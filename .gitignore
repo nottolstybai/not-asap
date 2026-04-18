@@ -1,0 +1,6 @@
+.claude/
+.planning/
+.qwen/
+CLAUDE.md
+coverage.out
+coverage.html
