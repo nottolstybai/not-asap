@@ -31,21 +31,144 @@ go get github.com/nottolstybai/not-asap
 
 ## Применение миграций
 
-Библиотека не применяет миграции сама — SQL-файлы поставляются через `embed.FS` в виде `notasap.MigrationFiles`. Примените их любым удобным инструментом, например [goose](https://github.com/pressly/goose):
+Перед запуском очереди накатите миграцию ниже любым удобным инструментом.
 
-```go
-import (
-    "database/sql"
+<details>
+<summary>goose</summary>
 
-    "github.com/nottolstybai/not-asap"
-    "github.com/pressly/goose/v3"
-)
+```sql
+-- +goose Up
+-- +goose StatementBegin
+CREATE TABLE IF NOT EXISTS notasap_jobs (
+    id                UUID        NOT NULL DEFAULT gen_random_uuid(),
+    job_type          TEXT        NOT NULL,
+    payload           JSONB       NOT NULL DEFAULT '{}',
+    status            TEXT        NOT NULL DEFAULT 'new',
+    run_after         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    attempt           INT         NOT NULL DEFAULT 0,
+    max_attempts      INT         NOT NULL DEFAULT 3,
+    error             TEXT,
+    last_heartbeat_at TIMESTAMPTZ,
+    worker_id         TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT notasap_jobs_pkey PRIMARY KEY (id),
+    CONSTRAINT notasap_jobs_status_check CHECK (
+        status IN ('new','running','done','failed','retrying','exhausted','cancelled')
+    )
+);
+-- +goose StatementEnd
+-- +goose StatementBegin
+CREATE INDEX IF NOT EXISTS idx_notasap_jobs_poll
+    ON notasap_jobs (status, run_after)
+    WHERE status IN ('new', 'retrying');
+-- +goose StatementEnd
+-- +goose StatementBegin
+CREATE INDEX IF NOT EXISTS idx_notasap_jobs_heartbeat
+    ON notasap_jobs (status, last_heartbeat_at)
+    WHERE status = 'running';
+-- +goose StatementEnd
+-- +goose StatementBegin
+CREATE INDEX IF NOT EXISTS idx_notasap_jobs_janitor
+    ON notasap_jobs (status, updated_at)
+    WHERE status IN ('done', 'failed', 'exhausted', 'cancelled');
+-- +goose StatementEnd
 
-goose.SetBaseFS(notasap.MigrationFiles)
-if err := goose.Up(db, "migrations"); err != nil {
-    log.Fatal(err)
-}
+-- +goose Down
+-- +goose StatementBegin
+DROP TABLE IF EXISTS notasap_jobs;
+-- +goose StatementEnd
 ```
+
+</details>
+
+<details>
+<summary>golang-migrate</summary>
+
+`000001_notasap_jobs.up.sql`:
+
+```sql
+CREATE TABLE IF NOT EXISTS notasap_jobs (
+    id                UUID        NOT NULL DEFAULT gen_random_uuid(),
+    job_type          TEXT        NOT NULL,
+    payload           JSONB       NOT NULL DEFAULT '{}',
+    status            TEXT        NOT NULL DEFAULT 'new',
+    run_after         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    attempt           INT         NOT NULL DEFAULT 0,
+    max_attempts      INT         NOT NULL DEFAULT 3,
+    error             TEXT,
+    last_heartbeat_at TIMESTAMPTZ,
+    worker_id         TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT notasap_jobs_pkey PRIMARY KEY (id),
+    CONSTRAINT notasap_jobs_status_check CHECK (
+        status IN ('new','running','done','failed','retrying','exhausted','cancelled')
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_notasap_jobs_poll
+    ON notasap_jobs (status, run_after)
+    WHERE status IN ('new', 'retrying');
+
+CREATE INDEX IF NOT EXISTS idx_notasap_jobs_heartbeat
+    ON notasap_jobs (status, last_heartbeat_at)
+    WHERE status = 'running';
+
+CREATE INDEX IF NOT EXISTS idx_notasap_jobs_janitor
+    ON notasap_jobs (status, updated_at)
+    WHERE status IN ('done', 'failed', 'exhausted', 'cancelled');
+```
+
+`000001_notasap_jobs.down.sql`:
+
+```sql
+DROP TABLE IF EXISTS notasap_jobs;
+```
+
+</details>
+
+<details>
+<summary>Liquibase</summary>
+
+```xml
+<changeSet id="notasap-jobs-1" author="you">
+    <sql splitStatements="true" endDelimiter=";">
+        CREATE TABLE IF NOT EXISTS notasap_jobs (
+            id                UUID        NOT NULL DEFAULT gen_random_uuid(),
+            job_type          TEXT        NOT NULL,
+            payload           JSONB       NOT NULL DEFAULT '{}',
+            status            TEXT        NOT NULL DEFAULT 'new',
+            run_after         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            attempt           INT         NOT NULL DEFAULT 0,
+            max_attempts      INT         NOT NULL DEFAULT 3,
+            error             TEXT,
+            last_heartbeat_at TIMESTAMPTZ,
+            worker_id         TEXT,
+            created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT notasap_jobs_pkey PRIMARY KEY (id),
+            CONSTRAINT notasap_jobs_status_check CHECK (
+                status IN ('new','running','done','failed','retrying','exhausted','cancelled')
+            )
+        );
+        CREATE INDEX IF NOT EXISTS idx_notasap_jobs_poll
+            ON notasap_jobs (status, run_after)
+            WHERE status IN ('new', 'retrying');
+        CREATE INDEX IF NOT EXISTS idx_notasap_jobs_heartbeat
+            ON notasap_jobs (status, last_heartbeat_at)
+            WHERE status = 'running';
+        CREATE INDEX IF NOT EXISTS idx_notasap_jobs_janitor
+            ON notasap_jobs (status, updated_at)
+            WHERE status IN ('done', 'failed', 'exhausted', 'cancelled');
+    </sql>
+    <rollback>
+        DROP TABLE IF EXISTS notasap_jobs;
+    </rollback>
+</changeSet>
+```
+
+</details>
 
 ## Быстрый старт
 
