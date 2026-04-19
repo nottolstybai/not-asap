@@ -3,6 +3,7 @@ package simulator
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math/rand/v2"
 	"sync"
 	"time"
@@ -21,9 +22,7 @@ type Service struct {
 
 func New(initial map[string]Knob) *Service {
 	k := make(map[string]Knob, len(initial))
-	for kk, v := range initial {
-		k[kk] = v
-	}
+	maps.Copy(k, initial)
 	return &Service{knobs: k}
 }
 
@@ -66,9 +65,7 @@ func (s *Service) Snapshot() map[string]Knob {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make(map[string]Knob, len(s.knobs))
-	for kk, v := range s.knobs {
-		out[kk] = v
-	}
+	maps.Copy(out, s.knobs)
 	return out
 }
 
