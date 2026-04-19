@@ -274,6 +274,10 @@ if err := q.Stop(ctx); err != nil {
 
 `Stop` перестаёт забирать новые задачи, ждёт завершения уже запущенных до `ShutdownTimeout`, а затем отменяет их контексты. Прерванные задачи возвращаются в `retrying` и будут подхвачены на следующем опросе.
 
+## Playground
+
+В каталоге [`examples/playground/`](examples/playground/README.md) лежит самодостаточное демо с HTMX-интерфейсом, Prometheus и Grafana. Одна команда `docker compose up` (или `make up` из этого каталога) поднимает весь стек с предпровиженным дашбордом.
+
 ## License
 
 MIT

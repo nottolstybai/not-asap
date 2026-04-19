@@ -1,5 +1,6 @@
 .claude/
 .planning/
+.opencode
 .qwen/
 CLAUDE.md
 coverage.out

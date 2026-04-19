@@ -32,6 +32,7 @@ func (q *Queue) markJobDone(job *database.ClaimedJob) {
 		q.logger().Warn("job already moved by rescuer", "job_id", job.ID)
 		return
 	}
+	q.metrics.Processed.WithLabelValues(job.JobType, string(core.StatusDone)).Inc()
 	q.logger().Info("job completed", "job_id", job.ID, "job_type", job.JobType)
 }
 
@@ -48,6 +49,7 @@ func (q *Queue) markJobFailed(job *database.ClaimedJob, errMsg string) {
 		q.logger().Warn("job already moved by rescuer", "job_id", job.ID)
 		return
 	}
+	q.metrics.Processed.WithLabelValues(job.JobType, string(core.StatusFailed)).Inc()
 	q.logger().Warn("job failed",
 		"job_id", job.ID,
 		"error", errMsg,
@@ -69,6 +71,7 @@ func (q *Queue) markJobCancelled(job *database.ClaimedJob) {
 		q.logger().Warn("job already moved by rescuer", "job_id", job.ID)
 		return
 	}
+	q.metrics.Processed.WithLabelValues(job.JobType, string(core.StatusCancelled)).Inc()
 	q.logger().Info("job cancelled", "job_id", job.ID)
 }
 
@@ -85,6 +88,7 @@ func (q *Queue) markJobExhausted(job *database.ClaimedJob) {
 		q.logger().Warn("job already moved by rescuer", "job_id", job.ID)
 		return
 	}
+	q.metrics.Processed.WithLabelValues(job.JobType, string(core.StatusExhausted)).Inc()
 	q.logger().Error("job exhausted",
 		"job_id", job.ID,
 		"attempts", job.Attempt,

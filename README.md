@@ -274,6 +274,10 @@ if err := q.Stop(ctx); err != nil {
 
 `Stop` stops claiming new jobs, waits for in-flight jobs up to `ShutdownTimeout`, and then cancels their contexts. Interrupted jobs go back to `retrying` and are picked up on the next poll.
 
+## Playground
+
+A self-contained demo with an HTMX UI, Prometheus, and Grafana is shipped under [`examples/playground/`](examples/playground/README.md). One `docker compose up` (or `make up` from that directory) brings up the full stack with a pre-provisioned dashboard.
+
 ## License
 
 MIT

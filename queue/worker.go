@@ -68,7 +68,9 @@ func (q *Queue) worker() {
 		default:
 		}
 
+		pollStart := time.Now()
 		job, err := q.db.ClaimJob(q.jobCtx, q.workerID)
+		q.metrics.Poll.Observe(time.Since(pollStart).Seconds())
 		if err != nil {
 			q.sem.Release(1)
 			if errors.Is(err, context.Canceled) {
@@ -115,6 +117,9 @@ func (q *Queue) runJob(job *database.ClaimedJob) {
 	var panicStack []byte
 	handlerRan := false
 
+	q.metrics.InFlight.Inc()
+	start := time.Now()
+
 	defer func() {
 		if r := recover(); r != nil {
 			panicValue = r
@@ -126,6 +131,9 @@ func (q *Queue) runJob(job *database.ClaimedJob) {
 		q.runningMu.Unlock()
 		q.sem.Release(1)
 		q.wg.Done()
+
+		q.metrics.InFlight.Dec()
+		q.metrics.Duration.WithLabelValues(job.JobType).Observe(time.Since(start).Seconds())
 
 		switch {
 		case panicValue != nil:

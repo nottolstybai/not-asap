@@ -18,6 +18,7 @@ type Queue struct {
 	db       *database.Client
 	config   core.QueueConfig
 	registry *core.Registry
+	metrics  *core.Metrics
 
 	// Worker pool
 	workerID string
@@ -51,6 +52,7 @@ func NewQueue(db *database.Client, config core.QueueConfig) *Queue {
 		db:       db,
 		config:   config,
 		registry: core.NewRegistry(),
+		metrics:  core.NewMetrics(config.Registerer),
 		running:  make(map[string]struct{}),
 		stopCh:   make(chan struct{}),
 		hbDone:   make(chan struct{}),
@@ -77,7 +79,12 @@ func (q *Queue) resolveConfig(kind string) core.EffectiveConfig {
 // Enqueue inserts one job without an external transaction.
 func (q *Queue) Enqueue(ctx context.Context, args core.JobArgs) (*database.Job, error) {
 	eff := q.resolveConfig(args.Kind())
-	return q.db.Enqueue(ctx, args.Kind(), args, eff.MaxAttempts)
+	job, err := q.db.Enqueue(ctx, args.Kind(), args, eff.MaxAttempts)
+	if err != nil {
+		return nil, err
+	}
+	q.metrics.Enqueued.WithLabelValues(args.Kind()).Inc()
+	return job, nil
 }
 
 // EnqueueBatch inserts multiple jobs in a single pgx.Batch round-trip.
@@ -94,13 +101,24 @@ func (q *Queue) EnqueueBatch(ctx context.Context, jobs ...core.JobArgs) error {
 			MaxAttempts: eff.MaxAttempts,
 		}
 	}
-	return q.db.EnqueueBatch(ctx, batchJobs)
+	if err := q.db.EnqueueBatch(ctx, batchJobs); err != nil {
+		return err
+	}
+	for _, j := range jobs {
+		q.metrics.Enqueued.WithLabelValues(j.Kind()).Inc()
+	}
+	return nil
 }
 
 // EnqueueTx inserts one job inside the caller's pgx.Tx.
 func (q *Queue) EnqueueTx(ctx context.Context, tx pgx.Tx, args core.JobArgs) (*database.Job, error) {
 	eff := q.resolveConfig(args.Kind())
-	return q.db.EnqueueTx(ctx, tx, args.Kind(), args, eff.MaxAttempts)
+	job, err := q.db.EnqueueTx(ctx, tx, args.Kind(), args, eff.MaxAttempts)
+	if err != nil {
+		return nil, err
+	}
+	q.metrics.Enqueued.WithLabelValues(args.Kind()).Inc()
+	return job, nil
 }
 
 // EnqueueBatchTx inserts multiple jobs inside the caller's pgx.Tx.
@@ -117,7 +135,13 @@ func (q *Queue) EnqueueBatchTx(ctx context.Context, tx pgx.Tx, jobs ...core.JobA
 			MaxAttempts: eff.MaxAttempts,
 		}
 	}
-	return q.db.EnqueueBatchTx(ctx, tx, batchJobs)
+	if err := q.db.EnqueueBatchTx(ctx, tx, batchJobs); err != nil {
+		return err
+	}
+	for _, j := range jobs {
+		q.metrics.Enqueued.WithLabelValues(j.Kind()).Inc()
+	}
+	return nil
 }
 
 // Register registers a typed handler for job kind T.Kind().
