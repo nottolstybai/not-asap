@@ -1,0 +1,35 @@
+{{define "_jobs_table"}}
+{{if .}}
+<table>
+  <thead>
+    <tr>
+      <th>Job ID</th>
+      <th>Type</th>
+      <th>Status</th>
+      <th style="text-align:center;">Attempt</th>
+      <th>Run after</th>
+      <th>Updated at</th>
+    </tr>
+  </thead>
+  <tbody>
+  {{range .}}
+    <tr>
+      <td class="td-id" title="{{.ID}}">{{.ID}}</td>
+      <td class="td-kind">{{.Kind}}</td>
+      <td>
+        <span class="pill pill-{{.Status}}">
+          <span class="pill-dot" aria-hidden="true"></span>
+          {{.Status}}
+        </span>
+      </td>
+      <td class="td-attempt">{{.Attempt}}</td>
+      <td class="td-ts">{{.NextRun}}</td>
+      <td class="td-ts">{{.UpdateAt}}</td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+{{else}}
+<div class="empty">no jobs yet — create an order or run a scenario</div>
+{{end}}
+{{end}}

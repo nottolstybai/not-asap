@@ -1,0 +1,14 @@
+{{define "_counters"}}
+{{if .}}
+<div class="counters-wrap">
+  {{range $status, $count := .}}
+  <div class="counter-chip chip-{{$status}}">
+    <span class="counter-num">{{$count}}</span>
+    <span class="counter-label">{{$status}}</span>
+  </div>
+  {{end}}
+</div>
+{{else}}
+<p class="counters-empty">— no jobs in queue</p>
+{{end}}
+{{end}}
