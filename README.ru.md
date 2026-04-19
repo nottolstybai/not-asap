@@ -174,7 +174,13 @@ DROP TABLE IF EXISTS notasap_jobs;
 
 ### 1. Опишите payload задачи
 
-Любой сериализуемый в JSON тип, реализующий интерфейс `JobArgs`:
+Определите структуру с данными задачи и реализуйте интерфейс `JobArgs`:
+
+```go
+type JobArgs interface {
+    Kind() string // уникальный идентификатор, хранится в колонке job_type
+}
+```
 
 ```go
 type SendEmail struct {
@@ -185,7 +191,7 @@ type SendEmail struct {
 func (SendEmail) Kind() string { return "send_email" }
 ```
 
-`Kind()` — строка, под которой задача будет лежать в колонке `job_type`.
+Подходит любая JSON-сериализуемая структура. `Kind()` — строка, по которой очередь сопоставляет строку из БД с нужным хендлером.
 
 ### 2. Создайте очередь
 
@@ -202,7 +208,11 @@ if err != nil {
 q := notasap.NewQueue(pool, cfg)
 ```
 
+Все доступные параметры и их значения по умолчанию — в разделе [Конфигурация](#конфигурация).
+
 ### 3. Зарегистрируйте хендлер
+
+Хендлеры имеют сигнатуру `func(ctx context.Context, args T) error`, где `T` реализует `JobArgs`. Очередь сама десериализует payload в `T` перед вызовом хендлера — никаких сырых байт.
 
 ```go
 notasap.Register(q, func(ctx context.Context, job SendEmail) error {
@@ -210,7 +220,14 @@ notasap.Register(q, func(ctx context.Context, job SendEmail) error {
 })
 ```
 
-Хендлер получает уже распарсенный `SendEmail`, а не сырые байты.
+Третий аргумент `Register` — опциональный override конфигурации для конкретного типа задачи. Если не передан, тип наследует настройки из `QueueConfig`:
+
+```go
+notasap.Register(q, sendEmailHandler, func(tc *notasap.TaskConfig) {
+    tc.MaxRetries = 10
+    tc.RetryDelay = 30 * time.Second
+})
+```
 
 ### 4. Запустите и остановите пул воркеров
 
@@ -222,8 +239,10 @@ defer q.Stop(context.Background())
 ### 5. Поставьте задачу в очередь
 
 ```go
-_, err := q.Enqueue(ctx, SendEmail{To: "a@b.co", Subject: "hi"})
+job, err := q.Enqueue(ctx, SendEmail{To: "a@b.co", Subject: "hi"})
 ```
+
+`Enqueue` возвращает `*Job` с полями `ID`, `JobType`, `Status`, `MaxAttempts` и `CreatedAt`. Если идентификатор задачи не нужен, результат можно проигнорировать.
 
 ## Постановка в транзакции (outbox)
 
@@ -297,25 +316,14 @@ notasap.Register(q, func(ctx context.Context, job SendEmail) error {
 
 ### На тип задачи — `TaskConfig`
 
-Передаётся третьим аргументом `Register` и переопределяет глобальные настройки. Пустые поля наследуют значение из `QueueConfig`:
-
-```go
-notasap.Register(q,
-    sendEmailHandler,
-    func(tc *notasap.TaskConfig) {
-        tc.MaxRetries    = 10
-        tc.RetryStrategy = notasap.RetryStrategyStatic
-        tc.RetryDelay    = 30 * time.Second
-    },
-)
-```
+Передаётся опциональным третьим аргументом `Register`. Пустые поля наследуют значение из `QueueConfig`. Пример использования — в [шаге 3](#3-зарегистрируйте-хендлер).
 
 | Поле | Назначение |
 |------|------------|
 | `MaxRetries` | Лимит попыток для этого типа задачи |
 | `RetryDelay` | База задержки |
-| `RetryStrategy` | `Static` или `Exponential` |
-| `MaxRetryDelay` | Потолок задержки |
+| `RetryStrategy` | `RetryStrategyStatic` или `RetryStrategyExponential` |
+| `MaxRetryDelay` | Потолок задержки для exponential |
 
 ### Janitor
 
@@ -351,7 +359,13 @@ cfg.Janitor = notasap.JanitorConfig{
 
 ## Логирование
 
-Передайте `*slog.Logger` в `QueueConfig.Logger`. Внутри хендлера достаньте логгер с автоматически добавленными полями `job_id`, `job_type`, `attempt`:
+Передайте `*slog.Logger` в `QueueConfig.Logger`. Внутри хендлера вызовите `notasap.LoggerFromContext(ctx)` — получите логгер с уже добавленными полями задачи:
+
+| Ключ | Тип | Значение |
+|------|-----|----------|
+| `job_id` | `string` | UUID текущей задачи |
+| `job_type` | `string` | Значение, возвращаемое `Kind()` |
+| `attempt` | `int` | Номер текущей попытки (с 1) |
 
 ```go
 notasap.Register(q, func(ctx context.Context, job SendEmail) error {

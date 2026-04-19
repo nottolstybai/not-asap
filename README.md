@@ -174,7 +174,13 @@ DROP TABLE IF EXISTS notasap_jobs;
 
 ### 1. Describe your job payload
 
-Any JSON-serializable type that implements `JobArgs`:
+Define a struct for your job's data and implement the `JobArgs` interface:
+
+```go
+type JobArgs interface {
+    Kind() string // unique identifier stored in the job_type column
+}
+```
 
 ```go
 type SendEmail struct {
@@ -185,7 +191,7 @@ type SendEmail struct {
 func (SendEmail) Kind() string { return "send_email" }
 ```
 
-`Kind()` is the string stored in the `job_type` column.
+Any JSON-serializable struct works. `Kind()` is how the queue matches a job row to the right handler.
 
 ### 2. Create a queue
 
@@ -202,7 +208,11 @@ if err != nil {
 q := notasap.NewQueue(pool, cfg)
 ```
 
+See the [Configuration](#configuration) section for all available options and their defaults.
+
 ### 3. Register a handler
+
+Handlers have the signature `func(ctx context.Context, args T) error` where `T` implements `JobArgs`. The queue unmarshals the stored payload into `T` before calling the handler — no raw bytes.
 
 ```go
 notasap.Register(q, func(ctx context.Context, job SendEmail) error {
@@ -210,7 +220,14 @@ notasap.Register(q, func(ctx context.Context, job SendEmail) error {
 })
 ```
 
-The handler receives a decoded `SendEmail` value, not raw bytes.
+The third argument to `Register` is an optional config override for this job type. When omitted, the job type inherits all settings from `QueueConfig`:
+
+```go
+notasap.Register(q, sendEmailHandler, func(tc *notasap.TaskConfig) {
+    tc.MaxRetries = 10
+    tc.RetryDelay = 30 * time.Second
+})
+```
 
 ### 4. Start and stop the worker pool
 
@@ -222,8 +239,10 @@ defer q.Stop(context.Background())
 ### 5. Enqueue a job
 
 ```go
-_, err := q.Enqueue(ctx, SendEmail{To: "a@b.co", Subject: "hi"})
+job, err := q.Enqueue(ctx, SendEmail{To: "a@b.co", Subject: "hi"})
 ```
+
+`Enqueue` returns a `*Job` with `ID`, `JobType`, `Status`, `MaxAttempts`, and `CreatedAt`. It is safe to ignore if you don't need the job ID.
 
 ## Transactional enqueue (outbox)
 
@@ -297,25 +316,14 @@ Passed to `NewQueueConfig`, applies to the whole queue.
 
 ### Per-job-type — `TaskConfig`
 
-Passed as the third argument to `Register`, overrides global defaults. Zero-valued fields inherit from `QueueConfig`:
-
-```go
-notasap.Register(q,
-    sendEmailHandler,
-    func(tc *notasap.TaskConfig) {
-        tc.MaxRetries    = 10
-        tc.RetryStrategy = notasap.RetryStrategyStatic
-        tc.RetryDelay    = 30 * time.Second
-    },
-)
-```
+Passed as the optional third argument to `Register`. Zero-valued fields inherit from `QueueConfig`. See [step 3](#3-register-a-handler) for usage.
 
 | Field | Purpose |
 |-------|---------|
 | `MaxRetries` | Attempt limit for this job type |
 | `RetryDelay` | Base delay |
-| `RetryStrategy` | `Static` or `Exponential` |
-| `MaxRetryDelay` | Upper bound on delay |
+| `RetryStrategy` | `RetryStrategyStatic` or `RetryStrategyExponential` |
+| `MaxRetryDelay` | Upper bound on exponential delay |
 
 ### Janitor
 
@@ -351,7 +359,13 @@ Public constants — use these for filtering and checks:
 
 ## Logging
 
-Pass a `*slog.Logger` to `QueueConfig.Logger`. Inside a handler, fetch it back with `job_id`, `job_type`, `attempt` already attached:
+Pass a `*slog.Logger` to `QueueConfig.Logger`. Inside a handler, call `notasap.LoggerFromContext(ctx)` to get back a logger pre-enriched with job metadata:
+
+| Key | Type | Value |
+|-----|------|-------|
+| `job_id` | `string` | UUID of the current job |
+| `job_type` | `string` | Value returned by `Kind()` |
+| `attempt` | `int` | Current attempt number (1-based) |
 
 ```go
 notasap.Register(q, func(ctx context.Context, job SendEmail) error {
