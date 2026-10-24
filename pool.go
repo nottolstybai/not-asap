@@ -1,0 +1,159 @@
+package notasap
+
+import (
+	"context"
+	"log/slog"
+	"runtime/debug"
+	"time"
+
+	"github.com/nottolstybai/not-asap/internal/store"
+)
+
+// statusWriteTimeout bounds writing a job's status after its handler returns.
+// The write does not inherit the handler or shutdown contexts.
+const statusWriteTimeout = 10 * time.Second
+
+// kindPool polls and runs the jobs of one Kind with at most Workers handlers.
+type kindPool struct {
+	c     *Client
+	e     *kindEntry
+	slots chan struct{} // one token per running handler; cap is Workers
+	wake  chan struct{} // signalled when a slot frees; cap 1
+}
+
+// loop claims jobs while there are free slots until the client stops. A full
+// batch is followed by an immediate poll, otherwise it waits PollInterval.
+func (p *kindPool) loop() {
+	c, cfg := p.c, p.e.cfg
+	lease := cfg.Timeout + c.rescuer.Grace
+	timer := time.NewTimer(cfg.PollInterval)
+	timer.Stop()
+	defer timer.Stop()
+
+	fullBatch := false
+	for first := true; ; first = false {
+		if !first && !fullBatch {
+			timer.Reset(cfg.PollInterval)
+			select {
+			case <-timer.C:
+			case <-c.stopCh:
+				return
+			}
+		}
+		free := cap(p.slots) - len(p.slots)
+		for free == 0 {
+			select {
+			case <-p.wake:
+			case <-c.stopCh:
+				return
+			}
+			free = cap(p.slots) - len(p.slots)
+		}
+		select {
+		case <-c.stopCh:
+			return
+		default:
+		}
+
+		start := time.Now()
+		rows, err := c.st.Claim(c.bgCtx, int16(p.e.kind), free, lease)
+		c.observer.Polled(cfg.Name, time.Since(start))
+		if err != nil {
+			if c.bgCtx.Err() != nil {
+				return
+			}
+			c.logger.Warn("notasap: claim jobs", "kind", cfg.Name, "error", err)
+			fullBatch = false
+			continue
+		}
+		for _, row := range rows {
+			p.slots <- struct{}{}
+			c.jobsWG.Go(func() { p.execute(row) })
+		}
+		fullBatch = len(rows) == free
+	}
+}
+
+// execute runs the handler for a claimed job, waits for it even past its
+// timeout, records the outcome and frees the slot.
+func (p *kindPool) execute(row store.ClaimedJob) {
+	c, cfg := p.c, p.e.cfg
+	defer func() {
+		c.observer.JobEnded(cfg.Name)
+		<-p.slots
+		select {
+		case p.wake <- struct{}{}:
+		default:
+		}
+	}()
+
+	logger := c.logger.With("job_id", row.ID, "kind", cfg.Name, "attempt", row.Attempt)
+	ctx, cancel := context.WithTimeoutCause(c.runCtx, cfg.Timeout, errTimeout)
+	defer cancel()
+	ctx = withLogger(ctx, logger)
+
+	c.observer.JobStarted(cfg.Name)
+	start := time.Now()
+	stuck := time.AfterFunc(cfg.Timeout+c.rescuer.Grace, func() {
+		logger.Error("notasap: handler ignores context", "timeout", cfg.Timeout)
+		c.observer.JobStuck(cfg.Name)
+	})
+	res := p.run(ctx, row, logger)
+	stuck.Stop()
+	res.cause = context.Cause(ctx)
+	took := time.Since(start)
+
+	a := decide(res, row.Attempt, row.MaxAttempts, cfg.Backoff)
+	p.record(row, a, took, logger)
+}
+
+// run calls the handler, turning a panic into a failed result.
+func (p *kindPool) run(ctx context.Context, row store.ClaimedJob, logger *slog.Logger) (res execResult) {
+	defer func() {
+		if v := recover(); v != nil {
+			logger.Error("notasap: handler panicked", "panic", v, "stack", string(debug.Stack()))
+			res = execResult{panicked: true, panicValue: v}
+		}
+	}()
+	res.decodeErr, res.err = p.e.run(ctx, row)
+	return res
+}
+
+// record writes the job's next state and reports it.
+func (p *kindPool) record(row store.ClaimedJob, a action, took time.Duration, logger *slog.Logger) {
+	c, name := p.c, p.e.cfg.Name
+	ctx, cancel := context.WithTimeout(context.Background(), statusWriteTimeout)
+	defer cancel()
+
+	ref := store.Ref{ID: row.ID, Lease: row.Lease}
+	var ok bool
+	var err error
+	if a.status == StatusPending {
+		ok, err = c.st.Reschedule(ctx, ref, a.delay, a.errMsg, a.refund)
+	} else {
+		ok, err = c.st.Finish(ctx, ref, int16(a.status), a.errMsg)
+	}
+	switch {
+	case err != nil:
+		logger.Warn("notasap: write job status", "status", a.status, "error", err)
+		return
+	case !ok:
+		logger.Warn("notasap: job lost lease", "status", a.status)
+		return
+	}
+
+	switch a.status {
+	case StatusPending:
+		c.observer.JobRetried(name, a.reason, took)
+		logger.Info("notasap: job retried", "reason", a.reason, "delay", a.delay, "error", a.errMsg)
+	case StatusDone:
+		c.observer.JobFinished(name, a.status, took)
+		logger.Debug("notasap: job done", "took", took)
+	case StatusCancelled:
+		c.observer.JobFinished(name, a.status, took)
+		logger.Info("notasap: job cancelled", "error", a.errMsg)
+	default:
+		c.observer.JobFinished(name, a.status, took)
+		logger.Error("notasap: job failed", "reason", a.reason, "error", a.errMsg)
+	}
+}
