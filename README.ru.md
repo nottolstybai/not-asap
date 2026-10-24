@@ -1,223 +1,431 @@
-# not-asap
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+    <img alt="notasap" src="docs/assets/logo-light.svg" width="380">
+  </picture>
+</p>
 
-Отложенные фоновые задачи поверх PostgreSQL для Go. Без брокера: только та база, что у сервиса уже есть.
+<p align="center">
+  <b>Отложенные фоновые задачи для Go в том Postgres, который у вас уже есть.</b>
+</p>
 
-*English: [README.md](README.md).*
+<p align="center">
+  <a href="https://pkg.go.dev/github.com/nottolstybai/not-asap"><img alt="Go Reference" src="https://pkg.go.dev/badge/github.com/nottolstybai/not-asap.svg"></a>
+  <img alt="Go 1.26+" src="https://img.shields.io/badge/go-1.26%2B-00ADD8?logo=go&logoColor=white">
+  <img alt="PostgreSQL 14+" src="https://img.shields.io/badge/postgres-14%2B-4169E1?logo=postgresql&logoColor=white">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green"></a>
+</p>
 
-- Типобезопасные обработчики на дженериках; payload хранится как JSON.
-- Постановка внутри своей транзакции (`ScheduleTx`) для паттерна outbox.
-- Отложенный запуск, ретраи с backoff, ключи идемпотентности, отмена.
-- Свой пул воркеров на каждый kind, rescuer для зависших задач, janitor для завершённых.
-- Graceful shutdown; метрики Prometheus в подпакете `prom` (опционально).
+<p align="center">
+  <a href="README.md">English</a> · <b>Русский</b>
+</p>
 
-Требования: Go 1.26+, PostgreSQL 14+, `*pgxpool.Pool` из [pgx v5](https://github.com/jackc/pgx).
+---
 
-```bash
-go get github.com/nottolstybai/not-asap
-```
-
-## Миграции
-
-Схема — одна таблица `notasap_jobs`. Можно скопировать файл в свою директорию миграций или применить встроенный FS с **отдельной таблицей версий**, чтобы нумерация не пересекалась с миграциями сервиса.
-
-- Файлы: `migrations/goose/00001_notasap_jobs.sql`, `migrations/golang-migrate/000001_notasap_jobs.{up,down}.sql`.
-- Встроенные: `migrations.Goose` и `migrations.GolangMigrate` (пакет `github.com/nottolstybai/not-asap/migrations`).
-
-goose:
-
-```go
-goose.SetBaseFS(migrations.Goose)
-goose.SetTableName("notasap_goose_version")
-err := goose.Up(db, "goose") // db — *sql.DB, например stdlib.OpenDBFromPool(pool)
-```
-
-или через provider API: `goose.NewProvider(goose.DialectPostgres, db, sub, goose.WithTableName("notasap_goose_version"))`, где `sub, _ := fs.Sub(migrations.Goose, "goose")`.
-
-golang-migrate:
+**notasap** выполняет фоновые задачи внутри вашего Go-сервиса, а очередью служит одна таблица в Postgres.
+Отдельный брокер не нужен. Задача — это строка, поэтому её можно поставить **в той же транзакции**,
+что и бизнес-данные: задача появится, только если транзакция закоммитится.
 
 ```go
-src, _ := iofs.New(migrations.GolangMigrate, "golang-migrate")
-m, _ := migrate.NewWithSourceInstance("iofs", src,
-    dsn+"&x-migrations-table=notasap_schema_migrations") // в dsn уже есть query string
-err := m.Up()
+tx, _ := pool.Begin(ctx)
+orderID := createOrder(ctx, tx, order)                       // ваши данные
+client.ScheduleTx(ctx, tx, SendInvoice{OrderID: orderID})    // ваша задача
+tx.Commit(ctx)                                               // либо обе, либо ни одной
 ```
 
-SQL не квалифицирует схему; при необходимости изолируйте таблицу через `search_path` соединения. Если таблицы нет, `Start` вернёт понятную ошибку.
+## Содержание
+
+- [Возможности](#возможности)
+- [Быстрый старт](#быстрый-старт)
+- [Как это работает](#как-это-работает)
+- [Обработчики](#обработчики)
+- [Постановка задач](#постановка-задач)
+- [Настройка](#настройка)
+- [Запуск и остановка](#запуск-и-остановка)
+- [Надёжность](#надёжность)
+- [Наблюдаемость](#наблюдаемость)
+- [Миграции](#миграции)
+- [Разработка](#разработка)
+- [Лицензия](#лицензия)
+
+## Возможности
+
+- **Постановка в транзакции.** `ScheduleTx` пишет задачу в ваш `pgx.Tx`.
+- **Типизированные обработчики.** Payload — обычная Go-структура, обработчик получает её уже распакованной.
+- **Задержки, ретраи, таймауты.** Задачу можно запустить позже, повторить с постоянной или экспоненциальной задержкой и ограничить каждый запуск по времени.
+- **Ключи идемпотентности.** Повторная постановка той же задачи вернёт первую, а при желании перезапишет её.
+- **Свой пул воркеров на каждый kind.** Медленный вид задач не отнимает воркеров у остальных.
+- **Восстановление после падений.** Задачи упавшего процесса снова берутся в работу, а запоздавший результат старого воркера отбрасывается.
+- **Плавная остановка.** `Stop` дожидается текущих задач; прерванные задачи возвращаются в очередь без траты попытки.
+- **Уборка.** Janitor удаляет старые завершённые задачи по расписанию для каждого статуса.
+- **Наблюдаемость.** Логи через `log/slog` и готовый коллектор Prometheus.
 
 ## Быстрый старт
 
-Полная программа — [examples/basic](examples/basic/main.go).
+### 1. Установка
+
+```sh
+go get github.com/nottolstybai/not-asap
+```
+
+Нужны Go 1.26+, PostgreSQL 14+ и [pgx v5](https://github.com/jackc/pgx).
+
+### 2. Создайте таблицу
+
+Примените миграцию из [`migrations/`](migrations) своим инструментом миграций
+(см. [Миграции](#миграции)).
+
+### 3. Опишите задачу и запустите клиент
 
 ```go
-const KindSendInvoice notasap.Kind = 1 // хранится в БД: не менять и не переиспользовать
+package main
+
+import (
+	"context"
+	"log"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	notasap "github.com/nottolstybai/not-asap"
+)
+
+// Номер kind хранится в базе. Никогда не меняйте и не переиспользуйте его.
+const KindSendInvoice notasap.Kind = 1
 
 type SendInvoice struct {
-    OrderID int64  `json:"order_id"`
-    Email   string `json:"email"`
+	OrderID int64 `json:"order_id"`
 }
 
 func (SendInvoice) Kind() notasap.Kind { return KindSendInvoice }
 
-client, err := notasap.New(pool)
-err = notasap.Register(client, handle, notasap.KindConfig{Name: "send_invoice"})
-err = client.Start(ctx) // не блокирует
+func sendInvoice(ctx context.Context, job *notasap.Job[SendInvoice]) error {
+	notasap.Logger(ctx).Info("sending invoice", "order_id", job.Payload.OrderID)
+	return nil // done
+}
 
-id, err := client.Schedule(ctx, SendInvoice{OrderID: 42, Email: "a@b.c"},
-    notasap.WithDelay(time.Minute),
-    notasap.WithIdempotencyKey("invoice-42"))
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-err = client.Stop(shutdownCtx)
-```
+	pool, err := pgxpool.New(ctx, "postgres://localhost:5432/app")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer pool.Close()
 
-```go
-func handle(ctx context.Context, job *notasap.Job[SendInvoice]) error {
-    notasap.Logger(ctx).Info("sending", "order", job.Payload.OrderID) // в логгере job_id, kind, attempt
-    return send(ctx, job.Payload)
+	client, err := notasap.New(pool)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = notasap.Register(client, sendInvoice, notasap.KindConfig{Name: "send_invoice"})
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := client.Start(ctx); err != nil {
+		log.Fatal(err)
+	}
+
+	_, err = client.Schedule(ctx, SendInvoice{OrderID: 42}, notasap.WithDelay(time.Minute))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	<-ctx.Done()
+	stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = client.Stop(stopCtx)
 }
 ```
 
-Kind — число (`int16`, строго больше 0), хранится в БД. `KindConfig.Name` обязателен, уникален и используется только в логах и метриках. Тип payload — не указатель и не интерфейс. Регистрировать нужно до `Start`.
+Готовый к запуску вариант лежит в [`examples/basic`](examples/basic).
 
-Жизненный цикл клиента одноразовый: `new -> started -> stopped`. Повторный `Start` вернёт `ErrAlreadyStarted`, `Start` после `Stop` — `ErrStopped`, `Stop` у незапущенного клиента вернёт `nil`, но переводит его в stopped, поэтому последующий `Start` вернёт `ErrStopped`. Повторный или конкурентный `Stop` ждёт, пока вернётся первый `Stop` (или пока не истечёт его собственный `ctx` — тогда вернёт `ctx.Err()`). `Start` держит блокировку клиента на время проверки схемы, поэтому передавайте ему `ctx` с дедлайном. `Schedule*` и `Cancel` работают в любом состоянии: это просто запись в БД.
+## Как это работает
 
-## Исходы обработчика
+Каждая задача — строка в `notasap_jobs`. У каждого зарегистрированного kind есть поллер:
+он забирает готовые строки через `FOR UPDATE SKIP LOCKED` и раздаёт их воркерам этого kind.
+Реплики сервиса работают с одной таблицей и никогда не забирают одну строку дважды.
 
-| Результат обработчика | Что происходит |
-|---|---|
-| `nil` | `done` |
-| ошибка, оборачивающая `ErrCancel` | `cancelled`, текст ошибки сохраняется |
-| ошибка, оборачивающая `ErrKeepAttempt` | снова `pending`, попытка **не тратится**, `run_at = NOW() + Backoff(job.Attempt)`. Лимита нет: используйте осторожно, следите за `reason=keep_attempt` |
-| любая другая ошибка, паника, `Timeout` kind'а | `attempt >= MaxAttempts`: `failed`; иначе `pending`, `run_at = NOW() + Backoff(attempt)`. Ошибка сохраняется; паника пишется в лог со стеком |
-| payload не удалось распаковать | сразу `failed` (ретрай бессмыслен) |
-| прерван shutdown'ом (обработчик вернул ошибку) | `pending`, попытка возвращается, `run_at = NOW()` |
-| вернул `nil`, несмотря на shutdown | `done` |
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> pending: Schedule
+    pending --> running: взята воркером
+    running --> done: обработчик вернул nil
+    running --> pending: ретрай (есть попытки),<br/>ErrKeepAttempt, остановка
+    running --> failed: попытки кончились,<br/>payload не распаковался
+    running --> cancelled: обработчик вернул ErrCancel
+    pending --> cancelled: client.Cancel(id)
+    done --> [*]: janitor
+    cancelled --> [*]: janitor
+```
 
-Текст ошибки обрезается до 4096 байт по границе руны.
+> [!NOTE]
+> Гарантия доставки — **at least once**. Задача может выполниться больше одного раза
+> (например, после падения процесса), поэтому обработчики должны быть идемпотентными.
 
-Попытка тратится в момент claim, поэтому падение процесса тоже стоит попытки (защита от poison-задач). Доставка **at-least-once**: задача может выполниться не один раз (падение, rescue, shutdown), поэтому обработчики должны быть идемпотентными.
+## Обработчики
 
-## Идемпотентность
-
-`WithIdempotencyKey(key)` делает пару `(kind, key)` уникальной, пока строка существует. Строки удаляет janitor: ключ освобождается, когда удалена `done`/`cancelled` строка (`failed` по умолчанию хранится вечно).
-
-| Существующая строка | без `WithReplace` | с `WithReplace` |
-|---|---|---|
-| нет | вставка | вставка |
-| `pending`, `done`, `failed`, `cancelled` | `ErrDuplicate` + ID существующей | та же строка **перезаписывается** (ID сохраняется): новый payload, `pending`, `attempt=0`, `max_attempts` из текущего конфига, без ошибки, новый `run_at` |
-| `running` | `ErrDuplicate` + ID | `ErrJobRunning` + ID |
-
-`WithReplace` требует `WithIdempotencyKey`. В обоих случаях возвращается ID существующей задачи.
-
-Особенности:
-
-- `ScheduleTx` с `WithReplace` блокирует найденную строку до конца вашей транзакции, в том числе когда строка выполняется и возвращается `ErrJobRunning`. Долгая транзакция блокирует запись статуса воркером (таймаут 10s): запись не проходит, задача после deadline подбирается rescuer'ом и выполняется снова. Держите такие транзакции короткими.
-- Обычный дубль существующую строку не блокирует.
-- `ScheduleBatch` (без tx) с ключами идемпотентности выполняется в собственной транзакции (для батчей из 2+ элементов), т.к. разбор конфликтов может требовать нескольких round-trip'ов; без ключей — один round-trip.
-
-## Постановка
+Обработчик — функция, которая получает распакованный payload и данные о задаче:
 
 ```go
-id, err := client.Schedule(ctx, p, opts...)
-id, err := client.ScheduleTx(ctx, tx, p, opts...)          // видна после коммита tx
-res, err := client.ScheduleBatch(ctx, notasap.Item(p1, opts...), notasap.Item(p2))
+func handle(ctx context.Context, job *notasap.Job[SendInvoice]) error
+```
+
+В `job` есть `ID`, `Kind`, `Payload`, `Attempt` (начинается с 1), `MaxAttempts` и `CreatedAt`.
+`ctx` отменяется, когда истекает `Timeout` kind'а или клиент останавливается, поэтому передавайте его
+во все вызовы, которые могут зависнуть. `notasap.Logger(ctx)` возвращает логгер с полями `job_id`, `kind` и `attempt`.
+
+Что вернёт обработчик, то и случится с задачей:
+
+| Результат обработчика | Статус задачи | Попытка тратится? |
+|---|---|---|
+| `nil` | `done` | да |
+| ошибка, оборачивающая `notasap.ErrCancel` | `cancelled` | да |
+| ошибка, оборачивающая `notasap.ErrKeepAttempt` | снова `pending` после задержки | **нет** |
+| любая другая ошибка, паника или таймаут | `pending` после задержки или `failed`, если попыток не осталось | да |
+| payload не распаковывается | сразу `failed` | да |
+| прервана через `Stop` | `pending`, запускается снова сразу | **нет** |
+
+Сигнальные ошибки проверяются через `errors.Is`, поэтому их можно оборачивать с понятным текстом:
+
+```go
+if !order.Paid {
+	// Заказ ещё не оплачен. Проверим позже, не тратя попытку.
+	return fmt.Errorf("order %d not paid: %w", order.ID, notasap.ErrKeepAttempt)
+}
+```
+
+> [!WARNING]
+> У `ErrKeepAttempt` нет лимита: задача, которая всегда его возвращает, живёт вечно.
+> Останавливайтесь сами, например когда `job.CreatedAt` слишком старый.
+> Такие повторы видны в метрике `notasap_jobs_retried_total{reason="keep_attempt"}`.
+
+Текст ошибки сохраняется в колонке `error`, обрезанный до 4 КБ по границе символа UTF-8.
+
+## Постановка задач
+
+```go
+id, err := client.Schedule(ctx, payload, opts...)                    // отдельно
+id, err := client.ScheduleTx(ctx, tx, payload, opts...)              // внутри вашего pgx.Tx
+res, err := client.ScheduleBatch(ctx, notasap.Item(p1), notasap.Item(p2, opts...))
 res, err := client.ScheduleBatchTx(ctx, tx, items...)
 ```
 
-- `WithDelay(d)`: `run_at = NOW() + d` по часам БД.
-- Kind без зарегистрированного обработчика даёт `ErrUnknownKind`, ничего не пишется.
-- Батч атомарен. `ErrDuplicate`/`ErrJobRunning` по элементам приходят в `BatchResult{ID, Err}`; любая другая ошибка проваливает весь батч.
-- `max_attempts` фиксируется в строке из конфига kind'а на момент постановки.
-- Метрика `scheduled_total` увеличивается после успешного запроса, до коммита вашей транзакции, поэтому при rollback `*Tx`-вызова она завышена.
+| Опция | Что делает |
+|---|---|
+| `notasap.WithDelay(d)` | задача станет готовой через `d` (по времени базы) |
+| `notasap.WithIdempotencyKey(key)` | не больше одной задачи на `(kind, key)`, пока строка существует |
+| `notasap.WithReplace()` | вместе с ключом: перезаписать существующую задачу вместо ошибки о дубле |
 
-## Отмена
+Постановка незарегистрированного kind возвращает `ErrUnknownKind` и ничего не пишет.
+Батч возвращает по `BatchResult{ID, Err}` на каждый элемент; `Err` элемента — только `ErrDuplicate` или `ErrJobRunning`.
 
-```go
-err := client.Cancel(ctx, id)
-```
+### Ключи идемпотентности
 
-`pending -> cancelled`. Для выполняющейся задачи вернёт `ErrJobRunning`, для уже завершённой (done/failed/cancelled) — `ErrJobFinished`, если строки нет — `ErrNotFound`. Чтобы отменить задачу изнутри обработчика, верните `ErrCancel`.
+Если задача с тем же kind и ключом уже есть:
 
-## Конфигурация
-
-Нулевые поля берутся из `WithDefaults`, затем из встроенных значений.
-
-| Опция | Поле | По умолчанию |
+| Существующая задача | Без `WithReplace` | С `WithReplace` |
 |---|---|---|
-| `KindConfig` | `Workers` | 5 |
-| | `MaxAttempts` | 3 |
-| | `Timeout` | 1m |
-| | `Backoff` | `Exponential(5s, 10m)` |
-| | `PollInterval` | 1s |
-| `WithRescuer(RescuerConfig)` | `Interval` | 30s |
-| | `Grace` | 30s |
-| `WithJanitor(JanitorConfig)` | `Interval` | 10m |
-| | `BatchSize` | 1000 |
-| | `Retention` | done 24h, cancelled 24h, failed 0 (не удалять) |
-| | `Disabled` | false |
-| `WithStopGrace(d)` | | 5s |
-| `WithLogger(*slog.Logger)` | | `slog.Default()` |
-| `WithObserver(Observer)` | | no-op |
+| `pending`, `done`, `failed`, `cancelled` | `ErrDuplicate` и ID существующей | строка перезаписывается: новый payload, `pending`, попытки сброшены, ID тот же |
+| `running` | `ErrDuplicate` и ID существующей | `ErrJobRunning` и ID существующей |
 
-- `WithDefaults(KindConfig{...})` задаёт общие умолчания для kind'ов (`Name` должен быть пустым).
-- Backoff: `Constant(d)`, `Exponential(base, max)` (удвоение, jitter в `[d/2, d]`, без переполнения) или своя `func(attempt int) time.Duration`. Конструкторы паникуют на некорректных аргументах (как `regexp.MustCompile`), вызывайте их при инициализации.
-- `Retention` janitor'а сливается с умолчаниями по ключам: `{StatusDone: time.Hour}` оставляет `cancelled` на 24h. Чтобы не удалять статус, укажите явный `0`. Допустимы только done, failed, cancelled.
-- `Disabled` «липкий»: если какой-то `WithJanitor` его выставил, последующий `WithJanitor(JanitorConfig{})` janitor не включит обратно.
-- Вся конфигурация проверяется в `New`/`Register` и возвращается ошибкой.
-
-## Rescuer и долгие задачи
-
-Взятая задача получает `deadline = claim + Timeout + Rescuer.Grace`. Rescuer (всегда включён) возвращает выполняющиеся задачи с истёкшим deadline в `pending` с backoff kind'а, либо в `failed`, если попытки кончились (`error = "rescued: deadline exceeded"`). Это общее для всех экземпляров сервиса. Запоздалую запись старого воркера отсекает счётчик lease (fencing).
-
-Heartbeat'а нет, поэтому задача упавшего процесса вернётся не раньше чем через `Timeout + Grace`. Для долгих задач ставьте большой `Timeout`.
-
-Обработчик, игнорирующий `ctx`, продолжает занимать слот воркера. Когда rescuer вернёт его задачу в `pending`, её может снова взять любой свободный слот — в этом же процессе или в другом, — пока старый обработчик ещё работает; результат старого обработчика отсекается lease. Если он не вернулся через `Rescuer.Grace` после `Timeout`, пул пишет Error-лог и считает метрику `stuck`. Слот освободится, когда обработчик вернётся.
-
-Задачи kind'а, не зарегистрированного в процессе, остаются `pending` и этим процессом не берутся; их заберёт процесс, где kind зарегистрирован.
-
-## Остановка
-
-`Stop(ctx)`:
-
-1. прекращает опрос, останавливает rescuer и janitor;
-2. ждёт выполняющиеся обработчики до `ctx.Done()`;
-3. если `ctx` истёк, отменяет контексты обработчиков (причина: shutdown), ждёт `StopGrace`, пока они запишут статус, и возвращает `ctx.Err()`.
-
-Прерванные задачи возвращаются в `pending` с возвратом попытки. Если `Stop` истёк по таймауту, обработчики, игнорирующие контекст, могут продолжать работу после его возврата; их задачи подберёт rescuer.
-
-## Метрики
-
-Ядро без зависимостей, оно сообщает события в `Observer`. Подпакет `prom` реализует его для Prometheus:
+Ключ снова свободен, когда janitor удаляет старую строку. Задачи в `failed` по умолчанию хранятся вечно,
+поэтому их ключи заняты, пока вы их не перезапишете.
 
 ```go
-m, err := prom.New(prometheus.DefaultRegisterer,
-    prom.WithJobDurationBuckets([]float64{0.1, 1, 10, 60}),
-    prom.WithPollDurationBuckets([]float64{0.001, 0.01, 0.1}),
-)
-client, err := notasap.New(pool, notasap.WithObserver(m))
+id, err := client.Schedule(ctx, SendInvoice{OrderID: 42},
+	notasap.WithIdempotencyKey("invoice:42"))
+if errors.Is(err, notasap.ErrDuplicate) {
+	// уже поставлена; id указывает на существующую задачу
+}
 ```
 
-`prom.New` возвращает ошибку (не паникует) при nil-registerer'е, повторной регистрации или некорректных бакетах. Бакеты по умолчанию: длительность задачи `ExponentialBuckets(0.005, 2, 15)`, опрос `ExponentialBuckets(0.0005, 2, 12)`. Метка `kind` — это `KindConfig.Name`.
+<details>
+<summary>Подробности о блокировках</summary>
+
+- Батч из 2+ элементов с ключами идемпотентности, переданный в `ScheduleBatch`, выполняется в отдельной транзакции: либо всё, либо ничего.
+- `ScheduleTx` с `WithReplace` блокирует существующую строку до конца вашей транзакции, даже если задача в `running`.
+  Делайте такие транзакции короткими: воркер, завершающий задачу, будет ждать эту блокировку.
+
+</details>
+
+### Отмена задачи в очереди
+
+```go
+err := client.Cancel(ctx, id) // nil, ErrJobRunning, ErrJobFinished или ErrNotFound
+```
+
+Снаружи можно отменить только задачу в `pending`. Выполняющуюся задачу останавливает только её обработчик.
+
+## Настройка
+
+Опции клиента (все необязательные):
+
+```go
+client, err := notasap.New(pool,
+	notasap.WithLogger(slog.Default()),
+	notasap.WithObserver(metrics),                                  // см. «Наблюдаемость»
+	notasap.WithDefaults(notasap.KindConfig{Workers: 10}),          // значения для всех kind
+	notasap.WithRescuer(notasap.RescuerConfig{Interval: time.Minute}),
+	notasap.WithJanitor(notasap.JanitorConfig{BatchSize: 500}),
+	notasap.WithStopGrace(10*time.Second),
+)
+```
+
+Настройки kind в `KindConfig`. Пустые поля берутся из `WithDefaults`, затем из встроенных значений:
+
+| Поле | По умолчанию | Значение |
+|---|---|---|
+| `Name` | обязательно | имя для логов и метрик |
+| `Workers` | `5` | сколько обработчиков работает одновременно |
+| `MaxAttempts` | `3` | сколько попыток до `failed` |
+| `Timeout` | `1m` | лимит на один запуск обработчика |
+| `Backoff` | `Exponential(5s, 10m)` | задержка перед ретраем (`Constant(d)`, `Exponential(base, max)` или своя функция) |
+| `PollInterval` | `1s` | как часто kind без работы проверяет готовые задачи |
+
+Фоновые процессы:
+
+| Настройка | По умолчанию | Значение |
+|---|---|---|
+| `RescuerConfig.Interval` | `30s` | как часто искать зависшие задачи |
+| `RescuerConfig.Grace` | `30s` | запас после `Timeout`, прежде чем задача считается зависшей |
+| `JanitorConfig.Interval` | `10m` | как часто удалять завершённые задачи |
+| `JanitorConfig.BatchSize` | `1000` | строк за один DELETE |
+| `JanitorConfig.Retention` | done `24h`, cancelled `24h`, failed `0` | сколько хранить каждый статус; `0` — хранить вечно |
+| `JanitorConfig.Disabled` | `false` | выключить janitor (последующий `WithJanitor` не включит его обратно) |
+| `WithStopGrace` | `5s` | сколько `Stop` ждёт, пока отменённые обработчики сохранят результат |
+
+`Retention` сливается по статусам: `Retention{StatusDone: time.Hour}` оставляет остальные значения по умолчанию.
+Неверные значения возвращаются ошибкой из `New` и `Register`, а не паникой во время работы.
+
+## Запуск и остановка
+
+```go
+err := client.Start(ctx) // проверяет, что таблица есть, и запускает воркеры и фоновые процессы
+err := client.Stop(ctx)  // плавная остановка
+```
+
+- Регистрируйте все kind до `Start`. `Schedule` и `Cancel` работают в любом состоянии.
+- `Start` держит блокировку клиента, пока проверяет схему, поэтому передавайте `ctx` с дедлайном.
+- Клиент запускается один раз. Повторный `Start` возвращает `ErrAlreadyStarted`, `Start` после `Stop` — `ErrStopped`.
+
+`Stop` работает по шагам:
+
+1. Перестаёт забирать новые задачи и останавливает фоновые процессы.
+   Уже начатый захват задач сначала завершается (до 10 с), и его задачи выполняются.
+2. Ждёт выполняющиеся обработчики, пока не истечёт `ctx`.
+3. Если `ctx` истёк, отменяет обработчики, ждёт `StopGrace`, чтобы они сохранили результат,
+   и возвращает `ctx.Err()`. Прерванные задачи возвращаются в `pending` без траты попытки.
+
+Второй одновременный `Stop` ждёт первый, поэтому `defer pool.Close()` безопасен.
+
+## Надёжность
+
+**Упавшие процессы.** Забирая задачу, воркер записывает `deadline = now + Timeout + Grace`.
+Если процесс умер, rescuer (он работает в каждой реплике) находит задачи в `running` с прошедшим дедлайном и
+возвращает их в `pending`, а если попыток не осталось — переводит в `failed`. Падение тратит попытку,
+поэтому задача, которая роняет процесс, не будет перезапускаться бесконечно.
+
+> [!IMPORTANT]
+> Задача упавшего процесса вернётся не раньше чем через `Timeout + Grace`. Для долгих задач ставьте большой `Timeout`.
+
+**Опоздавшие воркеры.** Каждый захват увеличивает счётчик `lease`. Воркер сохраняет результат, только если
+lease совпадает, поэтому медленный воркер не может перезаписать результат более нового запуска.
+
+**Обработчики, которые игнорируют `ctx`.** Go не умеет останавливать горутину снаружи. После `Timeout + Grace`
+задача помечается как зависшая (лог и метрика), а слот воркера занят, пока обработчик не вернётся.
+Тем временем rescuer может отдать задачу другому воркеру — в этом процессе или в другой реплике.
+
+**Незарегистрированные kind.** Задачи kind, который не зарегистрирован ни в одной реплике, остаются в `pending`.
+
+## Наблюдаемость
+
+### Логи
+
+Передайте `*slog.Logger` через `WithLogger`. Старт и остановка пишутся на уровне Info, завершённые задачи — Debug,
+ретраи — Info, ошибки и паники — Error (со стек-трейсом).
+
+### Prometheus
+
+```go
+import "github.com/nottolstybai/not-asap/prom"
+
+metrics, err := prom.New(prometheus.DefaultRegisterer,
+	prom.WithJobDurationBuckets([]float64{0.1, 0.5, 1, 5, 30}),
+)
+client, err := notasap.New(pool, notasap.WithObserver(metrics))
+```
 
 | Метрика | Метки |
 |---|---|
-| `notasap_jobs_scheduled_total` | kind |
-| `notasap_jobs_finished_total` | kind, status (done/failed/cancelled) |
-| `notasap_jobs_retried_total` | kind, reason (error/panic/timeout/keep_attempt/shutdown) |
-| `notasap_job_duration_seconds` | kind, outcome (done/failed/cancelled/retried) |
-| `notasap_jobs_running` | kind |
-| `notasap_poll_duration_seconds` | kind |
-| `notasap_jobs_rescued_total` | kind |
-| `notasap_jobs_stuck_total` | kind |
-| `notasap_janitor_deleted_total` | status |
+| `notasap_jobs_scheduled_total` | `kind` |
+| `notasap_jobs_finished_total` | `kind`, `status` (`done`, `failed`, `cancelled`) |
+| `notasap_jobs_retried_total` | `kind`, `reason` (`error`, `panic`, `timeout`, `keep_attempt`, `shutdown`) |
+| `notasap_job_duration_seconds` | `kind`, `outcome` |
+| `notasap_jobs_running` | `kind` |
+| `notasap_poll_duration_seconds` | `kind` |
+| `notasap_jobs_rescued_total` | `kind` |
+| `notasap_jobs_stuck_total` | `kind` |
+| `notasap_janitor_deleted_total` | `status` |
 
-Для другой системы метрик реализуйте `notasap.Observer`; встройте `notasap.NopObserver`, чтобы переопределить лишь нужные методы. Реализация должна быть потокобезопасной и не блокироваться.
+`scheduled_total` растёт при успешной вставке, поэтому для `ScheduleTx` он учитывает и задачи
+из транзакций, которые потом откатились.
+
+Для другой системы метрик реализуйте интерфейс `notasap.Observer`
+(встройте `notasap.NopObserver`, чтобы переопределить только нужное).
+
+## Миграции
+
+Схема поставляется в двух форматах и встроена в пакет [`migrations`](migrations):
+
+| Инструмент | Файлы | Встроенная FS |
+|---|---|---|
+| [goose](https://github.com/pressly/goose) | `migrations/goose/` | `migrations.Goose` |
+| [golang-migrate](https://github.com/golang-migrate/migrate) | `migrations/golang-migrate/` | `migrations.GolangMigrate` |
+
+Либо скопируйте файл в свою папку миграций, либо запускайте встроенные файлы с
+**отдельной таблицей версий**, чтобы их номера не пересекались с вашими:
+
+<details>
+<summary>goose</summary>
+
+```go
+db := stdlib.OpenDBFromPool(pool) // github.com/jackc/pgx/v5/stdlib
+goose.SetBaseFS(migrations.Goose)
+goose.SetTableName("notasap_goose_version")
+if err := goose.SetDialect("postgres"); err != nil { /* ... */ }
+if err := goose.Up(db, "goose"); err != nil { /* ... */ }
+```
+
+</details>
+
+<details>
+<summary>golang-migrate</summary>
+
+```go
+src, _ := iofs.New(migrations.GolangMigrate, "golang-migrate")
+m, _ := migrate.NewWithSourceInstance("iofs", src,
+	"pgx5://localhost:5432/app?x-migrations-table=notasap_schema_migrations")
+if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) { /* ... */ }
+```
+
+</details>
+
+Таблица всегда называется `notasap_jobs`. Чтобы держать её в отдельной схеме, задайте `search_path` в пуле.
 
 ## Разработка
 
-```bash
-make test    # go test -race ./... (интеграционным тестам нужен Docker)
-make cover   # покрытие по пакетам
+```sh
+make test-unit   # быстрые тесты без базы
+make test        # все тесты; поднимает Postgres через testcontainers (нужен Docker)
+make cover       # отчёт о покрытии
 make vet
 ```
 
-Интеграционные тесты используют testcontainers (`postgres:16-alpine`) и пропускаются при `-short`.
+Задайте `NOTASAP_TEST_DSN`, чтобы гонять интеграционные тесты на своей базе вместо контейнера.
+
+## Лицензия
+
+[MIT](LICENSE). Можно использовать в любом проекте, коммерческом и нет.

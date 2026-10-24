@@ -1,223 +1,431 @@
-# not-asap
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+    <img alt="notasap" src="docs/assets/logo-light.svg" width="380">
+  </picture>
+</p>
 
-Delayed background jobs on top of PostgreSQL, for Go. No broker: just the database your service already has.
+<p align="center">
+  <b>Delayed background jobs for Go, stored in the Postgres you already run.</b>
+</p>
 
-*На русском: [README.ru.md](README.ru.md).*
+<p align="center">
+  <a href="https://pkg.go.dev/github.com/nottolstybai/not-asap"><img alt="Go Reference" src="https://pkg.go.dev/badge/github.com/nottolstybai/not-asap.svg"></a>
+  <img alt="Go 1.26+" src="https://img.shields.io/badge/go-1.26%2B-00ADD8?logo=go&logoColor=white">
+  <img alt="PostgreSQL 14+" src="https://img.shields.io/badge/postgres-14%2B-4169E1?logo=postgresql&logoColor=white">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green"></a>
+</p>
 
-- Type-safe handlers via generics; payloads are JSON.
-- Schedule inside your own transaction (`ScheduleTx`) for the outbox pattern.
-- Delayed jobs, retries with backoff, idempotency keys, cancellation.
-- One worker pool per kind, a rescuer for stuck jobs, a janitor for finished ones.
-- Graceful shutdown; optional Prometheus metrics in the `prom` subpackage.
+<p align="center">
+  <b>English</b> · <a href="README.ru.md">Русский</a>
+</p>
 
-Requirements: Go 1.26+, PostgreSQL 14+, `*pgxpool.Pool` from [pgx v5](https://github.com/jackc/pgx).
+---
 
-```bash
-go get github.com/nottolstybai/not-asap
-```
-
-## Migrations
-
-The schema is one table, `notasap_jobs`. Either copy a file into your own migrations directory, or apply the embedded FS with a **separate version table**, so numbering does not collide with your service's migrations.
-
-- Files: `migrations/goose/00001_notasap_jobs.sql`, `migrations/golang-migrate/000001_notasap_jobs.{up,down}.sql`.
-- Embedded: `migrations.Goose` and `migrations.GolangMigrate` (package `github.com/nottolstybai/not-asap/migrations`).
-
-goose:
-
-```go
-goose.SetBaseFS(migrations.Goose)
-goose.SetTableName("notasap_goose_version")
-err := goose.Up(db, "goose") // db is *sql.DB, e.g. from stdlib.OpenDBFromPool(pool)
-```
-
-or, with the provider API, `goose.NewProvider(goose.DialectPostgres, db, sub, goose.WithTableName("notasap_goose_version"))` where `sub, _ := fs.Sub(migrations.Goose, "goose")`.
-
-golang-migrate:
+**notasap** runs background jobs inside your Go service, using one Postgres table as the queue.
+There is no broker to deploy. Because a job is a row, you can schedule it **in the same transaction**
+as your business data: the job exists only if the transaction commits.
 
 ```go
-src, _ := iofs.New(migrations.GolangMigrate, "golang-migrate")
-m, _ := migrate.NewWithSourceInstance("iofs", src,
-    dsn+"&x-migrations-table=notasap_schema_migrations") // dsn already has a query string
-err := m.Up()
+tx, _ := pool.Begin(ctx)
+orderID := createOrder(ctx, tx, order)                       // your data
+client.ScheduleTx(ctx, tx, SendInvoice{OrderID: orderID})    // your job
+tx.Commit(ctx)                                               // both or neither
 ```
 
-All SQL is unqualified, so isolate the table with the connection's `search_path` if needed. `Start` fails with a clear error if the table is missing.
+## Contents
+
+- [Features](#features)
+- [Quick start](#quick-start)
+- [How it works](#how-it-works)
+- [Writing handlers](#writing-handlers)
+- [Scheduling jobs](#scheduling-jobs)
+- [Configuration](#configuration)
+- [Running and stopping](#running-and-stopping)
+- [Reliability](#reliability)
+- [Observability](#observability)
+- [Migrations](#migrations)
+- [Development](#development)
+- [License](#license)
+
+## Features
+
+- **Transactional scheduling.** `ScheduleTx` writes the job in your `pgx.Tx`.
+- **Typed handlers.** Payloads are plain Go structs; handlers receive them already decoded.
+- **Delays, retries, timeouts.** Start a job later, retry it with constant or exponential backoff, and cap each run with a timeout.
+- **Idempotency keys.** Schedule the same logical job twice and get the first one back, or replace it on purpose.
+- **Per-kind worker pools.** Every job kind has its own workers, so a slow kind never starves the others.
+- **Crash recovery.** Jobs of a crashed process are picked up again; late results of a stale worker are rejected.
+- **Graceful shutdown.** `Stop` drains running jobs; interrupted jobs go back to the queue without losing an attempt.
+- **Housekeeping.** A janitor deletes old finished jobs on a per-status schedule.
+- **Observability.** `log/slog` logging and an optional Prometheus collector.
 
 ## Quick start
 
-A complete program is in [examples/basic](examples/basic/main.go).
+### 1. Install
+
+```sh
+go get github.com/nottolstybai/not-asap
+```
+
+Requires Go 1.26+, PostgreSQL 14+ and [pgx v5](https://github.com/jackc/pgx).
+
+### 2. Create the table
+
+Apply the migration from [`migrations/`](migrations) with your migration tool
+(see [Migrations](#migrations)).
+
+### 3. Define a job and run the client
 
 ```go
-const KindSendInvoice notasap.Kind = 1 // stored in the DB: never change or reuse
+package main
+
+import (
+	"context"
+	"log"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	notasap "github.com/nottolstybai/not-asap"
+)
+
+// The kind number is stored in the database. Never change or reuse it.
+const KindSendInvoice notasap.Kind = 1
 
 type SendInvoice struct {
-    OrderID int64  `json:"order_id"`
-    Email   string `json:"email"`
+	OrderID int64 `json:"order_id"`
 }
 
 func (SendInvoice) Kind() notasap.Kind { return KindSendInvoice }
 
-client, err := notasap.New(pool)
-err = notasap.Register(client, handle, notasap.KindConfig{Name: "send_invoice"})
-err = client.Start(ctx) // does not block
+func sendInvoice(ctx context.Context, job *notasap.Job[SendInvoice]) error {
+	notasap.Logger(ctx).Info("sending invoice", "order_id", job.Payload.OrderID)
+	return nil // done
+}
 
-id, err := client.Schedule(ctx, SendInvoice{OrderID: 42, Email: "a@b.c"},
-    notasap.WithDelay(time.Minute),
-    notasap.WithIdempotencyKey("invoice-42"))
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-err = client.Stop(shutdownCtx)
-```
+	pool, err := pgxpool.New(ctx, "postgres://localhost:5432/app")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer pool.Close()
 
-```go
-func handle(ctx context.Context, job *notasap.Job[SendInvoice]) error {
-    notasap.Logger(ctx).Info("sending", "order", job.Payload.OrderID) // logger has job_id, kind, attempt
-    return send(ctx, job.Payload)
+	client, err := notasap.New(pool)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = notasap.Register(client, sendInvoice, notasap.KindConfig{Name: "send_invoice"})
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := client.Start(ctx); err != nil {
+		log.Fatal(err)
+	}
+
+	_, err = client.Schedule(ctx, SendInvoice{OrderID: 42}, notasap.WithDelay(time.Minute))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	<-ctx.Done()
+	stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = client.Stop(stopCtx)
 }
 ```
 
-Kinds are numbers (`int16`, must be > 0) stored in the database. The `KindConfig.Name` is required, unique, and used only in logs and metrics. Payload types must be non-pointer, non-interface types. Registering must happen before `Start`.
+A runnable version is in [`examples/basic`](examples/basic).
 
-The client lifecycle is single-use: `new -> started -> stopped`. A second `Start` returns `ErrAlreadyStarted`, `Start` after `Stop` returns `ErrStopped`, `Stop` on a client that is not running returns `nil`, but still moves it to stopped, so a later `Start` returns `ErrStopped`. A repeated or concurrent `Stop` waits until the first `Stop` returns (or its own `ctx` is done, then it returns `ctx.Err()`). `Start` holds the client lock during its schema check, so pass it a `ctx` with a deadline. `Schedule*` and `Cancel` work in any state, they only write to the database.
+## How it works
 
-## Handler outcomes
+Every job is a row in `notasap_jobs`. Each registered kind has a poller that claims
+ready rows with `FOR UPDATE SKIP LOCKED` and hands them to that kind's workers.
+Replicas of your service share the table and never claim the same row twice.
 
-| Handler result | What happens |
-|---|---|
-| `nil` | `done` |
-| error wrapping `ErrCancel` | `cancelled`, the error text is stored |
-| error wrapping `ErrKeepAttempt` | back to `pending`, the attempt is **not** spent, `run_at = NOW() + Backoff(job.Attempt)`. No limit: use with care, watch `reason=keep_attempt` |
-| any other error, panic, kind `Timeout` | `attempt >= MaxAttempts`: `failed`; otherwise `pending` with `run_at = NOW() + Backoff(attempt)`. The error is stored; a panic is logged with a stack |
-| payload cannot be decoded | `failed` at once (retrying is pointless) |
-| interrupted by shutdown (handler returned an error) | `pending`, the attempt is refunded, `run_at = NOW()` |
-| returned `nil` despite shutdown | `done` |
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> pending: Schedule
+    pending --> running: claimed by a worker
+    running --> done: handler returns nil
+    running --> pending: retry (attempts left),<br/>ErrKeepAttempt, shutdown
+    running --> failed: attempts used up,<br/>payload cannot be decoded
+    running --> cancelled: handler returns ErrCancel
+    pending --> cancelled: client.Cancel(id)
+    done --> [*]: janitor
+    cancelled --> [*]: janitor
+```
 
-Error text is truncated to 4096 bytes on a rune boundary.
+> [!NOTE]
+> Delivery is **at least once**. A job can run more than once (for example after a crash),
+> so handlers must be idempotent.
 
-An attempt is spent at claim time, so a process crash also costs an attempt (protection against poison jobs). Delivery is **at-least-once**: a job can run more than once (crash, rescue, shutdown), so handlers must be idempotent.
+## Writing handlers
 
-## Idempotency
-
-`WithIdempotencyKey(key)` makes `(kind, key)` unique while the row exists. Rows leave through the janitor, so a key is freed when a `done`/`cancelled` row is deleted (a `failed` row is kept forever by default).
-
-| Existing row | without `WithReplace` | with `WithReplace` |
-|---|---|---|
-| none | inserted | inserted |
-| `pending`, `done`, `failed`, `cancelled` | `ErrDuplicate` + ID of the existing job | the same row is **overwritten** (ID kept): new payload, `pending`, `attempt=0`, `max_attempts` from current config, no error, new `run_at` |
-| `running` | `ErrDuplicate` + ID | `ErrJobRunning` + ID |
-
-`WithReplace` requires `WithIdempotencyKey`. In both cases the returned ID is the existing job's.
-
-Notes:
-
-- `ScheduleTx` with `WithReplace` locks the matched row until your transaction ends, also when the row is running and `ErrJobRunning` is returned. A long transaction then blocks the worker's status write (10s timeout); the write fails, the job is rescued after its deadline and runs again. Keep such transactions short.
-- Plain duplicates do not lock the existing row.
-- `ScheduleBatch` (no tx) with idempotency keys runs in its own transaction (for batches of 2+ items), because resolving conflicts may take more round trips; without keys it is one round trip.
-
-## Scheduling
+A handler is a function that receives the decoded payload and job metadata:
 
 ```go
-id, err := client.Schedule(ctx, p, opts...)
-id, err := client.ScheduleTx(ctx, tx, p, opts...)          // visible when tx commits
-res, err := client.ScheduleBatch(ctx, notasap.Item(p1, opts...), notasap.Item(p2))
+func handle(ctx context.Context, job *notasap.Job[SendInvoice]) error
+```
+
+`job` carries `ID`, `Kind`, `Payload`, `Attempt` (starts at 1), `MaxAttempts` and `CreatedAt`.
+`ctx` is cancelled when the kind's `Timeout` expires or the client stops, so pass it to every call
+that can block. `notasap.Logger(ctx)` returns a logger with `job_id`, `kind` and `attempt` attached.
+
+What the handler returns decides what happens next:
+
+| Handler result | Job status | Attempt spent? |
+|---|---|---|
+| `nil` | `done` | yes |
+| error wrapping `notasap.ErrCancel` | `cancelled` | yes |
+| error wrapping `notasap.ErrKeepAttempt` | back to `pending` after backoff | **no** |
+| any other error, a panic, or the timeout | `pending` after backoff, or `failed` if no attempts are left | yes |
+| payload cannot be decoded | `failed` immediately | yes |
+| interrupted by `Stop` | `pending`, runs again right away | **no** |
+
+Sentinels are matched with `errors.Is`, so wrap them to keep a useful message:
+
+```go
+if !order.Paid {
+	// The order is not paid yet. Check again later without spending an attempt.
+	return fmt.Errorf("order %d not paid: %w", order.ID, notasap.ErrKeepAttempt)
+}
+```
+
+> [!WARNING]
+> `ErrKeepAttempt` has no limit: a job that always returns it lives forever.
+> Stop retrying yourself, for example once `job.CreatedAt` is too old.
+> Such retries are visible in the metric `notasap_jobs_retried_total{reason="keep_attempt"}`.
+
+Error texts are stored in the `error` column, trimmed to 4 KB on a UTF-8 boundary.
+
+## Scheduling jobs
+
+```go
+id, err := client.Schedule(ctx, payload, opts...)                    // standalone
+id, err := client.ScheduleTx(ctx, tx, payload, opts...)              // inside your pgx.Tx
+res, err := client.ScheduleBatch(ctx, notasap.Item(p1), notasap.Item(p2, opts...))
 res, err := client.ScheduleBatchTx(ctx, tx, items...)
 ```
 
-- `WithDelay(d)`: `run_at = NOW() + d`, using the database clock.
-- A kind without a registered handler gives `ErrUnknownKind`, nothing is written.
-- Batches are atomic. Per-item `ErrDuplicate`/`ErrJobRunning` are in `BatchResult{ID, Err}`; any other error fails the whole batch.
-- `max_attempts` is fixed in the row from the kind's config at scheduling time.
-- The `scheduled_total` metric is counted after the statement succeeds, before your transaction commits, so it overcounts if the `*Tx` caller rolls back.
+| Option | Effect |
+|---|---|
+| `notasap.WithDelay(d)` | the job becomes ready after `d` (database time) |
+| `notasap.WithIdempotencyKey(key)` | at most one job per `(kind, key)` while the row exists |
+| `notasap.WithReplace()` | with a key: overwrite the existing job instead of returning a duplicate |
 
-## Cancel
+Scheduling a kind that is not registered returns `ErrUnknownKind` and writes nothing.
+A batch returns one `BatchResult{ID, Err}` per item; per-item `Err` is only `ErrDuplicate` or `ErrJobRunning`.
+
+### Idempotency keys
+
+When a job with the same kind and key already exists:
+
+| Existing job | Without `WithReplace` | With `WithReplace` |
+|---|---|---|
+| `pending`, `done`, `failed`, `cancelled` | `ErrDuplicate` and the existing ID | the row is overwritten: new payload, `pending`, attempts reset, same ID |
+| `running` | `ErrDuplicate` and the existing ID | `ErrJobRunning` and the existing ID |
+
+The key is free again once the janitor deletes the old row. Failed jobs are kept forever by default,
+so their keys stay taken until you replace them.
 
 ```go
-err := client.Cancel(ctx, id)
+id, err := client.Schedule(ctx, SendInvoice{OrderID: 42},
+	notasap.WithIdempotencyKey("invoice:42"))
+if errors.Is(err, notasap.ErrDuplicate) {
+	// already scheduled; id points to the existing job
+}
 ```
 
-`pending -> cancelled`. Returns `ErrJobRunning` for a running job, `ErrJobFinished` if it is already done/failed/cancelled, `ErrNotFound` if there is no such row. To stop a running job from the inside, return `ErrCancel` from the handler.
+<details>
+<summary>Locking details</summary>
+
+- A batch of 2+ items with idempotency keys passed to `ScheduleBatch` runs in its own transaction, so it is all or nothing.
+- `ScheduleTx` with `WithReplace` locks the existing row until your transaction ends, even when that row is `running`.
+  Keep such transactions short: a worker that finishes the job meanwhile waits for the lock.
+
+</details>
+
+### Cancelling a pending job
+
+```go
+err := client.Cancel(ctx, id) // nil, ErrJobRunning, ErrJobFinished or ErrNotFound
+```
+
+Only `pending` jobs can be cancelled from outside. A running job stops only by its handler's decision.
 
 ## Configuration
 
-Zero fields fall back to `WithDefaults`, then to built-in defaults.
-
-| Option | Field | Default |
-|---|---|---|
-| `KindConfig` | `Workers` | 5 |
-| | `MaxAttempts` | 3 |
-| | `Timeout` | 1m |
-| | `Backoff` | `Exponential(5s, 10m)` |
-| | `PollInterval` | 1s |
-| `WithRescuer(RescuerConfig)` | `Interval` | 30s |
-| | `Grace` | 30s |
-| `WithJanitor(JanitorConfig)` | `Interval` | 10m |
-| | `BatchSize` | 1000 |
-| | `Retention` | done 24h, cancelled 24h, failed 0 (keep) |
-| | `Disabled` | false |
-| `WithStopGrace(d)` | | 5s |
-| `WithLogger(*slog.Logger)` | | `slog.Default()` |
-| `WithObserver(Observer)` | | no-op |
-
-- `WithDefaults(KindConfig{...})` sets client-wide kind defaults (its `Name` must be empty).
-- Backoff: `Constant(d)`, `Exponential(base, max)` (doubling, jitter in `[d/2, d]`, overflow-safe), or your own `func(attempt int) time.Duration`. The constructors panic on invalid arguments, like `regexp.MustCompile`; call them at setup.
-- Janitor `Retention` is merged per key over the defaults: `{StatusDone: time.Hour}` keeps `cancelled` at 24h. Use an explicit `0` to never delete a status. Only done, failed and cancelled are allowed.
-- `Disabled` is sticky: once any `WithJanitor` sets it, a later `WithJanitor(JanitorConfig{})` does not re-enable it.
-- All configuration is validated in `New`/`Register` and returned as an error.
-
-## Rescuer and long jobs
-
-A claimed job gets `deadline = claim + Timeout + Rescuer.Grace`. The rescuer (always on) returns running jobs past their deadline to `pending` with the kind's backoff, or to `failed` if attempts are exhausted (`error = "rescued: deadline exceeded"`). All instances of a service share this, and a late write from the old worker is rejected by a lease counter (fencing).
-
-There is no heartbeat, so a job lost with a crashed process comes back no sooner than `Timeout + Grace`. For long jobs set a large `Timeout`.
-
-A handler that ignores `ctx` keeps its worker slot. Once the rescuer returns its job to `pending`, any free slot, in this process or another, may claim it again while the stale handler still runs; the stale handler's result is rejected by the lease. If it has not returned `Rescuer.Grace` after `Timeout`, the pool logs an error and reports `stuck`. The slot stays busy until it returns.
-
-Jobs of a kind that is not registered in a process stay `pending` there and are not claimed by that process; another process that registers the kind will take them.
-
-## Shutdown
-
-`Stop(ctx)`:
-
-1. stops polling, the rescuer and the janitor;
-2. waits for running handlers until `ctx` is done;
-3. if `ctx` expires, cancels handler contexts (cause: shutdown), waits `StopGrace` for them to record the status, and returns `ctx.Err()`.
-
-Interrupted jobs go back to `pending` with their attempt refunded. If `Stop` times out, handlers that ignore their context may still be running after it returns; their jobs are left to the rescuer.
-
-## Metrics
-
-The core has no dependencies; it reports to an `Observer`. The `prom` subpackage implements it for Prometheus:
+Client options (all optional):
 
 ```go
-m, err := prom.New(prometheus.DefaultRegisterer,
-    prom.WithJobDurationBuckets([]float64{0.1, 1, 10, 60}),
-    prom.WithPollDurationBuckets([]float64{0.001, 0.01, 0.1}),
+client, err := notasap.New(pool,
+	notasap.WithLogger(slog.Default()),
+	notasap.WithObserver(metrics),                                  // see Observability
+	notasap.WithDefaults(notasap.KindConfig{Workers: 10}),          // defaults for every kind
+	notasap.WithRescuer(notasap.RescuerConfig{Interval: time.Minute}),
+	notasap.WithJanitor(notasap.JanitorConfig{BatchSize: 500}),
+	notasap.WithStopGrace(10*time.Second),
 )
-client, err := notasap.New(pool, notasap.WithObserver(m))
 ```
 
-`prom.New` returns an error (no panic) on a nil registerer, duplicate registration or invalid buckets. Defaults: job duration `ExponentialBuckets(0.005, 2, 15)`, poll `ExponentialBuckets(0.0005, 2, 12)`. The `kind` label is `KindConfig.Name`.
+Per-kind settings in `KindConfig`. Zero fields fall back to `WithDefaults`, then to the built-in defaults:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `Name` | required | name used in logs and metrics |
+| `Workers` | `5` | handlers running at the same time |
+| `MaxAttempts` | `3` | attempts before the job is `failed` |
+| `Timeout` | `1m` | limit for one handler run |
+| `Backoff` | `Exponential(5s, 10m)` | delay before a retry (`Constant(d)`, `Exponential(base, max)` or your own func) |
+| `PollInterval` | `1s` | how often an idle kind checks for ready jobs |
+
+Background loops:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `RescuerConfig.Interval` | `30s` | how often stuck jobs are looked for |
+| `RescuerConfig.Grace` | `30s` | extra time after `Timeout` before a running job counts as stuck |
+| `JanitorConfig.Interval` | `10m` | how often finished jobs are deleted |
+| `JanitorConfig.BatchSize` | `1000` | rows per delete statement |
+| `JanitorConfig.Retention` | done `24h`, cancelled `24h`, failed `0` | how long to keep each status; `0` = keep forever |
+| `JanitorConfig.Disabled` | `false` | turn the janitor off (cannot be turned back on by a later `WithJanitor`) |
+| `WithStopGrace` | `5s` | how long `Stop` waits for handlers to save their result after cancelling them |
+
+`Retention` is merged per status: `Retention{StatusDone: time.Hour}` keeps the other defaults.
+Invalid values are reported by `New` and `Register`, never as a panic at run time.
+
+## Running and stopping
+
+```go
+err := client.Start(ctx) // checks the table exists, then starts workers and background loops
+err := client.Stop(ctx)  // graceful shutdown
+```
+
+- `Register` every kind before `Start`. `Schedule` and `Cancel` work in any state.
+- `Start` holds the client lock while it checks the schema, so give it a `ctx` with a deadline.
+- A client starts once. A second `Start` returns `ErrAlreadyStarted`; `Start` after `Stop` returns `ErrStopped`.
+
+`Stop` works in steps:
+
+1. Stops claiming new jobs and stops the background loops.
+   A claim already in flight finishes first (up to 10 s), and its jobs are run.
+2. Waits for running handlers until `ctx` is done.
+3. If `ctx` expires, cancels the handlers, waits `StopGrace` for them to save their result,
+   and returns `ctx.Err()`. Interrupted jobs go back to `pending` without losing an attempt.
+
+A second concurrent `Stop` waits for the first one, so `defer pool.Close()` is safe.
+
+## Reliability
+
+**Crashed processes.** When a worker claims a job it sets `deadline = now + Timeout + Grace`.
+If the process dies, the rescuer (running in every replica) finds `running` jobs past their deadline and
+returns them to `pending`, or marks them `failed` if no attempts are left. A crash spends an attempt,
+so a job that keeps crashing the process cannot loop forever.
+
+> [!IMPORTANT]
+> A crashed job is retried only after `Timeout + Grace`. For long jobs use a long `Timeout`.
+
+**Stale workers.** Every claim increments a `lease` counter. A worker saves its result only if the
+lease still matches, so a worker that was too slow cannot overwrite the result of a newer run.
+
+**Handlers that ignore `ctx`.** Go cannot stop a goroutine from outside. After `Timeout + Grace` the job
+is reported as stuck (log and metric) and its worker slot stays busy until the handler returns.
+Meanwhile the rescuer may give the job to another worker, in this process or another replica.
+
+**Unregistered kinds.** Jobs of a kind that no replica registers stay `pending`.
+
+## Observability
+
+### Logs
+
+Pass a `*slog.Logger` with `WithLogger`. Start and stop are logged at Info, finished jobs at Debug,
+retries at Info, failures and panics at Error (with stack trace).
+
+### Prometheus
+
+```go
+import "github.com/nottolstybai/not-asap/prom"
+
+metrics, err := prom.New(prometheus.DefaultRegisterer,
+	prom.WithJobDurationBuckets([]float64{0.1, 0.5, 1, 5, 30}),
+)
+client, err := notasap.New(pool, notasap.WithObserver(metrics))
+```
 
 | Metric | Labels |
 |---|---|
-| `notasap_jobs_scheduled_total` | kind |
-| `notasap_jobs_finished_total` | kind, status (done/failed/cancelled) |
-| `notasap_jobs_retried_total` | kind, reason (error/panic/timeout/keep_attempt/shutdown) |
-| `notasap_job_duration_seconds` | kind, outcome (done/failed/cancelled/retried) |
-| `notasap_jobs_running` | kind |
-| `notasap_poll_duration_seconds` | kind |
-| `notasap_jobs_rescued_total` | kind |
-| `notasap_jobs_stuck_total` | kind |
-| `notasap_janitor_deleted_total` | status |
+| `notasap_jobs_scheduled_total` | `kind` |
+| `notasap_jobs_finished_total` | `kind`, `status` (`done`, `failed`, `cancelled`) |
+| `notasap_jobs_retried_total` | `kind`, `reason` (`error`, `panic`, `timeout`, `keep_attempt`, `shutdown`) |
+| `notasap_job_duration_seconds` | `kind`, `outcome` |
+| `notasap_jobs_running` | `kind` |
+| `notasap_poll_duration_seconds` | `kind` |
+| `notasap_jobs_rescued_total` | `kind` |
+| `notasap_jobs_stuck_total` | `kind` |
+| `notasap_janitor_deleted_total` | `status` |
 
-To export elsewhere, implement `notasap.Observer`; embed `notasap.NopObserver` to override only some methods. Implementations must be concurrency-safe and not block.
+`scheduled_total` is counted when the insert succeeds, so with `ScheduleTx` it also counts jobs
+of transactions that are later rolled back.
+
+To use another metrics system, implement the `notasap.Observer` interface
+(embed `notasap.NopObserver` to override only what you need).
+
+## Migrations
+
+The schema ships in two formats, embedded in the [`migrations`](migrations) package:
+
+| Tool | Files | Embedded FS |
+|---|---|---|
+| [goose](https://github.com/pressly/goose) | `migrations/goose/` | `migrations.Goose` |
+| [golang-migrate](https://github.com/golang-migrate/migrate) | `migrations/golang-migrate/` | `migrations.GolangMigrate` |
+
+Either copy the file into your own migrations directory, or run the embedded files with a
+**separate version table**, so their numbers never clash with yours:
+
+<details>
+<summary>goose</summary>
+
+```go
+db := stdlib.OpenDBFromPool(pool) // github.com/jackc/pgx/v5/stdlib
+goose.SetBaseFS(migrations.Goose)
+goose.SetTableName("notasap_goose_version")
+if err := goose.SetDialect("postgres"); err != nil { /* ... */ }
+if err := goose.Up(db, "goose"); err != nil { /* ... */ }
+```
+
+</details>
+
+<details>
+<summary>golang-migrate</summary>
+
+```go
+src, _ := iofs.New(migrations.GolangMigrate, "golang-migrate")
+m, _ := migrate.NewWithSourceInstance("iofs", src,
+	"pgx5://localhost:5432/app?x-migrations-table=notasap_schema_migrations")
+if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) { /* ... */ }
+```
+
+</details>
+
+The table name is always `notasap_jobs`. To keep it in a separate schema, set `search_path` on the pool.
 
 ## Development
 
-```bash
-make test    # go test -race ./... (integration tests need Docker)
-make cover   # coverage across packages
+```sh
+make test-unit   # fast tests, no database
+make test        # all tests; starts Postgres with testcontainers (needs Docker)
+make cover       # coverage report
 make vet
 ```
 
-Integration tests use testcontainers (`postgres:16-alpine`) and are skipped under `-short`.
+Set `NOTASAP_TEST_DSN` to run the integration tests against your own database instead of a container.
+
+## License
+
+[MIT](LICENSE). Use it in any project, commercial or not.

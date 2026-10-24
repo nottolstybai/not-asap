@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="380" height="120" viewBox="0 0 380 120" role="img" aria-labelledby="title">
+  <title id="title">notasap</title>
+  <g fill="none" stroke-linecap="round">
+    <circle cx="60" cy="60" r="44" stroke="#1f2433" stroke-width="6"/>
+    <path d="M60 18v5M102 60h-5M60 102v-5M18 60h5" stroke="#1f2433" stroke-width="4"/>
+    <path d="M60 28 A32 32 0 0 1 87.7 76" stroke="#6366f1" stroke-width="6" stroke-dasharray="2 9"/>
+    <path d="M60 60V34" stroke="#1f2433" stroke-width="6"/>
+    <path d="M60 60l17.3 10" stroke="#6366f1" stroke-width="7"/>
+  </g>
+  <circle cx="60" cy="60" r="5" fill="#6366f1"/>
+  <g font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="58" font-weight="800" letter-spacing="-1.5">
+    <text x="128" y="80" fill="#1f2433">not</text>
+    <text x="226" y="80" fill="#6366f1">asap</text>
+  </g>
+  <path d="M222 61h136" stroke="#1f2433" stroke-width="6" stroke-linecap="round"/>
+</svg>
