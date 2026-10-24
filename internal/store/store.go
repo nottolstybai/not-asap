@@ -19,6 +19,9 @@ type DB interface {
 	SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
 }
 
+// statusRunning is the running value of the status column.
+const statusRunning = 2
+
 // Store executes notasap queries against a pool.
 type Store struct {
 	pool *pgxpool.Pool

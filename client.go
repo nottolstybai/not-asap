@@ -1,6 +1,7 @@
 package notasap
 
 import (
+	"context"
 	"errors"
 	"sync"
 
@@ -11,7 +12,11 @@ import (
 
 // jobStore is the persistence contract of the Client; methods are added as
 // the features that need them are introduced.
-type jobStore interface{}
+type jobStore interface {
+	Insert(ctx context.Context, db store.DB, params []store.InsertParams) ([]store.InsertResult, error)
+}
+
+var _ jobStore = (*store.Store)(nil)
 
 type clientState int
 
