@@ -28,6 +28,8 @@ type Client struct {
 	db    store.DB
 	mu    sync.Mutex
 	state clientState
+	kinds map[Kind]*kindEntry
+	names map[string]Kind
 }
 
 // New creates a Client over pool. It validates all options and returns the
@@ -49,5 +51,11 @@ func newClient(st jobStore, db store.DB, opts ...Option) (*Client, error) {
 			return nil, err
 		}
 	}
-	return &Client{options: o, st: st, db: db}, nil
+	return &Client{
+		options: o,
+		st:      st,
+		db:      db,
+		kinds:   make(map[Kind]*kindEntry),
+		names:   make(map[string]Kind),
+	}, nil
 }

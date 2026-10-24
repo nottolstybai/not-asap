@@ -3,6 +3,7 @@ package store
 
 import (
 	"context"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -26,4 +27,15 @@ type Store struct {
 // New returns a Store backed by pool.
 func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
+}
+
+// ClaimedJob is a job row taken for execution.
+type ClaimedJob struct {
+	ID          int64
+	Kind        int16
+	Payload     []byte
+	Attempt     int
+	MaxAttempts int
+	Lease       int64
+	CreatedAt   time.Time
 }
