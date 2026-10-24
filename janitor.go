@@ -1,0 +1,52 @@
+package notasap
+
+import "time"
+
+// janitorStatuses is the order in which the janitor cleans statuses.
+var janitorStatuses = [...]Status{StatusDone, StatusFailed, StatusCancelled}
+
+// janitorLoop deletes old finished jobs: once at start, then every janitor
+// Interval until the client stops.
+func (c *Client) janitorLoop() {
+	ticker := time.NewTicker(c.janitor.Interval)
+	defer ticker.Stop()
+	for {
+		c.clean()
+		select {
+		case <-ticker.C:
+		case <-c.stopCh:
+			return
+		}
+	}
+}
+
+// clean deletes, status by status, jobs past their retention in batches
+// until one comes back short or the client stops.
+func (c *Client) clean() {
+	for _, status := range janitorStatuses {
+		retention := c.janitor.Retention[status]
+		if retention <= 0 {
+			continue
+		}
+		var total int64
+		for c.bgCtx.Err() == nil {
+			n, err := c.st.DeleteFinished(c.bgCtx, int16(status), retention, c.janitor.BatchSize)
+			if err != nil {
+				if c.bgCtx.Err() == nil {
+					c.logger.Error("notasap: delete finished jobs", "status", status, "error", err)
+				}
+				break
+			}
+			if n > 0 {
+				c.observer.JanitorDeleted(status, n)
+				total += n
+			}
+			if n < int64(c.janitor.BatchSize) {
+				break
+			}
+		}
+		if total > 0 {
+			c.logger.Debug("notasap: janitor deleted finished jobs", "status", status, "count", total)
+		}
+	}
+}

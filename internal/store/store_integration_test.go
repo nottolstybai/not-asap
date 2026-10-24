@@ -288,3 +288,46 @@ func (s *StoreSuite) TestRescueNothing() {
 	s.Require().NoError(err)
 	s.Zero(n)
 }
+
+func (s *StoreSuite) TestDeleteFinished() {
+	insert := func(status int16, age time.Duration) int64 {
+		var id int64
+		s.Require().NoError(s.Pool.QueryRow(context.Background(), `
+INSERT INTO notasap_jobs (kind, status, payload, max_attempts, updated_at)
+VALUES (1, $1, '{}', 3, NOW() - make_interval(secs => $2)) RETURNING id`,
+			status, age.Seconds()).Scan(&id))
+		return id
+	}
+	exists := func(id int64) bool {
+		var ok bool
+		s.Require().NoError(s.Pool.QueryRow(context.Background(),
+			"SELECT EXISTS (SELECT 1 FROM notasap_jobs WHERE id = $1)", id).Scan(&ok))
+		return ok
+	}
+	oldest := insert(3, 5*time.Hour)
+	older := insert(3, 4*time.Hour)
+	old := insert(3, 3*time.Hour)
+	fresh := insert(3, time.Minute)
+	failed := insert(4, 5*time.Hour)
+	pending := insert(1, 5*time.Hour)
+
+	ctx := context.Background()
+	n, err := s.st.DeleteFinished(ctx, 3, time.Hour, 2)
+	s.Require().NoError(err)
+	s.Equal(int64(2), n)
+	s.False(exists(oldest))
+	s.False(exists(older))
+	s.True(exists(old))
+
+	n, err = s.st.DeleteFinished(ctx, 3, time.Hour, 2)
+	s.Require().NoError(err)
+	s.Equal(int64(1), n)
+	s.False(exists(old))
+
+	n, err = s.st.DeleteFinished(ctx, 3, time.Hour, 2)
+	s.Require().NoError(err)
+	s.Zero(n)
+	s.True(exists(fresh))
+	s.True(exists(failed))
+	s.True(exists(pending))
+}

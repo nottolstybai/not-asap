@@ -21,6 +21,7 @@ type jobStore interface {
 	Reschedule(ctx context.Context, ref store.Ref, delay time.Duration, errMsg string, refund bool) (bool, error)
 	Cancel(ctx context.Context, id int64) (store.CancelOutcome, error)
 	Rescue(ctx context.Context, limit int, decide func(store.StuckJob) store.RescueDecision) (int, error)
+	DeleteFinished(ctx context.Context, status int16, olderThan time.Duration, limit int) (int64, error)
 	CheckSchema(ctx context.Context) error
 }
 
@@ -128,6 +129,9 @@ func (c *Client) Start(ctx context.Context) error {
 // startMaintenance starts the background maintenance loops in c.bgWG.
 func (c *Client) startMaintenance() {
 	c.bgWG.Go(c.rescueLoop)
+	if !c.janitor.Disabled {
+		c.bgWG.Go(c.janitorLoop)
+	}
 }
 
 // Stop stops polling and maintenance and waits for running handlers until ctx

@@ -119,4 +119,8 @@ func (f *fakeStore) Rescue(context.Context, int, func(store.StuckJob) store.Resc
 	return 0, nil
 }
 
+func (f *fakeStore) DeleteFinished(context.Context, int16, time.Duration, int) (int64, error) {
+	return 0, nil
+}
+
 func (f *fakeStore) CheckSchema(context.Context) error { return nil }
