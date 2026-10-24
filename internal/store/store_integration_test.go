@@ -331,3 +331,33 @@ VALUES (1, $1, '{}', 3, NOW() - make_interval(secs => $2)) RETURNING id`,
 	s.True(exists(failed))
 	s.True(exists(pending))
 }
+
+func (s *StoreSuite) TestInsertOutcomesInParamsOrder() {
+	ctx := context.Background()
+	key := func(k string) *string { return &k }
+	seed, err := s.st.Insert(ctx, s.Pool, []store.InsertParams{
+		{Kind: 1, Payload: []byte("{}"), MaxAttempts: 3, Key: key("dup")},
+		{Kind: 1, Payload: []byte("{}"), MaxAttempts: 3, Key: key("done")},
+		{Kind: 1, Payload: []byte("{}"), MaxAttempts: 3, Key: key("run")},
+	})
+	s.Require().NoError(err)
+	s.Exec("UPDATE notasap_jobs SET status = 3 WHERE id = $1", seed[1].ID)
+	s.Exec("UPDATE notasap_jobs SET status = 2 WHERE id = $1", seed[2].ID)
+
+	res, err := s.st.Insert(ctx, s.Pool, []store.InsertParams{
+		{Kind: 2, Payload: []byte("{}"), MaxAttempts: 3, Key: key("dup")},
+		{Kind: 1, Payload: []byte("{}"), MaxAttempts: 3, Key: key("run"), Replace: true},
+		{Kind: 1, Payload: []byte("{}"), MaxAttempts: 3},
+		{Kind: 1, Payload: []byte("{}"), MaxAttempts: 3, Key: key("done"), Replace: true},
+		{Kind: 1, Payload: []byte("{}"), MaxAttempts: 3, Key: key("dup")},
+	})
+	s.Require().NoError(err)
+	s.Require().Len(res, 5)
+	s.Equal(store.Inserted, res[0].Outcome)
+	s.Equal(store.InsertResult{ID: seed[2].ID, Outcome: store.Running}, res[1])
+	s.Equal(store.Inserted, res[2].Outcome)
+	s.Equal(store.InsertResult{ID: seed[1].ID, Outcome: store.Replaced}, res[3])
+	s.Equal(store.InsertResult{ID: seed[0].ID, Outcome: store.Duplicate}, res[4])
+	s.Equal(int16(1), s.Job(seed[1].ID).Status)
+	s.Equal(int16(2), s.Job(seed[2].ID).Status)
+}

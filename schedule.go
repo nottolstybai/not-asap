@@ -48,10 +48,7 @@ func WithIdempotencyKey(key string) ScheduleOption {
 
 // WithReplace overwrites an existing non-running job with the same idempotency
 // key instead of returning ErrDuplicate. It requires WithIdempotencyKey.
-// Within a caller's tx the matched row stays locked until tx ends, even when
-// it is running and ErrJobRunning is returned: a long tx can block the
-// worker's status write past its 10s timeout, so the job is rescued and runs
-// again.
+// A running job is left as is and ErrJobRunning is returned.
 func WithReplace() ScheduleOption {
 	return func(o *scheduleOptions) { o.replace = true }
 }
@@ -81,8 +78,11 @@ func (c *Client) Schedule(ctx context.Context, p Payload, opts ...ScheduleOption
 }
 
 // ScheduleTx is Schedule within tx. The job becomes visible when tx commits.
-// The observer is notified before the commit. With WithReplace the matched row
-// stays locked until tx ends (see WithReplace); keep such transactions short.
+// The observer is notified before the commit. A keyed schedule holds its key
+// until tx ends, so concurrent schedules of that key wait for tx. Several
+// keyed schedules in one tx must be issued in a consistent (kind, key) order
+// across the application, or Postgres may abort tx with a deadlock (SQLSTATE
+// 40P01); retry tx on 40P01.
 func (c *Client) ScheduleTx(ctx context.Context, tx pgx.Tx, p Payload, opts ...ScheduleOption) (int64, error) {
 	if tx == nil {
 		return 0, errors.New("notasap: ScheduleTx: tx is nil")
@@ -100,7 +100,10 @@ func (c *Client) ScheduleBatch(ctx context.Context, items ...BatchItem) ([]Batch
 }
 
 // ScheduleBatchTx is ScheduleBatch within tx. On a database error tx is
-// aborted; validation errors send no SQL and leave tx usable.
+// aborted; validation errors send no SQL and leave tx usable. Items are
+// inserted in (kind, key) order, but keys scheduled by other calls in the
+// same tx must follow a consistent (kind, key) order across the application,
+// or Postgres may abort tx with a deadlock (SQLSTATE 40P01); retry tx on 40P01.
 func (c *Client) ScheduleBatchTx(ctx context.Context, tx pgx.Tx, items ...BatchItem) ([]BatchResult, error) {
 	if tx == nil {
 		return nil, errors.New("notasap: ScheduleBatchTx: tx is nil")
