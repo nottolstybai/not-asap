@@ -115,4 +115,8 @@ func (f *fakeStore) Cancel(context.Context, int64) (store.CancelOutcome, error) 
 	return 0, nil
 }
 
+func (f *fakeStore) Rescue(context.Context, int, func(store.StuckJob) store.RescueDecision) (int, error) {
+	return 0, nil
+}
+
 func (f *fakeStore) CheckSchema(context.Context) error { return nil }

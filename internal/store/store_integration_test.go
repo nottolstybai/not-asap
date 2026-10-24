@@ -203,3 +203,88 @@ func (s *StoreSuite) TestCheckSchemaMissing() {
 	s.Require().Error(err)
 	s.Contains(err.Error(), "apply migrations")
 }
+
+// insertRunning inserts a running row with the given attempts and a deadline
+// deadlineIn from now.
+func (s *StoreSuite) insertRunning(kind int16, attempt, maxAttempts int, deadlineIn time.Duration) int64 {
+	s.T().Helper()
+	var id int64
+	err := s.Pool.QueryRow(context.Background(), `
+INSERT INTO notasap_jobs (kind, status, payload, attempt, max_attempts, lease, deadline)
+VALUES ($1, 2, '{}', $2, $3, 1, NOW() + make_interval(secs => $4)) RETURNING id`,
+		kind, attempt, maxAttempts, deadlineIn.Seconds()).Scan(&id)
+	s.Require().NoError(err)
+	return id
+}
+
+func (s *StoreSuite) TestRescue() {
+	retry := s.insertRunning(1, 1, 3, -time.Minute)
+	fail := s.insertRunning(7, 3, 3, -2*time.Minute)
+	live := s.insertRunning(1, 1, 3, time.Hour)
+	pending := s.insertJob(1, 1, -time.Second)
+
+	var seen []store.StuckJob
+	n, err := s.st.Rescue(context.Background(), 10, func(j store.StuckJob) store.RescueDecision {
+		seen = append(seen, j)
+		if j.ID == fail {
+			return store.RescueDecision{Fail: true}
+		}
+		return store.RescueDecision{Delay: time.Hour}
+	})
+	s.Require().NoError(err)
+	s.Equal(2, n)
+	s.Equal([]store.StuckJob{
+		{ID: fail, Kind: 7, Attempt: 3, MaxAttempts: 3},
+		{ID: retry, Kind: 1, Attempt: 1, MaxAttempts: 3},
+	}, seen)
+
+	row := s.Job(retry)
+	s.Equal(int16(1), row.Status)
+	s.Equal(1, row.Attempt)
+	s.Equal(int64(1), row.Lease)
+	s.Nil(row.Deadline)
+	s.WithinDuration(time.Now().Add(time.Hour), row.RunAt, 5*time.Second)
+	s.Require().NotNil(row.Error)
+	s.Equal("rescued: deadline exceeded", *row.Error)
+
+	row = s.Job(fail)
+	s.Equal(int16(4), row.Status)
+	s.Nil(row.Deadline)
+	s.Require().NotNil(row.Error)
+	s.Equal("rescued: deadline exceeded", *row.Error)
+
+	s.Equal(int16(2), s.Job(live).Status)
+	s.Equal(int16(1), s.Job(pending).Status)
+}
+
+func (s *StoreSuite) TestRescueLimitAndSkipLocked() {
+	locked := s.insertRunning(1, 1, 3, -3*time.Minute)
+	first := s.insertRunning(1, 1, 3, -2*time.Minute)
+	s.insertRunning(1, 1, 3, -time.Minute)
+	ctx := context.Background()
+	tx, err := s.Pool.Begin(ctx)
+	s.Require().NoError(err)
+	defer func() { _ = tx.Rollback(ctx) }()
+	_, err = tx.Exec(ctx, "SELECT id FROM notasap_jobs WHERE id = $1 FOR UPDATE", locked)
+	s.Require().NoError(err)
+
+	var seen []int64
+	n, err := s.st.Rescue(ctx, 1, func(j store.StuckJob) store.RescueDecision {
+		seen = append(seen, j.ID)
+		return store.RescueDecision{}
+	})
+	s.Require().NoError(err)
+	s.Equal(1, n)
+	s.Equal([]int64{first}, seen)
+	s.Equal(int16(1), s.Job(first).Status)
+}
+
+func (s *StoreSuite) TestRescueNothing() {
+	s.insertRunning(1, 1, 3, time.Hour)
+	n, err := s.st.Rescue(context.Background(), 10, func(store.StuckJob) store.RescueDecision {
+		s.Fail("decide called")
+		return store.RescueDecision{}
+	})
+	s.Require().NoError(err)
+	s.Zero(n)
+}

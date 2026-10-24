@@ -20,6 +20,7 @@ type jobStore interface {
 	Finish(ctx context.Context, ref store.Ref, status int16, errMsg string) (bool, error)
 	Reschedule(ctx context.Context, ref store.Ref, delay time.Duration, errMsg string, refund bool) (bool, error)
 	Cancel(ctx context.Context, id int64) (store.CancelOutcome, error)
+	Rescue(ctx context.Context, limit int, decide func(store.StuckJob) store.RescueDecision) (int, error)
 	CheckSchema(ctx context.Context) error
 }
 
@@ -125,7 +126,9 @@ func (c *Client) Start(ctx context.Context) error {
 }
 
 // startMaintenance starts the background maintenance loops in c.bgWG.
-func (c *Client) startMaintenance() {}
+func (c *Client) startMaintenance() {
+	c.bgWG.Go(c.rescueLoop)
+}
 
 // Stop stops polling and maintenance and waits for running handlers until ctx
 // is done. Then it cancels handler contexts, waits up to the stop grace for
