@@ -1,8 +1,10 @@
 package store_test
 
 import (
+	"cmp"
 	"context"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -43,17 +45,29 @@ VALUES ($1, $2, '{}', 3, NOW() + make_interval(secs => $3)) RETURNING id`,
 }
 
 func (s *StoreSuite) TestClaimOrderAndLimit() {
-	a := s.insertJob(1, 1, -3*time.Second)
-	b := s.insertJob(1, 1, -2*time.Second)
-	s.insertJob(1, 1, -time.Second)
-	s.insertJob(2, 1, -4*time.Second)
+	// Without the claim index Postgres would otherwise return index order
+	// even if the query lost its ORDER BY, hiding the bug.
+	s.Exec("DROP INDEX notasap_jobs_claim_idx")
+	s.T().Cleanup(func() {
+		s.Exec("CREATE INDEX notasap_jobs_claim_idx ON notasap_jobs (kind, run_at, id) WHERE status = 1")
+	})
+	// run_at order differs from id order: id1 is the latest, id2 and id3 tie.
+	latest := s.insertJob(1, 1, -time.Second)
+	tieLow := s.insertJob(1, 1, -3*time.Second)
+	tieHigh := s.insertJob(1, 1, -4*time.Second)
+	s.Exec("UPDATE notasap_jobs SET run_at = (SELECT run_at FROM notasap_jobs WHERE id = $1) WHERE id = $2", tieLow, tieHigh)
+	s.insertJob(1, 1, -2*time.Second)
+	s.insertJob(2, 1, -10*time.Second)
 	s.insertJob(1, 1, time.Hour)
 
 	jobs, err := s.st.Claim(context.Background(), 1, 2, time.Minute)
 	s.Require().NoError(err)
 	s.Require().Len(jobs, 2)
-	s.Equal(a, jobs[0].ID)
-	s.Equal(b, jobs[1].ID)
+	// RETURNING order is not guaranteed: compare sorted by id.
+	slices.SortFunc(jobs, func(a, b store.ClaimedJob) int { return cmp.Compare(a.ID, b.ID) })
+	s.Equal(tieLow, jobs[0].ID)
+	s.Equal(tieHigh, jobs[1].ID)
+	s.NotEqual(latest, jobs[0].ID)
 	for _, j := range jobs {
 		s.Equal(int16(1), j.Kind)
 		s.Equal(1, j.Attempt)

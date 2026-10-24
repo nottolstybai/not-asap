@@ -96,10 +96,10 @@ func TestTruncateError(t *testing.T) {
 		require.Len(t, truncateError(strings.Repeat("a", 5000)), 4096)
 	})
 	t.Run("multibyte", func(t *testing.T) {
-		got := truncateError(strings.Repeat("я", 3000))
+		// 1 + 2*2047 = 4095 bytes; byte 4096 is mid-rune.
+		got := truncateError("a" + strings.Repeat("я", 3000))
 		require.True(t, utf8.ValidString(got))
-		require.LessOrEqual(t, len(got), 4096)
-		require.GreaterOrEqual(t, len(got), 4094)
+		require.Len(t, got, 4095)
 	})
 	t.Run("short", func(t *testing.T) {
 		require.Equal(t, "short", truncateError("short"))
