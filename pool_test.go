@@ -181,3 +181,84 @@ func TestStuckHandlerReported(t *testing.T) {
 	require.Equal(t, StatusDone, st.Calls()[0].status)
 	require.EqualValues(t, 1, obs.stuck.Load())
 }
+
+func TestClaimInFlightAtStopIsExecuted(t *testing.T) {
+	st := newFakeStore()
+	inClaim := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	st.claimHook = func(ctx context.Context) error {
+		first := false
+		once.Do(func() { first = true })
+		if !first {
+			return nil
+		}
+		close(inClaim)
+		<-release
+		return ctx.Err()
+	}
+	c := newPoolClient(t, st, noopHandler[testPayload](), KindConfig{})
+	require.NoError(t, c.Start(context.Background()))
+	<-inClaim
+
+	stopErr := make(chan error, 1)
+	go func() { stopErr <- c.Stop(context.Background()) }()
+	select {
+	case <-c.bgCtx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not begin")
+	}
+	st.feed(1)
+	close(release)
+
+	select {
+	case err := <-stopErr:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return")
+	}
+	calls := st.Calls()
+	require.Len(t, calls, 1)
+	require.Equal(t, StatusDone, calls[0].status)
+}
+
+func TestConcurrentStopWaitsForFirst(t *testing.T) {
+	st := newFakeStore()
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	c := newPoolClient(t, st, func(context.Context, *Job[testPayload]) error {
+		started <- struct{}{}
+		<-release
+		return nil
+	}, KindConfig{})
+	st.feed(1)
+	require.NoError(t, c.Start(context.Background()))
+	<-started
+
+	first := make(chan error, 1)
+	go func() { first <- c.Stop(context.Background()) }()
+	select {
+	case <-c.bgCtx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not begin")
+	}
+
+	short, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	require.ErrorIs(t, c.Stop(short), context.DeadlineExceeded)
+
+	second := make(chan error, 1)
+	go func() { second <- c.Stop(context.Background()) }()
+	require.Never(t, func() bool { return len(second) > 0 }, 100*time.Millisecond, 5*time.Millisecond)
+	require.Empty(t, first)
+
+	close(release)
+	select {
+	case err := <-second:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("second Stop did not return")
+	}
+	require.Len(t, st.Calls(), 1)
+	require.NoError(t, <-first)
+}

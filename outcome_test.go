@@ -1,14 +1,18 @@
 package notasap
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/nottolstybai/not-asap/internal/store"
 )
 
 func TestDecide(t *testing.T) {
@@ -78,6 +82,12 @@ func TestDecide(t *testing.T) {
 			res:     execResult{err: boom},
 			want:    action{status: StatusPending, errMsg: "boom", reason: RetryError},
 		},
+		{
+			name: "panicking backoff", attempt: 1, max: 3,
+			backoff: func(int) time.Duration { panic("bad backoff") },
+			res:     execResult{err: boom},
+			want:    action{status: StatusPending, errMsg: "boom", reason: RetryError},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -85,7 +95,7 @@ func TestDecide(t *testing.T) {
 			if b == nil {
 				b = Constant(time.Minute)
 			}
-			got := decide(tt.res, tt.attempt, tt.max, b)
+			got := decide(tt.res, tt.attempt, tt.max, b, slog.New(slog.DiscardHandler))
 			require.Equal(t, tt.want, got)
 		})
 	}
@@ -104,4 +114,25 @@ func TestTruncateError(t *testing.T) {
 	t.Run("short", func(t *testing.T) {
 		require.Equal(t, "short", truncateError("short"))
 	})
+}
+
+func TestDelayOfRecoversPanic(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	d := delayOf(func(int) time.Duration { panic("bad backoff") }, 2, logger)
+	require.Zero(t, d)
+	require.Contains(t, buf.String(), "level=ERROR")
+	require.Contains(t, buf.String(), "bad backoff")
+}
+
+func TestRescueDecisionPanickingBackoff(t *testing.T) {
+	var buf bytes.Buffer
+	c := newPoolClient(t, newFakeStore(), noopHandler[testPayload](), KindConfig{
+		Backoff: func(int) time.Duration { panic("bad backoff") },
+	}, WithLogger(slog.New(slog.NewTextHandler(&buf, nil))))
+
+	r := c.rescueDecision(store.StuckJob{ID: 1, Kind: 1, Attempt: 1, MaxAttempts: 3})
+	require.False(t, r.d.Fail)
+	require.Zero(t, r.d.Delay)
+	require.Contains(t, buf.String(), "level=ERROR")
 }

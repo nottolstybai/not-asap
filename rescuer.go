@@ -74,7 +74,7 @@ func (c *Client) rescueDecision(j store.StuckJob) rescued {
 	if j.Attempt >= j.MaxAttempts {
 		r.d.Fail = true
 	} else {
-		r.d.Delay = delayOf(backoff, j.Attempt)
+		r.d.Delay = delayOf(backoff, j.Attempt, c.logger)
 	}
 	return r
 }

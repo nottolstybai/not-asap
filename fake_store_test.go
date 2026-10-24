@@ -21,6 +21,9 @@ type finishCall struct {
 // are returned by Claim; status writes are recorded and always succeed.
 type fakeStore struct {
 	pending chan store.ClaimedJob
+	// claimHook, if set before Start, runs at the start of every Claim; a
+	// non-nil error is returned from Claim.
+	claimHook func(ctx context.Context) error
 
 	mu         sync.Mutex
 	claimErr   error
@@ -73,7 +76,12 @@ func (f *fakeStore) Insert(context.Context, store.DB, []store.InsertParams) ([]s
 	return nil, nil
 }
 
-func (f *fakeStore) Claim(_ context.Context, _ int16, limit int, _ time.Duration) ([]store.ClaimedJob, error) {
+func (f *fakeStore) Claim(ctx context.Context, _ int16, limit int, _ time.Duration) ([]store.ClaimedJob, error) {
+	if f.claimHook != nil {
+		if err := f.claimHook(ctx); err != nil {
+			return nil, err
+		}
+	}
 	f.mu.Lock()
 	f.claims++
 	f.maxLimit = max(f.maxLimit, limit)

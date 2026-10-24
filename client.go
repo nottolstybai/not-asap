@@ -42,8 +42,10 @@ type Client struct {
 	db    store.DB
 	mu    sync.Mutex
 	state clientState
-	kinds map[Kind]*kindEntry
-	names map[string]Kind
+	// stopped is closed when the first Stop returns.
+	stopped chan struct{}
+	kinds   map[Kind]*kindEntry
+	names   map[string]Kind
 
 	// Set by Start. stopCh and bgCtx stop pollers and maintenance loops;
 	// runCtx is the parent of handler contexts, cancelled with errShutdown
@@ -80,6 +82,7 @@ func newClient(st jobStore, db store.DB, opts ...Option) (*Client, error) {
 		options: o,
 		st:      st,
 		db:      db,
+		stopped: make(chan struct{}),
 		kinds:   make(map[Kind]*kindEntry),
 		names:   make(map[string]Kind),
 	}, nil
@@ -89,6 +92,8 @@ func newClient(st jobStore, db store.DB, opts ...Option) (*Client, error) {
 // and maintenance loops. It does not block; ctx bounds only the startup check.
 // A Client can be started once: a second call returns ErrAlreadyStarted, a
 // call after Stop returns ErrStopped. If the check fails, Start may be retried.
+// The client lock is held during the check, blocking Stop, so pass a ctx with
+// a deadline.
 func (c *Client) Start(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -138,15 +143,29 @@ func (c *Client) startMaintenance() {
 // is done. Then it cancels handler contexts, waits up to the stop grace for
 // them to record their status and returns ctx.Err(). Handlers that ignore
 // their context may still be running after Stop returns; their jobs are
-// recovered by the rescuer. Stop on a Client that is not running returns nil.
+// recovered by the rescuer. Stop on a Client that was never started returns
+// nil. A later Stop waits until the first one returns, then returns nil, or
+// returns ctx.Err() if ctx is done first.
 func (c *Client) Stop(ctx context.Context) error {
 	c.mu.Lock()
-	started := c.state == stateStarted
+	prev := c.state
 	c.state = stateStopped
-	c.mu.Unlock()
-	if !started {
-		return nil
+	if prev == stateNew {
+		close(c.stopped)
 	}
+	c.mu.Unlock()
+	switch prev {
+	case stateNew:
+		return nil
+	case stateStopped:
+		select {
+		case <-c.stopped:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	defer close(c.stopped)
 
 	close(c.stopCh)
 	c.cancelBg()

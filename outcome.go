@@ -3,6 +3,8 @@ package notasap
 import (
 	"errors"
 	"fmt"
+	"log/slog"
+	"runtime/debug"
 	"time"
 	"unicode/utf8"
 )
@@ -36,8 +38,9 @@ type action struct {
 	reason RetryReason
 }
 
-// decide maps an execution result to the next job state. It is pure.
-func decide(r execResult, attempt, maxAttempts int, backoff Backoff) action {
+// decide maps an execution result to the next job state. It is pure apart
+// from logging a panicking backoff to logger.
+func decide(r execResult, attempt, maxAttempts int, backoff Backoff, logger *slog.Logger) action {
 	switch {
 	case r.decodeErr != nil:
 		return action{status: StatusFailed, errMsg: truncateError("decode payload: " + r.decodeErr.Error())}
@@ -52,7 +55,7 @@ func decide(r execResult, attempt, maxAttempts int, backoff Backoff) action {
 	case errors.Is(r.cause, errShutdown):
 		return action{status: StatusPending, refund: true, errMsg: errMsg, reason: RetryShutdown}
 	case !r.panicked && errors.Is(r.err, ErrKeepAttempt):
-		return action{status: StatusPending, delay: delayOf(backoff, attempt), refund: true, errMsg: errMsg, reason: RetryKeepAttempt}
+		return action{status: StatusPending, delay: delayOf(backoff, attempt, logger), refund: true, errMsg: errMsg, reason: RetryKeepAttempt}
 	}
 
 	reason := RetryError
@@ -65,7 +68,7 @@ func decide(r execResult, attempt, maxAttempts int, backoff Backoff) action {
 	if attempt >= maxAttempts {
 		return action{status: StatusFailed, errMsg: errMsg, reason: reason}
 	}
-	return action{status: StatusPending, delay: delayOf(backoff, attempt), errMsg: errMsg, reason: reason}
+	return action{status: StatusPending, delay: delayOf(backoff, attempt, logger), errMsg: errMsg, reason: reason}
 }
 
 func failureText(r execResult) string {
@@ -75,7 +78,15 @@ func failureText(r execResult) string {
 	return r.err.Error()
 }
 
-func delayOf(b Backoff, attempt int) time.Duration {
+// delayOf returns the backoff delay for attempt, clamped at 0. A panicking
+// backoff is logged and yields 0.
+func delayOf(b Backoff, attempt int, logger *slog.Logger) (d time.Duration) {
+	defer func() {
+		if v := recover(); v != nil {
+			logger.Error("notasap: backoff panicked", "attempt", attempt, "panic", v, "stack", string(debug.Stack()))
+			d = 0
+		}
+	}()
 	return max(b(attempt), 0)
 }
 

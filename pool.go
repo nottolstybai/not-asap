@@ -9,8 +9,8 @@ import (
 	"github.com/nottolstybai/not-asap/internal/store"
 )
 
-// statusWriteTimeout bounds writing a job's status after its handler returns.
-// The write does not inherit the handler or shutdown contexts.
+// statusWriteTimeout bounds claiming jobs and writing a job's status after its
+// handler returns. Neither inherits the handler or shutdown contexts.
 const statusWriteTimeout = 10 * time.Second
 
 // kindPool polls and runs the jobs of one Kind with at most Workers handlers.
@@ -55,12 +55,19 @@ func (p *kindPool) loop() {
 		default:
 		}
 
+		// The claim does not use bgCtx: cancelling it mid-query could commit
+		// the claim while losing its rows. Claimed rows are always dispatched
+		// and then drained by Stop.
 		start := time.Now()
-		rows, err := c.st.Claim(c.bgCtx, int16(p.e.kind), free, lease)
+		ctx, cancel := context.WithTimeout(context.Background(), statusWriteTimeout)
+		rows, err := c.st.Claim(ctx, int16(p.e.kind), free, lease)
+		cancel()
 		c.observer.Polled(cfg.Name, time.Since(start))
 		if err != nil {
-			if c.bgCtx.Err() != nil {
+			select {
+			case <-c.stopCh:
 				return
+			default:
 			}
 			c.logger.Warn("notasap: claim jobs", "kind", cfg.Name, "error", err)
 			fullBatch = false
@@ -103,7 +110,7 @@ func (p *kindPool) execute(row store.ClaimedJob) {
 	res.cause = context.Cause(ctx)
 	took := time.Since(start)
 
-	a := decide(res, row.Attempt, row.MaxAttempts, cfg.Backoff)
+	a := decide(res, row.Attempt, row.MaxAttempts, cfg.Backoff, logger)
 	p.record(row, a, took, logger)
 }
 

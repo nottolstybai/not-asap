@@ -288,13 +288,21 @@ func (s *WorkerSuite) TestKindIsolation() {
 func (s *WorkerSuite) TestTwoClientsNoDoubleExecution() {
 	const n = 200
 	var seen sync.Map
-	h := func(_ context.Context, j *notasap.Job[payloadA]) error {
-		cnt, _ := seen.LoadOrStore(j.ID, new(atomic.Int64))
-		cnt.(*atomic.Int64).Add(1)
-		return nil
+	handler := func(processed *atomic.Int64) notasap.Handler[payloadA] {
+		return func(_ context.Context, j *notasap.Job[payloadA]) error {
+			cnt, _ := seen.LoadOrStore(j.ID, new(atomic.Int64))
+			cnt.(*atomic.Int64).Add(1)
+			processed.Add(1)
+			t := time.NewTimer(2 * time.Millisecond)
+			defer t.Stop()
+			<-t.C
+			return nil
+		}
 	}
-	c1 := s.startClient(newWorkerObserver(), reg(h, notasap.KindConfig{Name: "a"}))
-	s.startClientOn(pgtest.NewPool(s.T(), s.Schema), newWorkerObserver(), reg(h, notasap.KindConfig{Name: "a"}))
+	var processed1, processed2 atomic.Int64
+	cfg := notasap.KindConfig{Name: "a", Workers: 2}
+	c1 := s.startClient(newWorkerObserver(), reg(handler(&processed1), cfg))
+	s.startClientOn(pgtest.NewPool(s.T(), s.Schema), newWorkerObserver(), reg(handler(&processed2), cfg))
 
 	items := make([]notasap.BatchItem, n)
 	for i := range items {
@@ -305,9 +313,9 @@ func (s *WorkerSuite) TestTwoClientsNoDoubleExecution() {
 
 	s.Require().Eventually(func() bool {
 		var done int
-		s.Require().NoError(s.Pool.QueryRow(context.Background(),
-			"SELECT count(*) FROM notasap_jobs WHERE status = 3").Scan(&done))
-		return done == n
+		err := s.Pool.QueryRow(context.Background(),
+			"SELECT count(*) FROM notasap_jobs WHERE status = 3").Scan(&done)
+		return err == nil && done == n
 	}, waitFor, tick)
 
 	var total int
@@ -317,6 +325,9 @@ func (s *WorkerSuite) TestTwoClientsNoDoubleExecution() {
 		return true
 	})
 	s.Equal(n, total)
+	s.Positive(processed1.Load())
+	s.Positive(processed2.Load())
+	s.EqualValues(n, processed1.Load()+processed2.Load())
 }
 
 func (s *WorkerSuite) TestStopDrains() {
