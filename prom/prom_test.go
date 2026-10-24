@@ -1,6 +1,7 @@
 package prom_test
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -151,4 +152,19 @@ func value(t *testing.T, reg *prometheus.Registry, name string, vals ...string) 
 	}
 	t.Fatalf("no series %s%v", name, vals)
 	return 0
+}
+
+func TestInvalidBuckets(t *testing.T) {
+	for name, b := range map[string][]float64{
+		"decreasing": {2, 1},
+		"equal":      {1, 1},
+		"nan":        {math.NaN()},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := prom.New(prometheus.NewRegistry(), prom.WithJobDurationBuckets(b))
+			require.Error(t, err)
+			_, err = prom.New(prometheus.NewRegistry(), prom.WithPollDurationBuckets(b))
+			require.Error(t, err)
+		})
+	}
 }

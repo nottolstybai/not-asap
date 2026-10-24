@@ -3,6 +3,9 @@ package prom
 
 import (
 	"errors"
+	"fmt"
+	"math"
+	"slices"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -37,13 +40,13 @@ type Option func(*config)
 // WithJobDurationBuckets overrides the buckets of notasap_job_duration_seconds.
 // An empty slice makes New return an error.
 func WithJobDurationBuckets(b []float64) Option {
-	return func(c *config) { c.jobBuckets = b }
+	return func(c *config) { c.jobBuckets = slices.Clone(b) }
 }
 
 // WithPollDurationBuckets overrides the buckets of notasap_poll_duration_seconds.
 // An empty slice makes New return an error.
 func WithPollDurationBuckets(b []float64) Option {
-	return func(c *config) { c.pollBuckets = b }
+	return func(c *config) { c.pollBuckets = slices.Clone(b) }
 }
 
 // New creates the metrics and registers them with reg. If registration fails,
@@ -59,11 +62,11 @@ func New(reg prometheus.Registerer, opts ...Option) (*Metrics, error) {
 	for _, o := range opts {
 		o(&cfg)
 	}
-	if len(cfg.jobBuckets) == 0 {
-		return nil, errors.New("notasap/prom: job duration buckets must not be empty")
+	if err := checkBuckets("WithJobDurationBuckets", cfg.jobBuckets); err != nil {
+		return nil, err
 	}
-	if len(cfg.pollBuckets) == 0 {
-		return nil, errors.New("notasap/prom: poll duration buckets must not be empty")
+	if err := checkBuckets("WithPollDurationBuckets", cfg.pollBuckets); err != nil {
+		return nil, err
 	}
 
 	m := &Metrics{
@@ -109,6 +112,22 @@ func New(reg prometheus.Registerer, opts ...Option) (*Metrics, error) {
 		}
 	}
 	return m, nil
+}
+
+// checkBuckets rejects buckets client_golang would panic on at first use.
+func checkBuckets(opt string, b []float64) error {
+	if len(b) == 0 {
+		return fmt.Errorf("notasap/prom: %s: buckets must not be empty", opt)
+	}
+	for i, v := range b {
+		if math.IsNaN(v) {
+			return fmt.Errorf("notasap/prom: %s: bucket %d is NaN", opt, i)
+		}
+		if i > 0 && v <= b[i-1] {
+			return fmt.Errorf("notasap/prom: %s: buckets must be strictly increasing", opt)
+		}
+	}
+	return nil
 }
 
 // JobScheduled implements notasap.Observer.
