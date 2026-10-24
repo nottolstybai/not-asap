@@ -10,7 +10,10 @@ import (
 	"github.com/nottolstybai/not-asap/internal/store"
 )
 
-type failStore struct{ t *testing.T }
+type failStore struct {
+	jobStore
+	t *testing.T
+}
 
 func (f failStore) Insert(context.Context, store.DB, []store.InsertParams) ([]store.InsertResult, error) {
 	f.t.Fatal("store must not be called")

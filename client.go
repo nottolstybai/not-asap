@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -14,6 +15,11 @@ import (
 // the features that need them are introduced.
 type jobStore interface {
 	Insert(ctx context.Context, db store.DB, params []store.InsertParams) ([]store.InsertResult, error)
+	Claim(ctx context.Context, kind int16, limit int, lease time.Duration) ([]store.ClaimedJob, error)
+	Finish(ctx context.Context, ref store.Ref, status int16, errMsg string) (bool, error)
+	Reschedule(ctx context.Context, ref store.Ref, delay time.Duration, errMsg string, refund bool) (bool, error)
+	Cancel(ctx context.Context, id int64) (store.CancelOutcome, error)
+	CheckSchema(ctx context.Context) error
 }
 
 var _ jobStore = (*store.Store)(nil)
