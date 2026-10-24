@@ -78,7 +78,7 @@ func handle(ctx context.Context, job *notasap.Job[SendInvoice]) error {
 
 Kinds are numbers (`int16`, must be > 0) stored in the database. The `KindConfig.Name` is required, unique, and used only in logs and metrics. Payload types must be non-pointer, non-interface types. Registering must happen before `Start`.
 
-The client lifecycle is single-use: `new -> started -> stopped`. A second `Start` returns `ErrAlreadyStarted`, `Start` after `Stop` returns `ErrStopped`, `Stop` on a client that is not running returns `nil`, but still moves it to stopped, so a later `Start` returns `ErrStopped`. `Schedule*` and `Cancel` work in any state, they only write to the database.
+The client lifecycle is single-use: `new -> started -> stopped`. A second `Start` returns `ErrAlreadyStarted`, `Start` after `Stop` returns `ErrStopped`, `Stop` on a client that is not running returns `nil`, but still moves it to stopped, so a later `Start` returns `ErrStopped`. A repeated or concurrent `Stop` waits until the first `Stop` returns (or its own `ctx` is done, then it returns `ctx.Err()`). `Start` holds the client lock during its schema check, so pass it a `ctx` with a deadline. `Schedule*` and `Cancel` work in any state, they only write to the database.
 
 ## Handler outcomes
 
@@ -110,7 +110,7 @@ An attempt is spent at claim time, so a process crash also costs an attempt (pro
 
 Notes:
 
-- `ScheduleTx` with `WithReplace` on a running row returns `ErrJobRunning`, but a replaced row stays locked until your transaction ends.
+- `ScheduleTx` with `WithReplace` locks the matched row until your transaction ends, also when the row is running and `ErrJobRunning` is returned. A long transaction then blocks the worker's status write (10s timeout); the write fails, the job is rescued after its deadline and runs again. Keep such transactions short.
 - Plain duplicates do not lock the existing row.
 - `ScheduleBatch` (no tx) with idempotency keys runs in its own transaction (for batches of 2+ items), because resolving conflicts may take more round trips; without keys it is one round trip.
 
@@ -170,7 +170,7 @@ A claimed job gets `deadline = claim + Timeout + Rescuer.Grace`. The rescuer (al
 
 There is no heartbeat, so a job lost with a crashed process comes back no sooner than `Timeout + Grace`. For long jobs set a large `Timeout`.
 
-A handler that ignores `ctx` keeps its worker slot (the pool never runs the same job twice in one process). If it has not returned `Rescuer.Grace` after `Timeout`, the pool logs an error and reports `stuck`. The slot stays busy until it returns.
+A handler that ignores `ctx` keeps its worker slot. Once the rescuer returns its job to `pending`, any free slot, in this process or another, may claim it again while the stale handler still runs; the stale handler's result is rejected by the lease. If it has not returned `Rescuer.Grace` after `Timeout`, the pool logs an error and reports `stuck`. The slot stays busy until it returns.
 
 Jobs of a kind that is not registered in a process stay `pending` there and are not claimed by that process; another process that registers the kind will take them.
 

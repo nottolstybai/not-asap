@@ -48,6 +48,10 @@ func WithIdempotencyKey(key string) ScheduleOption {
 
 // WithReplace overwrites an existing non-running job with the same idempotency
 // key instead of returning ErrDuplicate. It requires WithIdempotencyKey.
+// Within a caller's tx the matched row stays locked until tx ends, even when
+// it is running and ErrJobRunning is returned: a long tx can block the
+// worker's status write past its 10s timeout, so the job is rescued and runs
+// again.
 func WithReplace() ScheduleOption {
 	return func(o *scheduleOptions) { o.replace = true }
 }
@@ -77,7 +81,8 @@ func (c *Client) Schedule(ctx context.Context, p Payload, opts ...ScheduleOption
 }
 
 // ScheduleTx is Schedule within tx. The job becomes visible when tx commits.
-// The observer is notified before the commit.
+// The observer is notified before the commit. With WithReplace the matched row
+// stays locked until tx ends (see WithReplace); keep such transactions short.
 func (c *Client) ScheduleTx(ctx context.Context, tx pgx.Tx, p Payload, opts ...ScheduleOption) (int64, error) {
 	if tx == nil {
 		return 0, errors.New("notasap: ScheduleTx: tx is nil")
@@ -94,7 +99,8 @@ func (c *Client) ScheduleBatch(ctx context.Context, items ...BatchItem) ([]Batch
 	return c.scheduleBatch(ctx, c.db, items, true)
 }
 
-// ScheduleBatchTx is ScheduleBatch within tx. On error tx is aborted.
+// ScheduleBatchTx is ScheduleBatch within tx. On a database error tx is
+// aborted; validation errors send no SQL and leave tx usable.
 func (c *Client) ScheduleBatchTx(ctx context.Context, tx pgx.Tx, items ...BatchItem) ([]BatchResult, error) {
 	if tx == nil {
 		return nil, errors.New("notasap: ScheduleBatchTx: tx is nil")
