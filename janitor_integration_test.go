@@ -3,6 +3,7 @@ package notasap_test
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -86,12 +87,7 @@ func (s *JanitorSuite) exists(id int64) bool {
 func (s *JanitorSuite) settle(gone, kept []int64) {
 	s.T().Helper()
 	s.Require().Eventually(func() bool {
-		for _, id := range gone {
-			if s.exists(id) {
-				return false
-			}
-		}
-		return true
+		return !slices.ContainsFunc(gone, s.exists)
 	}, waitFor, tick)
 	s.Never(func() bool {
 		for _, id := range kept {

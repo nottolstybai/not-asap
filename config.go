@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"time"
 )
 
@@ -192,12 +193,8 @@ func WithJanitor(cfg JanitorConfig) Option {
 			o.janitor.BatchSize = cfg.BatchSize
 		}
 		ret := make(map[Status]time.Duration, len(o.janitor.Retention)+len(cfg.Retention))
-		for s, d := range o.janitor.Retention {
-			ret[s] = d
-		}
-		for s, d := range cfg.Retention {
-			ret[s] = d
-		}
+		maps.Copy(ret, o.janitor.Retention)
+		maps.Copy(ret, cfg.Retention)
 		o.janitor.Retention = ret
 		if cfg.Disabled {
 			o.janitor.Disabled = true
