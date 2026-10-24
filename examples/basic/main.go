@@ -41,12 +41,14 @@ func handleSendInvoice(ctx context.Context, job *notasap.Job[SendInvoice]) error
 
 	switch {
 	case p.Email == "":
-		// Retrying cannot help: finish the job as cancelled.
+		// Retrying cannot help: finish the job as cancelled
+		// (not hit by the order scheduled below, which has an email).
 		return fmt.Errorf("order %d has no email: %w", p.OrderID, notasap.ErrCancel)
-	case job.Attempt == 1 && p.OrderID%2 == 0:
-		// Retry later without spending an attempt.
+	case p.OrderID%2 == 0 && time.Since(job.CreatedAt) < 5*time.Second:
+		// Retry later without spending an attempt. The refunded attempt
+		// stays 1, so this must depend on something that changes over time.
 		return fmt.Errorf("mail queue is full: %w", notasap.ErrKeepAttempt)
-	case job.Attempt < 2 && p.OrderID%3 == 0:
+	case p.OrderID%3 == 0 && job.Attempt < 2:
 		// Any other error is retried with backoff until MaxAttempts.
 		return errTemporary
 	}
@@ -85,7 +87,7 @@ func run() error {
 		Workers:     4,
 		MaxAttempts: 5,
 		Timeout:     30 * time.Second,
-		Backoff:     notasap.Exponential(time.Second, 10*time.Minute),
+		Backoff:     notasap.Constant(time.Second),
 	})
 	if err != nil {
 		return err

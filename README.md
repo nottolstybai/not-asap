@@ -78,7 +78,7 @@ func handle(ctx context.Context, job *notasap.Job[SendInvoice]) error {
 
 Kinds are numbers (`int16`, must be > 0) stored in the database. The `KindConfig.Name` is required, unique, and used only in logs and metrics. Payload types must be non-pointer, non-interface types. Registering must happen before `Start`.
 
-The client lifecycle is single-use: `new -> started -> stopped`. A second `Start` returns `ErrAlreadyStarted`, `Start` after `Stop` returns `ErrStopped`, `Stop` on a client that is not running returns `nil`. `Schedule*` and `Cancel` work in any state, they only write to the database.
+The client lifecycle is single-use: `new -> started -> stopped`. A second `Start` returns `ErrAlreadyStarted`, `Start` after `Stop` returns `ErrStopped`, `Stop` on a client that is not running returns `nil`, but still moves it to stopped, so a later `Start` returns `ErrStopped`. `Schedule*` and `Cancel` work in any state, they only write to the database.
 
 ## Handler outcomes
 
@@ -112,7 +112,7 @@ Notes:
 
 - `ScheduleTx` with `WithReplace` on a running row returns `ErrJobRunning`, but a replaced row stays locked until your transaction ends.
 - Plain duplicates do not lock the existing row.
-- `ScheduleBatch` (no tx) with idempotency keys runs in its own transaction, because resolving conflicts may take more round trips; without keys it is one round trip.
+- `ScheduleBatch` (no tx) with idempotency keys runs in its own transaction (for batches of 2+ items), because resolving conflicts may take more round trips; without keys it is one round trip.
 
 ## Scheduling
 

@@ -206,8 +206,8 @@ func WithJanitor(cfg JanitorConfig) Option {
 	}
 }
 
-// WithStopGrace sets how long Stop waits for in-flight handlers before
-// cancelling their contexts. Default 5s.
+// WithStopGrace sets how long Stop waits, after cancelling handler contexts
+// because its ctx expired, for handlers to record their status. Default 5s.
 func WithStopGrace(d time.Duration) Option {
 	return func(o *options) error {
 		if d < 0 {
