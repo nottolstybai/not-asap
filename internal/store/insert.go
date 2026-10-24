@@ -60,8 +60,10 @@ type InsertResult struct {
 }
 
 // Insert inserts params in one batch and resolves idempotency key conflicts.
-// Results are in the order of params. Outside a transaction the first batch
-// is atomic: any failing statement rolls back all of them.
+// Results are in the order of params. Each round trip is a single batch, so
+// outside a transaction a round is atomic, but rounds after the first (key
+// conflict lookups and re-inserts) commit separately: callers needing the
+// whole call to be atomic must pass a transaction.
 func (s *Store) Insert(ctx context.Context, db DB, params []InsertParams) ([]InsertResult, error) {
 	results := make([]InsertResult, len(params))
 	todo := make([]int, len(params))

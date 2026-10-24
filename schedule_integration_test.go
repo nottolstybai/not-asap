@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/suite"
 
 	notasap "github.com/nottolstybai/not-asap"
@@ -237,6 +240,64 @@ func (s *ScheduleSuite) TestBatchAtomicOnError() {
 	)
 	s.Require().ErrorContains(err, "unsupported Unicode escape")
 	s.Equal(0, countJobs(&s.Suite))
+}
+
+// failingBatchDB sends the batch number failAt (1-based, counted over the pool
+// and the transactions it begins) with a cancelled context, so it fails.
+type failingBatchDB struct {
+	*pgxpool.Pool
+	failAt int32
+	calls  *atomic.Int32
+}
+
+func (d failingBatchDB) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	return d.Pool.SendBatch(failCtx(ctx, d.calls.Add(1) == d.failAt), b)
+}
+
+func (d failingBatchDB) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := d.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return failingBatchTx{Tx: tx, failAt: d.failAt, calls: d.calls}, nil
+}
+
+type failingBatchTx struct {
+	pgx.Tx
+	failAt int32
+	calls  *atomic.Int32
+}
+
+func (t failingBatchTx) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	return t.Tx.SendBatch(failCtx(ctx, t.calls.Add(1) == t.failAt), b)
+}
+
+func failCtx(ctx context.Context, fail bool) context.Context {
+	if !fail {
+		return ctx
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	cancel()
+	return ctx
+}
+
+func (s *ScheduleSuite) TestBatchAtomicOnLookupError() {
+	ctx := context.Background()
+	_, err := s.newClient().Schedule(ctx, payloadA{}, notasap.WithIdempotencyKey("dup"))
+	s.Require().NoError(err)
+
+	db := failingBatchDB{Pool: s.Pool, failAt: 2, calls: new(atomic.Int32)}
+	c, err := notasap.NewWithDB(s.Pool, db)
+	s.Require().NoError(err)
+	s.Require().NoError(notasap.Register(c, noop[payloadA], notasap.KindConfig{Name: "a"}))
+
+	_, err = c.ScheduleBatch(ctx,
+		notasap.Item(payloadA{Msg: "new"}),
+		notasap.Item(payloadA{}, notasap.WithIdempotencyKey("dup")),
+	)
+	s.Require().ErrorIs(err, context.Canceled)
+	s.Equal(int32(2), db.calls.Load())
+	s.Equal(1, countJobs(&s.Suite))
 }
 
 func (s *ScheduleSuite) TestBatchTxRollback() {

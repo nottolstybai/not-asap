@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -84,11 +85,13 @@ func (c *Client) ScheduleTx(ctx context.Context, tx pgx.Tx, p Payload, opts ...S
 	return c.scheduleOne(ctx, tx, p, opts)
 }
 
-// ScheduleBatch inserts all items in one round trip, atomically. Per-item
-// idempotency conflicts are reported in the results; any other error fails
-// the whole batch.
+// ScheduleBatch inserts all items atomically. Per-item idempotency conflicts
+// are reported in the results; any other error fails the whole batch and
+// nothing is written. A batch without idempotency keys takes one round trip;
+// one with keys runs in its own transaction, as resolving conflicts may need
+// more round trips.
 func (c *Client) ScheduleBatch(ctx context.Context, items ...BatchItem) ([]BatchResult, error) {
-	return c.scheduleBatch(ctx, c.db, items)
+	return c.scheduleBatch(ctx, c.db, items, true)
 }
 
 // ScheduleBatchTx is ScheduleBatch within tx. On error tx is aborted.
@@ -96,18 +99,21 @@ func (c *Client) ScheduleBatchTx(ctx context.Context, tx pgx.Tx, items ...BatchI
 	if tx == nil {
 		return nil, errors.New("notasap: ScheduleBatchTx: tx is nil")
 	}
-	return c.scheduleBatch(ctx, tx, items)
+	return c.scheduleBatch(ctx, tx, items, false)
 }
 
 func (c *Client) scheduleOne(ctx context.Context, db store.DB, p Payload, opts []ScheduleOption) (int64, error) {
-	res, err := c.scheduleBatch(ctx, db, []BatchItem{{payload: p, opts: opts}})
+	res, err := c.scheduleBatch(ctx, db, []BatchItem{{payload: p, opts: opts}}, false)
 	if err != nil {
 		return 0, err
 	}
 	return res[0].ID, res[0].Err
 }
 
-func (c *Client) scheduleBatch(ctx context.Context, db store.DB, items []BatchItem) ([]BatchResult, error) {
+// scheduleBatch validates items and inserts them. With ownTx, a batch of
+// several items with any idempotency key runs in a transaction on db, so the
+// extra conflict-resolution round trips cannot leave it partially committed.
+func (c *Client) scheduleBatch(ctx context.Context, db store.DB, items []BatchItem, ownTx bool) ([]BatchResult, error) {
 	if len(items) == 0 {
 		return nil, nil
 	}
@@ -122,7 +128,18 @@ func (c *Client) scheduleBatch(ctx context.Context, db store.DB, items []BatchIt
 		names[i] = name
 	}
 
-	inserted, err := c.st.Insert(ctx, db, params)
+	var inserted []store.InsertResult
+	insert := func(db store.DB) error {
+		var err error
+		inserted, err = c.st.Insert(ctx, db, params)
+		return err
+	}
+	var err error
+	if ownTx && len(params) > 1 && slices.ContainsFunc(params, func(p store.InsertParams) bool { return p.Key != nil }) {
+		err = pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error { return insert(tx) })
+	} else {
+		err = insert(db)
+	}
 	if err != nil {
 		return nil, err
 	}
