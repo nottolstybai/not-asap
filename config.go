@@ -198,7 +198,9 @@ func WithJanitor(cfg JanitorConfig) Option {
 			ret[s] = d
 		}
 		o.janitor.Retention = ret
-		o.janitor.Disabled = cfg.Disabled
+		if cfg.Disabled {
+			o.janitor.Disabled = true
+		}
 		return nil
 	}
 }

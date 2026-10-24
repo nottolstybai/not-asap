@@ -1,10 +1,12 @@
 package notasap
 
 import (
+	"context"
 	"log/slog"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 )
 
@@ -123,4 +125,45 @@ func TestJanitorRetentionMerge(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, time.Duration(0), c.janitor.Retention[StatusCancelled])
 	require.Equal(t, 24*time.Hour, c.janitor.Retention[StatusDone])
+}
+
+func TestJanitorDisabledMerge(t *testing.T) {
+	t.Parallel()
+
+	c, err := newClient(nil, nil)
+	require.NoError(t, err)
+	require.False(t, c.janitor.Disabled)
+
+	c, err = newClient(nil, nil, WithJanitor(JanitorConfig{Disabled: true}))
+	require.NoError(t, err)
+	require.True(t, c.janitor.Disabled)
+
+	c, err = newClient(nil, nil,
+		WithJanitor(JanitorConfig{Disabled: true}),
+		WithJanitor(JanitorConfig{Interval: time.Minute}),
+	)
+	require.NoError(t, err)
+	require.True(t, c.janitor.Disabled)
+	require.Equal(t, time.Minute, c.janitor.Interval)
+}
+
+func TestNewWiring(t *testing.T) {
+	t.Parallel()
+
+	pool, err := pgxpool.New(context.Background(), "postgres://u:p@127.0.0.1:1/db")
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+
+	c, err := New(pool,
+		WithLogger(slog.Default()),
+		WithObserver(NopObserver{}),
+		WithDefaults(KindConfig{Workers: 2}),
+		WithRescuer(RescuerConfig{Interval: time.Second}),
+		WithJanitor(JanitorConfig{Interval: time.Minute}),
+		WithStopGrace(time.Second),
+	)
+	require.NoError(t, err)
+	require.Equal(t, 2, c.defaults.Workers)
+	require.NotNil(t, c.st)
+	require.NotNil(t, c.db)
 }
