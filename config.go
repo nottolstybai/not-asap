@@ -53,7 +53,8 @@ type KindConfig struct {
 type RescuerConfig struct {
 	// Interval between rescue passes. Default 30s.
 	Interval time.Duration
-	// Grace is how long past its deadline a running job must be before rescue. Default 30s.
+	// Grace is added to a claimed job's deadline (claim + Timeout + Grace); the
+	// rescuer picks running jobs whose deadline has passed. Default 30s.
 	Grace time.Duration
 }
 

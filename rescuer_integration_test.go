@@ -1,8 +1,11 @@
 package notasap_test
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -48,12 +51,18 @@ func (o *rescueObserver) Rescued(kind string) int {
 // 2h and the given kinds; it is stopped on test cleanup.
 func (s *RescuerSuite) startClient(obs notasap.Observer, kinds ...kindReg) *notasap.Client {
 	s.T().Helper()
-	c, err := notasap.New(s.Pool,
+	return s.startClientOpts(nil, obs, kinds...)
+}
+
+// startClientOpts is startClient with extra options applied over the suite's.
+func (s *RescuerSuite) startClientOpts(opts []notasap.Option, obs notasap.Observer, kinds ...kindReg) *notasap.Client {
+	s.T().Helper()
+	c, err := notasap.New(s.Pool, append([]notasap.Option{
 		notasap.WithLogger(slog.New(slog.DiscardHandler)),
 		notasap.WithObserver(obs),
 		notasap.WithDefaults(notasap.KindConfig{PollInterval: 10 * time.Millisecond, Backoff: notasap.Constant(2 * time.Hour)}),
 		notasap.WithRescuer(notasap.RescuerConfig{Interval: 20 * time.Millisecond, Grace: 20 * time.Millisecond}),
-	)
+	}, opts...)...)
 	s.Require().NoError(err)
 	for _, k := range kinds {
 		s.Require().NoError(k(c))
@@ -76,6 +85,34 @@ INSERT INTO notasap_jobs (kind, status, payload, attempt, max_attempts, lease, d
 VALUES ($1, 2, '{}', $2, $3, 1, NOW() + make_interval(secs => $4)) RETURNING id`,
 		int16(kind), attempt, maxAttempts, deadlineIn.Seconds()).Scan(&id))
 	return id
+}
+
+// recv waits for a value on ch or fails the test after waitFor.
+func (s *RescuerSuite) recv(ch <-chan struct{}) {
+	s.T().Helper()
+	select {
+	case <-ch:
+	case <-time.After(waitFor):
+		s.FailNow("timed out waiting for handler")
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for concurrent log writes.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func (s *RescuerSuite) waitStatus(id int64, st notasap.Status) pgtest.JobRow {
@@ -153,7 +190,7 @@ func (s *RescuerSuite) TestStaleWorkerFenced() {
 	s.T().Cleanup(unblock) // runs before the client's Stop
 	id, err := c.Schedule(context.Background(), payloadA{})
 	s.Require().NoError(err)
-	<-started
+	s.recv(started)
 
 	row := s.waitStatus(id, notasap.StatusPending)
 	s.Equal(1, row.Attempt)
@@ -163,5 +200,61 @@ func (s *RescuerSuite) TestStaleWorkerFenced() {
 	unblock()
 	s.Never(func() bool { return s.Job(id).Status == int16(notasap.StatusDone) }, 200*time.Millisecond, tick)
 	s.Equal(0, obs.Finished(notasap.StatusDone))
+	s.Equal(1, obs.Rescued("a"))
+}
+
+func (s *RescuerSuite) TestStaleWorkerLeaseFenced() {
+	obs := newRescueObserver()
+	logs := &syncBuffer{}
+	startedStale := make(chan struct{}, 1)
+	startedSecond := make(chan struct{}, 1)
+	releaseStale := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	h := func(_ context.Context, j *notasap.Job[payloadA]) error {
+		if j.Attempt == 1 {
+			startedStale <- struct{}{}
+			<-releaseStale
+			return errors.New("stale failure")
+		}
+		startedSecond <- struct{}{}
+		<-releaseSecond
+		return nil
+	}
+	// Grace keeps the re-claimed attempt's deadline (Timeout + Grace) well
+	// beyond the steps below, so the rescuer does not take it a second time.
+	c := s.startClientOpts([]notasap.Option{
+		notasap.WithLogger(slog.New(slog.NewTextHandler(logs, nil))),
+		notasap.WithRescuer(notasap.RescuerConfig{Grace: 500 * time.Millisecond}),
+	}, obs, reg(h, notasap.KindConfig{
+		Name: "a", Workers: 2, Timeout: 20 * time.Millisecond, MaxAttempts: 3,
+		Backoff: notasap.Constant(0),
+	}))
+	unblockStale := sync.OnceFunc(func() { close(releaseStale) })
+	unblockSecond := sync.OnceFunc(func() { close(releaseSecond) })
+	s.T().Cleanup(unblockStale) // run before the client's Stop
+	s.T().Cleanup(unblockSecond)
+	id, err := c.Schedule(context.Background(), payloadA{})
+	s.Require().NoError(err)
+	s.recv(startedStale)
+
+	s.Require().Eventually(func() bool {
+		row := s.Job(id)
+		return row.Status == int16(notasap.StatusRunning) && row.Lease == 2 && row.Attempt == 2
+	}, waitFor, tick)
+	s.recv(startedSecond)
+
+	unblockStale()
+	s.Require().Eventually(func() bool { return strings.Contains(logs.String(), "job lost lease") }, waitFor, tick)
+	row := s.Job(id)
+	s.Equal(int16(notasap.StatusRunning), row.Status)
+	s.Equal(int64(2), row.Lease)
+	s.Equal(2, row.Attempt)
+
+	unblockSecond()
+	row = s.waitStatus(id, notasap.StatusDone)
+	s.Equal(2, row.Attempt)
+	s.Equal(int64(2), row.Lease)
+	s.Equal(1, obs.Finished(notasap.StatusDone))
+	s.Equal(0, obs.Retried(notasap.RetryError))
 	s.Equal(1, obs.Rescued("a"))
 }
