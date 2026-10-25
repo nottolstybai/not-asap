@@ -88,7 +88,11 @@ func (c *Client) Schedule(ctx context.Context, p Payload, opts ...ScheduleOption
 // ScheduleTx is Schedule within tx. The job becomes visible when tx commits.
 // The observer is notified before the commit. A keyed schedule that inserts or
 // replaces a job holds its key until tx ends, so concurrent schedules of that
-// key wait for tx; one that finds a duplicate locks nothing. Several keyed
+// key wait for tx; one that finds a duplicate locks nothing. WithReplace on a
+// running job normally locks nothing either, but if a worker claims the job at
+// the same moment, ScheduleTx still returns ErrJobRunning and keeps the row
+// locked until tx ends, so the worker's status write waits for tx; keep such
+// transactions short. Several keyed
 // schedules in one tx must be issued in a consistent (kind, key) order across
 // the application, or Postgres may abort tx with a deadlock (SQLSTATE 40P01);
 // retry tx on 40P01.

@@ -188,8 +188,9 @@ func TestNoClaimAfterStop(t *testing.T) {
 	require.Eventually(t, func() bool { return st.Claims() >= 2 }, waitFor, tick)
 
 	require.NoError(t, c.Stop(context.Background()))
+	// Stop waits for the pollers, so no claim can follow it.
 	n := st.Claims()
-	require.Never(t, func() bool { return st.Claims() != n }, 100*time.Millisecond, tick)
+	require.Equal(t, n, st.Claims())
 }
 
 func TestStuckHandlerReported(t *testing.T) {
@@ -345,7 +346,7 @@ func TestStatusWrite(t *testing.T) {
 	t.Run("outcome unknown after retry", func(t *testing.T) {
 		st := newFakeStore()
 		// The first write timed out but committed, so the retry finds no row.
-		st.scriptWrites(writeResult{err: retryableErr{}}, writeResult{ok: false})
+		st.scriptWrites(writeResult{err: fmt.Errorf("finish: %w", context.DeadlineExceeded)}, writeResult{ok: false})
 		obs := &countObserver{}
 		var buf syncBuffer
 		c := newPoolClient(t, st, noop[testPayload], KindConfig{},
@@ -359,6 +360,22 @@ func TestStatusWrite(t *testing.T) {
 		require.Contains(t, buf.String(), `level=INFO msg="notasap: status write outcome unknown after retry"`)
 		require.NotContains(t, buf.String(), "job lost lease")
 		require.Zero(t, obs.finished.Load())
+	})
+
+	t.Run("lost lease after unsent attempt", func(t *testing.T) {
+		st := newFakeStore()
+		// The first write was never sent, so ok == false is a lost lease.
+		st.scriptWrites(writeResult{err: retryableErr{}}, writeResult{ok: false})
+		var buf syncBuffer
+		c := newPoolClient(t, st, noop[testPayload], KindConfig{}, WithLogger(slog.New(slog.NewTextHandler(&buf, nil))))
+		stopOnCleanup(t, c)
+		st.feed(1)
+		require.NoError(t, c.Start(context.Background()))
+
+		require.Eventually(t, func() bool { return len(st.Calls()) == 2 }, waitFor, tick)
+		stop(t, c)
+		require.Contains(t, buf.String(), `level=WARN msg="notasap: job lost lease"`)
+		require.NotContains(t, buf.String(), "outcome unknown")
 	})
 
 	t.Run("no retry on permanent error", func(t *testing.T) {

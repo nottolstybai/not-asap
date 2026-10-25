@@ -36,7 +36,10 @@ WHERE kind = $1 AND idempotency_key = $5 AND NOT EXISTS (SELECT 1 FROM ins)`
 
 // insertReplaceSQL inserts a job or replaces the non-running row of its key,
 // and reports a running row as outcome 4 (Running). Running rows are filtered
-// out before the conflict check, so they are not locked.
+// out before the conflict check, so they are normally not locked. A row
+// claimed after the statement snapshot passes the filter; the conflict check
+// then locks it although its WHERE is false, so it stays locked until the
+// enclosing transaction ends, and the lookup round reports it as Running.
 const insertReplaceSQL = `WITH up AS (` + insertValuesSQL + `
   WHERE NOT EXISTS (SELECT 1 FROM notasap_jobs WHERE kind = $1 AND idempotency_key = $5 AND status = 2 /* running */)` +
 	onConflictSQL + `DO UPDATE SET payload = EXCLUDED.payload, status = 1 /* pending */, attempt = 0,

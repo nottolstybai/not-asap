@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/nottolstybai/not-asap/internal/store"
 )
 
@@ -269,6 +271,25 @@ func (s *Suite) WaitFor(cond func() bool, msg string, args ...any) {
 		}
 		time.Sleep(Tick)
 	}
+}
+
+// BackendPID returns the backend pid of tx.
+func (s *Suite) BackendPID(tx pgx.Tx) uint32 {
+	s.T().Helper()
+	var pid uint32
+	s.Require().NoError(tx.QueryRow(context.Background(), "SELECT pg_backend_pid()").Scan(&pid))
+	return pid
+}
+
+// WaitBlockedBy waits until some backend waits on a lock held by pid.
+func (s *Suite) WaitBlockedBy(pid uint32) {
+	s.T().Helper()
+	s.WaitFor(func() bool {
+		var n int
+		s.Require().NoError(s.Pool.QueryRow(context.Background(),
+			"SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))", pid).Scan(&n))
+		return n > 0
+	}, "no backend blocked by pid %d", pid)
 }
 
 // Consistently fails if cond becomes true within d. Use only when no barrier

@@ -151,8 +151,9 @@ Replicas of your service share the table and never claim the same row twice.
 An idle poller checks for ready jobs every `PollInterval`. `Schedule` and `ScheduleBatch` also wake
 this replica's poller at once when they insert a job without a delay. `ScheduleTx` and `ScheduleBatchTx`
 do not, because the job is invisible until your commit; such jobs, and jobs scheduled by other replicas,
-start within `PollInterval`. Under a backlog a poller waits up to 20 ms for a quarter of its workers
-to free up, so it claims in batches rather than one row at a time.
+start within `PollInterval`. Under steady `Schedule` traffic each ready job wakes the poller, so a claim
+may fetch a single row: more round trips to the database for lower latency. Under a backlog a poller
+waits up to 20 ms for a quarter of its workers to free up, so it claims in batches rather than one row at a time.
 
 ```mermaid
 stateDiagram-v2
@@ -255,8 +256,10 @@ if errors.Is(err, notasap.ErrDuplicate) {
 - A batch of 2+ items with idempotency keys passed to `ScheduleBatch` runs in its own transaction, so it is all or nothing.
 - A keyed `ScheduleTx` that inserts or replaces a job holds the key until your transaction ends:
   a concurrent schedule of the same key waits for it. Finding a duplicate locks nothing.
-- `WithReplace` does not wait on a row that is already `running`: it returns `ErrJobRunning` with the
-  existing ID, and the worker saves the job's result without waiting for your transaction.
+- `WithReplace` normally does not wait on or lock a row that is already `running`: it returns `ErrJobRunning`
+  with the existing ID. If a worker claims the row at the same moment, `ScheduleTx` still returns
+  `ErrJobRunning` but keeps the row locked until your transaction ends, and the worker waits for it to save
+  the job's result. Keep such transactions short.
 - Several keyed schedules in one transaction can deadlock with another transaction; see
   [Keyed jobs in one transaction](#keyed-jobs-in-one-transaction).
 
@@ -331,6 +334,9 @@ err := client.Stop(ctx)  // graceful shutdown
    and returns `ctx.Err()`. Interrupted jobs go back to `pending` without losing an attempt.
 
 A second concurrent `Stop` waits for the first one, so `defer pool.Close()` is safe.
+If `Stop` returns `ctx.Err()`, handlers that were still running keep saving their result after it returns;
+a handler that has returned may retry that write for up to 10 s. Keep the pool open that long, or the write
+fails and the rescuer recovers the job.
 
 ## Reliability
 

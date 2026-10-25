@@ -2,6 +2,7 @@ package notasap
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"runtime/debug"
 	"time"
@@ -28,7 +29,13 @@ const claimCoalesceWindow = 20 * time.Millisecond
 // or timeout) after which retrying a status write is safe: the lease makes the
 // write idempotent.
 func isTransient(err error) bool {
-	return pgconn.SafeToRetry(err) || pgconn.Timeout(err)
+	return pgconn.SafeToRetry(err) || timedOut(err)
+}
+
+// timedOut reports whether err is a timeout, after which the statement may
+// have been sent and committed.
+func timedOut(err error) bool {
+	return pgconn.Timeout(err) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // kindPool polls and runs the jobs of one Kind with at most Workers handlers.
@@ -205,7 +212,9 @@ func (p *kindPool) record(row store.ClaimedJob, a action, took time.Duration, lo
 	// Transient failures are retried with doubling backoff, all within the
 	// single dbCallTimeout budget of ctx.
 	ok, err := write()
-	retried := false
+	// unknown is set once an attempt timed out: it may have committed, so a
+	// later ok == false does not prove a lost lease.
+	unknown := false
 	for delay := statusWriteBackoff; err != nil && isTransient(err); delay *= 2 {
 		select {
 		case <-time.After(delay):
@@ -214,14 +223,14 @@ func (p *kindPool) record(row store.ClaimedJob, a action, took time.Duration, lo
 		if ctx.Err() != nil {
 			break
 		}
+		unknown = unknown || timedOut(err)
 		ok, err = write()
-		retried = true
 	}
 	switch {
 	case err != nil:
 		logger.Warn("notasap: write job status", "status", a.status, "error", err)
 		return
-	case !ok && retried:
+	case !ok && unknown:
 		// The retry cannot tell a committed earlier attempt from a lost
 		// lease. The observer is not called, as for a lost lease.
 		logger.Info("notasap: status write outcome unknown after retry", "status", a.status)

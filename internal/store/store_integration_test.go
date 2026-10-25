@@ -5,9 +5,11 @@ import (
 	"context"
 	"os"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/suite"
 
@@ -425,4 +427,76 @@ func (s *StoreSuite) TestInsertOutcomesInParamsOrder() {
 	s.NotEqual(res[0].ID, res[2].ID)
 	s.Equal(store.StatusPending, s.Job(seed[1].ID).Status)
 	s.Equal(store.StatusRunning, s.Job(seed[2].ID).Status)
+}
+
+func (s *StoreSuite) TestInsertReplaceClaimedMeanwhile() {
+	ctx := context.Background()
+	key := "k"
+	params := []store.InsertParams{{Kind: 1, Payload: []byte(`{"new":true}`), MaxAttempts: 3, Key: &key, Replace: true}}
+
+	// claim marks the pending row of key running in a transaction left open,
+	// like a worker's claim between the insert's snapshot and its conflict
+	// check, and returns the transaction and the new lease.
+	claim := func() (pgx.Tx, int64, int64) {
+		id := s.InsertJob(pgtest.WithKind(int16(1)), pgtest.WithKey(key))
+		tx, err := s.Pool.Begin(ctx)
+		s.Require().NoError(err)
+		s.T().Cleanup(func() { _ = tx.Rollback(ctx) })
+		var lease int64
+		s.Require().NoError(tx.QueryRow(ctx,
+			"UPDATE notasap_jobs SET status = 2, lease = lease + 1 WHERE id = $1 RETURNING lease", id).Scan(&lease))
+		return tx, id, lease
+	}
+
+	s.Run("autocommit", func() {
+		claimTx, id, lease := claim()
+		var (
+			res []store.InsertResult
+			err error
+			wg  sync.WaitGroup
+		)
+		wg.Go(func() { res, err = s.st.Insert(ctx, s.Pool, params) })
+		s.WaitBlockedBy(s.BackendPID(claimTx))
+		s.Require().NoError(claimTx.Commit(ctx))
+		wg.Wait()
+		s.Require().NoError(err)
+		s.Equal([]store.InsertResult{{ID: id, Outcome: store.Running}}, res)
+
+		// The running row is not left locked: the worker's Finish completes.
+		finishCtx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		ok, err := s.st.Finish(finishCtx, store.Ref{ID: id, Lease: lease}, store.StatusDone, "")
+		s.Require().NoError(err)
+		s.True(ok)
+	})
+	s.Run("in caller tx", func() {
+		claimTx, id, lease := claim()
+		tx, err := s.Pool.Begin(ctx)
+		s.Require().NoError(err)
+		defer func() { _ = tx.Rollback(ctx) }()
+		var (
+			res    []store.InsertResult
+			insErr error
+			wg     sync.WaitGroup
+		)
+		wg.Go(func() { res, insErr = s.st.Insert(ctx, tx, params) })
+		s.WaitBlockedBy(s.BackendPID(claimTx))
+		s.Require().NoError(claimTx.Commit(ctx))
+		wg.Wait()
+		s.Require().NoError(insErr)
+		s.Equal([]store.InsertResult{{ID: id, Outcome: store.Running}}, res)
+
+		// The conflict check locked the running row: Finish waits for tx.
+		var (
+			ok     bool
+			finErr error
+		)
+		wg.Go(func() { ok, finErr = s.st.Finish(ctx, store.Ref{ID: id, Lease: lease}, store.StatusDone, "") })
+		s.WaitBlockedBy(s.BackendPID(tx))
+		s.Require().NoError(tx.Commit(ctx))
+		wg.Wait()
+		s.Require().NoError(finErr)
+		s.True(ok)
+		s.JSONEq(`{}`, string(s.Job(id).Payload))
+	})
 }

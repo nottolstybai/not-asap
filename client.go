@@ -158,8 +158,10 @@ func (c *Client) startMaintenance() {
 // Stop stops polling and maintenance and waits for running handlers until ctx
 // is done. Then it cancels handler contexts, waits up to the stop grace for
 // them to record their status and returns ctx.Err(). Handlers that ignore
-// their context may still be running after Stop returns; their jobs are
-// recovered by the rescuer. Stop on a Client that was never started returns
+// their context may still be running after Stop returns, and a handler that
+// has returned may still retry its status write for up to 10s (dbCallTimeout);
+// keep the pool open that long, or the write fails and the rescuer recovers
+// the job. When Stop returns nil, all status writes are done. Stop on a Client that was never started returns
 // nil. A later Stop waits until the first one returns, then returns nil, or
 // returns ctx.Err() if ctx is done first.
 func (c *Client) Stop(ctx context.Context) error {
