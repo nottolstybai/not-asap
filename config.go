@@ -59,7 +59,8 @@ type RescuerConfig struct {
 	Grace time.Duration
 }
 
-// JanitorConfig configures deletion of finished jobs.
+// JanitorConfig configures deletion of finished jobs. The janitor runs in
+// every replica, but only one replica deletes a batch at a time.
 type JanitorConfig struct {
 	// Interval between cleanup passes. Default 10m.
 	Interval time.Duration

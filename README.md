@@ -43,6 +43,7 @@ tx.Commit(ctx)                                               // both or neither
 - [Configuration](#configuration)
 - [Running and stopping](#running-and-stopping)
 - [Reliability](#reliability)
+- [Operating in production](#operating-in-production)
 - [Observability](#observability)
 - [Migrations](#migrations)
 - [Development](#development)
@@ -147,6 +148,12 @@ Every job is a row in `notasap_jobs`. Each registered kind has a poller that cla
 ready rows with `FOR UPDATE SKIP LOCKED` and hands them to that kind's workers.
 Replicas of your service share the table and never claim the same row twice.
 
+An idle poller checks for ready jobs every `PollInterval`. `Schedule` and `ScheduleBatch` also wake
+this replica's poller at once when they insert a job without a delay. `ScheduleTx` and `ScheduleBatchTx`
+do not, because the job is invisible until your commit; such jobs, and jobs scheduled by other replicas,
+start within `PollInterval`. Under a backlog a poller waits up to 20 ms for a quarter of its workers
+to free up, so it claims in batches rather than one row at a time.
+
 ```mermaid
 stateDiagram-v2
     direction LR
@@ -246,8 +253,12 @@ if errors.Is(err, notasap.ErrDuplicate) {
 <summary>Locking details</summary>
 
 - A batch of 2+ items with idempotency keys passed to `ScheduleBatch` runs in its own transaction, so it is all or nothing.
-- `ScheduleTx` with `WithReplace` locks the existing row until your transaction ends, even when that row is `running`.
-  Keep such transactions short: a worker that finishes the job meanwhile waits for the lock.
+- A keyed `ScheduleTx` that inserts or replaces a job holds the key until your transaction ends:
+  a concurrent schedule of the same key waits for it. Finding a duplicate locks nothing.
+- `WithReplace` does not lock a `running` row: it returns `ErrJobRunning` with the existing ID,
+  and the worker saves the job's result without waiting for your transaction.
+- Several keyed schedules in one transaction can deadlock with another transaction; see
+  [Keyed jobs in one transaction](#keyed-jobs-in-one-transaction).
 
 </details>
 
@@ -339,6 +350,72 @@ is reported as stuck (log and metric) and its worker slot stays busy until the h
 Meanwhile the rescuer may give the job to another worker, in this process or another replica.
 
 **Unregistered kinds.** Jobs of a kind that no replica registers stay `pending`.
+
+## Operating in production
+
+The queue is an ordinary table updated in place, so it is only as fast as that table is healthy.
+
+### Long transactions
+
+Every claim and every status change leaves a dead row version and a dead index entry behind.
+Postgres can remove them, and index scans can skip them cheaply, only once they are older than the
+oldest snapshot still open in the cluster (the xmin horizon). While one transaction stays open,
+every claim of every replica steps over all dead entries made since it began, and claims get slower
+minute by minute for all kinds.
+
+The horizon is held by long business transactions (including the ones you `ScheduleTx` into),
+sessions left idle in transaction, `pg_dump` and long analytics queries on the primary,
+a lagging replication slot, or a standby with `hot_standby_feedback`.
+
+- Keep `ScheduleTx` transactions short; do not call slow external services inside them.
+- Set `idle_in_transaction_session_timeout` (and `statement_timeout`) for application roles.
+- Alert on the age of the oldest transaction (`backend_xmin` in `pg_stat_activity`) and of `xmin` in `pg_replication_slots`.
+
+### Dead tuples and autovacuum
+
+A job writes at least three row versions: insert, claim and finish. Each retry adds two more,
+and the janitor's delete leaves one more dead row. Every update changes an indexed column,
+so none of them is a HOT update, and each one also adds index entries. A queue table therefore
+produces dead tuples at several times the job rate, and default autovacuum thresholds, which grow with
+the table size, let them pile up between runs. Tune autovacuum for this table to match your load,
+and check that it keeps up (dead tuples and last autovacuum in `pg_stat_user_tables`).
+
+### Retention and table size
+
+Finished jobs stay in the table until the janitor deletes them, so done retention decides the table size:
+rows ≈ job rate × retention. At 300 jobs/s the default `24h` keeps about 26M done rows; a few hours is
+usually enough. Failed jobs are kept forever by default (`failed 0`), together with their idempotency keys;
+give them a retention too if failures are frequent.
+
+The janitor runs in every replica, but only one deletes at a time: each batch takes a transaction-level
+advisory try-lock keyed by the table, and a replica that does not get it waits for its next tick.
+The lock ends with the `DELETE` statement, so this works through PgBouncer in transaction mode.
+
+### Connection pool
+
+In each replica the pollers, the rescuer and the janitor use up to kinds + 2 connections at once,
+and every job that is saving its result needs one more, so plan for about kinds + 3, each held for
+milliseconds. Your handlers' queries come on top. A status write that gets no connection within 10 s,
+retries included, is lost (`write job status` in the log), and the job runs again after `Timeout + Grace`.
+
+- Give notasap its own `pgxpool` with `MaxConns` of at least kinds + 3, or size the shared pool for kinds + 3 plus your handlers.
+- `Start` logs a warning when `MaxConns` is below kinds + 2.
+- In a handler that holds a transaction, use `ScheduleTx`: `Schedule` and `Cancel` take a second connection,
+  and many such handlers at once can exhaust the pool.
+
+### Keyed jobs in one transaction
+
+Two transactions that take the same idempotency keys in opposite order deadlock. Within one
+`ScheduleBatch` or `ScheduleBatchTx` call notasap inserts items in (kind, key) order, keys compared
+byte-wise, so such calls do not deadlock each other. It cannot order keys across calls: if one
+transaction makes several keyed `ScheduleTx` or `ScheduleBatchTx` calls, make them in the same
+(kind, key) order everywhere in the application. Postgres breaks a deadlock after `deadlock_timeout`
+by aborting one transaction with SQLSTATE `40P01`; retry the whole transaction on it.
+
+### Payloads
+
+Keep payloads small: ids, not documents. The payload is read on every claim, and one larger than
+about 2 KB is stored out of line (TOAST) and costs an extra fetch each time.
 
 ## Observability
 
