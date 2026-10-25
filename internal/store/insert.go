@@ -53,12 +53,22 @@ SELECT id, 4 FROM notasap_jobs
 WHERE kind = $1 AND idempotency_key = $5 AND status = 2 /* running */ AND NOT EXISTS (SELECT 1 FROM up)`
 
 // insertKeylessSQL inserts jobs without idempotency key, which cannot
-// conflict, in one statement, in array order.
-const insertKeylessSQL = `INSERT INTO notasap_jobs (kind, status, payload, max_attempts, run_at, idempotency_key)
-SELECT k, 1 /* pending */, p, m, NOW() + make_interval(secs => d), NULL
-FROM unnest($1::smallint[], $2::jsonb[], $3::int[], $4::float8[]) WITH ORDINALITY AS t(k, p, m, d, ord)
-ORDER BY ord
-RETURNING id`
+// conflict, in one statement, in array order, and returns each job's 1-based
+// array position with its id. Ids are allocated in t, so the mapping does not
+// depend on the order rows are inserted or returned in. The sequence is
+// resolved once by a scalar subquery, not per row; per-row resolution halves
+// the throughput.
+const insertKeylessSQL = `WITH t AS MATERIALIZED (
+  SELECT nextval((SELECT pg_get_serial_sequence('notasap_jobs', 'id')::regclass)) AS id, k, p, m, d, ord
+  FROM unnest($1::smallint[], $2::jsonb[], $3::int[], $4::float8[]) WITH ORDINALITY AS u(k, p, m, d, ord)
+  ORDER BY ord
+), ins AS (
+  INSERT INTO notasap_jobs (id, kind, status, payload, max_attempts, run_at, idempotency_key)
+  OVERRIDING SYSTEM VALUE
+  SELECT id, k, 1 /* pending */, p, m, NOW() + make_interval(secs => d), NULL FROM t ORDER BY ord
+  RETURNING id
+)
+SELECT t.ord, t.id FROM t JOIN ins USING (id) ORDER BY t.ord`
 
 const lookupSQL = `SELECT id, status FROM notasap_jobs WHERE kind = $1 AND idempotency_key = $2`
 
@@ -223,32 +233,37 @@ func insertRound(ctx context.Context, db DB, params []InsertParams, keyless, tod
 	return conflicts, nil
 }
 
-// scanKeyless reads the ids returned by insertKeylessSQL into results of
-// keyless. RETURNING order is not guaranteed, so the ids are sorted: identity
-// values come from a sequence whose nextval increases within a session, and
-// the statement inserts the rows in ORDER BY ord, so the k-th smallest id
-// belongs to the k-th item of keyless.
+// scanKeyless reads the (ord, id) rows returned by insertKeylessSQL into
+// results of keyless; ord is the 1-based position in keyless.
 func scanKeyless(br pgx.BatchResults, keyless []int, results []InsertResult) error {
 	rows, err := br.Query()
 	if err != nil {
 		return fmt.Errorf("br.Query: %w", err)
 	}
 
-	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
-	if err != nil {
-		return fmt.Errorf("pgx.CollectRows: %w", err)
-	}
+	var (
+		n       int
+		ord, id int64
+	)
+	_, err = pgx.ForEachRow(rows, []any{&ord, &id}, func() error {
+		if ord < 1 || ord > int64(len(keyless)) {
+			return fmt.Errorf("ordinal %d out of range", ord)
+		}
 
-	if len(ids) != len(keyless) {
-		return fmt.Errorf("%d ids returned for %d jobs without idempotency key", len(ids), len(keyless))
-	}
-
-	slices.Sort(ids)
-	for j, i := range keyless {
-		results[i] = InsertResult{
-			ID:      ids[j],
+		results[keyless[ord-1]] = InsertResult{
+			ID:      id,
 			Outcome: Inserted,
 		}
+		n++
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("pgx.ForEachRow: %w", err)
+	}
+
+	if n != len(keyless) {
+		return fmt.Errorf("%d ids returned for %d jobs without idempotency key", n, len(keyless))
 	}
 
 	return nil
