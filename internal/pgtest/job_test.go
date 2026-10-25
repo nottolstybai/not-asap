@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/nottolstybai/not-asap/internal/pgtest"
@@ -27,8 +28,8 @@ func TestJobSuite(t *testing.T) {
 type myKind int16
 
 func (s *JobSuite) TestInsertJobDefaults() {
-	id := s.InsertJob()
-	row := s.Job(id)
+	id := s.Fixture.Job(context.Background()).ID
+	row := s.GetJob(id)
 	s.Equal(int16(1), row.Kind)
 	s.Equal(store.StatusPending, row.Status)
 	s.JSONEq(`{}`, string(row.Payload))
@@ -41,8 +42,12 @@ func (s *JobSuite) TestInsertJobDefaults() {
 }
 
 func (s *JobSuite) TestInsertJobRunningPreset() {
-	id := s.InsertJob(pgtest.WithKind(myKind(7)), pgtest.Running(-time.Minute))
-	row := s.Job(id)
+	id := s.Fixture.Job(context.Background(), pgtest.JobOpt{
+		Kind:       lo.ToPtr(int16(myKind(7))),
+		Status:     lo.ToPtr(store.StatusRunning),
+		DeadlineIn: lo.ToPtr(-time.Minute),
+	}).ID
+	row := s.GetJob(id)
 	now := s.DBNow()
 	s.Equal(int16(7), row.Kind)
 	s.Equal(store.StatusRunning, row.Status)
@@ -54,11 +59,18 @@ func (s *JobSuite) TestInsertJobRunningPreset() {
 }
 
 func (s *JobSuite) TestInsertJobOptions() {
-	id := s.InsertJob(
-		pgtest.WithPayload(`{"n":1}`), pgtest.WithAttempt(2, 9), pgtest.WithLease(4),
-		pgtest.WithRunIn(time.Hour), pgtest.WithKey("k"), pgtest.WithError("boom"),
-		pgtest.Finished(store.StatusDone, 25*time.Hour))
-	row := s.Job(id)
+	id := s.Fixture.Job(context.Background(), pgtest.JobOpt{
+		Payload:     lo.ToPtr(`{"n":1}`),
+		Attempt:     lo.ToPtr(2),
+		MaxAttempts: lo.ToPtr(9),
+		Lease:       lo.ToPtr(int64(4)),
+		RunIn:       lo.ToPtr(time.Hour),
+		Key:         lo.ToPtr("k"),
+		Error:       lo.ToPtr("boom"),
+		Status:      lo.ToPtr(store.StatusDone),
+		UpdatedAgo:  lo.ToPtr(25 * time.Hour),
+	}).ID
+	row := s.GetJob(id)
 	now := s.DBNow()
 	s.JSONEq(`{"n":1}`, string(row.Payload))
 	s.Equal(2, row.Attempt)
@@ -74,9 +86,9 @@ func (s *JobSuite) TestInsertJobOptions() {
 }
 
 func (s *JobSuite) TestInsertJobsTie() {
-	ids := s.InsertJobs(3, pgtest.WithRunIn(-3*time.Second))
-	s.Len(ids, 3)
-	a, b, c := s.Job(ids[0]), s.Job(ids[1]), s.Job(ids[2])
+	rows := s.Fixture.Jobs(context.Background(), 3, pgtest.JobOpt{RunIn: lo.ToPtr(-3 * time.Second)})
+	s.Require().Len(rows, 3)
+	a, b, c := s.GetJob(rows[0].ID), s.GetJob(rows[1].ID), s.GetJob(rows[2].ID)
 	s.True(a.RunAt.Equal(b.RunAt))
 	s.True(b.RunAt.Equal(c.RunAt))
 	s.True(a.UpdatedAt.Equal(c.UpdatedAt))
@@ -84,13 +96,21 @@ func (s *JobSuite) TestInsertJobsTie() {
 }
 
 func (s *JobSuite) TestSetJobTouchesOnlyGivenColumns() {
-	id := s.InsertJob(pgtest.WithPayload(`{"a":1}`), pgtest.WithAttempt(1, 5),
-		pgtest.WithKey("k"), pgtest.WithRunIn(time.Hour))
-	before := s.Job(id)
+	id := s.Fixture.Job(context.Background(), pgtest.JobOpt{
+		Payload:     lo.ToPtr(`{"a":1}`),
+		Attempt:     lo.ToPtr(1),
+		MaxAttempts: lo.ToPtr(5),
+		Key:         lo.ToPtr("k"),
+		RunIn:       lo.ToPtr(time.Hour),
+	}).ID
+	before := s.GetJob(id)
 
-	s.SetJob(id, pgtest.WithStatus(store.StatusFailed), pgtest.WithError("x"),
-		pgtest.WithDeadlineIn(-time.Minute))
-	after := s.Job(id)
+	s.Fixture.SetJob(context.Background(), id, pgtest.JobOpt{
+		Status:     lo.ToPtr(store.StatusFailed),
+		Error:      lo.ToPtr("x"),
+		DeadlineIn: lo.ToPtr(-time.Minute),
+	})
+	after := s.GetJob(id)
 	s.Equal(store.StatusFailed, after.Status)
 	s.Require().NotNil(after.Error)
 	s.Equal("x", *after.Error)
@@ -108,9 +128,9 @@ func (s *JobSuite) TestSetJobTouchesOnlyGivenColumns() {
 }
 
 func (s *JobSuite) TestExistsAndCount() {
-	id := s.InsertJob()
-	s.InsertJob(pgtest.WithStatus(store.StatusDone))
-	s.InsertJob(pgtest.WithStatus(store.StatusFailed))
+	id := s.Fixture.Job(context.Background()).ID
+	s.Fixture.Job(context.Background(), pgtest.JobOpt{Status: lo.ToPtr(store.StatusDone)})
+	s.Fixture.Job(context.Background(), pgtest.JobOpt{Status: lo.ToPtr(store.StatusFailed)})
 	s.True(s.Exists(id))
 	s.False(s.Exists(-1))
 	s.Equal(3, s.CountJobs())
@@ -129,7 +149,7 @@ func (s *JobSuite) TestWaitFor() {
 }
 
 func (s *JobSuite) TestWaitStatus() {
-	id := s.InsertJob()
+	id := s.Fixture.Job(context.Background()).ID
 	done := make(chan error, 1)
 	go func() {
 		time.Sleep(50 * time.Millisecond)
@@ -142,9 +162,16 @@ func (s *JobSuite) TestWaitStatus() {
 }
 
 func (s *JobSuite) TestSetJobRunningKeepsOtherColumns() {
-	id := s.InsertJob(pgtest.WithAttempt(2, 5), pgtest.WithLease(4))
-	s.SetJob(id, pgtest.Running(-time.Minute))
-	row := s.Job(id)
+	id := s.Fixture.Job(context.Background(), pgtest.JobOpt{
+		Attempt:     lo.ToPtr(2),
+		MaxAttempts: lo.ToPtr(5),
+		Lease:       lo.ToPtr(int64(4)),
+	}).ID
+	s.Fixture.SetJob(context.Background(), id, pgtest.JobOpt{
+		Status:     lo.ToPtr(store.StatusRunning),
+		DeadlineIn: lo.ToPtr(-time.Minute),
+	})
+	row := s.GetJob(id)
 	s.Equal(store.StatusRunning, row.Status)
 	s.Require().NotNil(row.Deadline)
 	s.True(row.Deadline.Before(s.DBNow()))
@@ -154,10 +181,19 @@ func (s *JobSuite) TestSetJobRunningKeepsOtherColumns() {
 }
 
 func (s *JobSuite) TestInsertRunningDefaultsAttemptAndLease() {
-	row := s.Job(s.InsertJob(pgtest.Running(time.Minute)))
+	row := s.GetJob(s.Fixture.Job(context.Background(), pgtest.JobOpt{
+		Status:     lo.ToPtr(store.StatusRunning),
+		DeadlineIn: lo.ToPtr(time.Minute),
+	}).ID)
 	s.Equal(1, row.Attempt)
 	s.Equal(int64(1), row.Lease)
-	row = s.Job(s.InsertJob(pgtest.Running(time.Minute), pgtest.WithAttempt(2, 3), pgtest.WithLease(7)))
+	row = s.GetJob(s.Fixture.Job(context.Background(), pgtest.JobOpt{
+		Status:      lo.ToPtr(store.StatusRunning),
+		DeadlineIn:  lo.ToPtr(time.Minute),
+		Attempt:     lo.ToPtr(2),
+		MaxAttempts: lo.ToPtr(3),
+		Lease:       lo.ToPtr(int64(7)),
+	}).ID)
 	s.Equal(2, row.Attempt)
 	s.Equal(int64(7), row.Lease)
 }
@@ -165,6 +201,6 @@ func (s *JobSuite) TestInsertRunningDefaultsAttemptAndLease() {
 type myStatus int16
 
 func (s *JobSuite) TestConsistently() {
-	id := s.InsertJob()
+	id := s.Fixture.Job(context.Background()).ID
 	s.Consistently(100*time.Millisecond, func() bool { return !s.Exists(id) }, "job %d vanished", id)
 }

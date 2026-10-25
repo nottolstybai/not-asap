@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/suite"
 
 	notasap "github.com/nottolstybai/not-asap"
@@ -36,7 +37,10 @@ func (s *CancelSuite) TestCancel() {
 	}
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
-			id := s.InsertJob(pgtest.WithKind(kindA), pgtest.WithStatus(tt.status))
+			id := s.Fixture.Job(context.Background(), pgtest.JobOpt{
+				Kind:   lo.ToPtr(int16(kindA)),
+				Status: lo.ToPtr(int16(tt.status)),
+			}).ID
 
 			err := c.Cancel(context.Background(), id)
 			if tt.wantErr == nil {

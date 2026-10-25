@@ -159,7 +159,7 @@ func (s *clientSuite) schedule(c *testClient, p notasap.Payload, opts ...notasap
 // status returns the status of job id.
 func (s *clientSuite) status(id int64) notasap.Status {
 	s.T().Helper()
-	return notasap.Status(s.Job(id).Status)
+	return notasap.Status(s.GetJob(id).Status)
 }
 
 // waitStatus waits until job id has status st and returns the row.

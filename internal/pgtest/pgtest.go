@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/suite"
 	"github.com/testcontainers/testcontainers-go"
@@ -128,22 +129,23 @@ type JobRow struct {
 	Status      int16
 	Payload     []byte
 	Attempt     int
-	MaxAttempts int
-	RunAt       time.Time
+	MaxAttempts int       `db:"max_attempts"`
+	RunAt       time.Time `db:"run_at"`
 	Deadline    *time.Time
 	Lease       int64
-	Key         *string
+	Key         *string `db:"idempotency_key"`
 	Error       *string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	CreatedAt   time.Time `db:"created_at"`
+	UpdatedAt   time.Time `db:"updated_at"`
 }
 
 // Suite is a testify suite with an isolated schema holding the notasap table.
 type Suite struct {
 	suite.Suite
-	Pool   *pgxpool.Pool
-	Schema string
-	admin  *pgxpool.Pool
+	Pool    *pgxpool.Pool
+	Schema  string
+	Fixture *Fixture
+	admin   *pgxpool.Pool
 }
 
 func (s *Suite) SetupSuite() {
@@ -161,6 +163,7 @@ func (s *Suite) SetupSuite() {
 
 	s.Pool, err = newPool(ctx, s.Schema)
 	s.Require().NoError(err)
+	s.Fixture = NewFixture(s.T, s.Pool)
 
 	up, err := migrations.GolangMigrate.ReadFile("golang-migrate/000001_notasap_jobs.up.sql")
 	s.Require().NoError(err)
@@ -207,16 +210,14 @@ func (s *Suite) Exec(sql string, args ...any) {
 	s.Require().NoError(err)
 }
 
-// Job reads one row by id.
-func (s *Suite) Job(id int64) JobRow {
+// GetJob reads one row by id.
+func (s *Suite) GetJob(id int64) JobRow {
 	s.T().Helper()
-	var r JobRow
-	err := s.Pool.QueryRow(context.Background(), `
-SELECT id, kind, status, payload, attempt, max_attempts, run_at, deadline, lease,
-       idempotency_key, error, created_at, updated_at
-FROM notasap_jobs WHERE id = $1`, id).Scan(
-		&r.ID, &r.Kind, &r.Status, &r.Payload, &r.Attempt, &r.MaxAttempts, &r.RunAt,
-		&r.Deadline, &r.Lease, &r.Key, &r.Error, &r.CreatedAt, &r.UpdatedAt)
+	rows, err := s.Pool.Query(context.Background(), `SELECT `+jobColumns+` FROM notasap_jobs WHERE id = $1`, id)
 	s.Require().NoError(err)
+
+	r, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[JobRow])
+	s.Require().NoError(err)
+
 	return r
 }

@@ -12,6 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/suite"
 
 	notasap "github.com/nottolstybai/not-asap"
@@ -120,7 +121,10 @@ func (s *WorkerSuite) TestOutcome() {
 			called.Store(true)
 			return nil
 		}, notasap.KindConfig{Name: "a"})})
-		id := s.InsertJob(pgtest.WithKind(kindA), pgtest.WithPayload(`{"n":"str"}`))
+		id := s.Fixture.Job(context.Background(), pgtest.JobOpt{
+			Kind:    lo.ToPtr(int16(kindA)),
+			Payload: lo.ToPtr(`{"n":"str"}`),
+		}).ID
 
 		row := s.waitStatus(id, notasap.StatusFailed)
 		s.Equal(1, row.Attempt)
@@ -149,7 +153,7 @@ func (s *WorkerSuite) TestDelayedNotRunEarly() {
 	now := s.schedule(c, payloadA{N: 2})
 
 	s.waitStatus(now, notasap.StatusDone)
-	row := s.Job(delayed)
+	row := s.GetJob(delayed)
 	s.Equal(notasap.StatusPending, notasap.Status(row.Status))
 	s.Equal(0, row.Attempt)
 }
@@ -290,7 +294,7 @@ func (s *WorkerSuite) TestStop() {
 		defer cancel()
 		s.Require().ErrorIs(c.Stop(ctx), context.DeadlineExceeded)
 
-		row := s.Job(id)
+		row := s.GetJob(id)
 		s.Equal(notasap.StatusPending, notasap.Status(row.Status))
 		s.Equal(0, row.Attempt)
 		s.False(row.RunAt.After(s.DBNow()))

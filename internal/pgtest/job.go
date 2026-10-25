@@ -4,9 +4,13 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/samber/lo"
+	"github.com/stretchr/testify/require"
 
 	"github.com/nottolstybai/not-asap/internal/store"
 )
@@ -18,108 +22,48 @@ const (
 	Tick = 10 * time.Millisecond
 )
 
-// Bits of jobSpec.set, one per column that SetJob can update.
-const (
-	fKind uint16 = 1 << iota
-	fStatus
-	fPayload
-	fAttempt
-	fLease
-	fRunAt
-	fDeadline
-	fUpdatedAt
-	fKey
-	fError
-)
+// jobColumns lists every notasap_jobs column in JobRow order.
+const jobColumns = `id, kind, status, payload, attempt, max_attempts, run_at, deadline, lease,
+       idempotency_key, error, created_at, updated_at`
 
-// JobOption sets one column of a fixture row. Times are relative to the
-// database NOW(), never to the Go clock.
-type JobOption func(*jobSpec)
-
-type jobSpec struct {
-	kind        int16
-	status      int16
-	payload     string
-	attempt     int
-	maxAttempts int
-	lease       int64
-	runIn       time.Duration  // run_at = NOW() + runIn
-	deadlineIn  *time.Duration // deadline = NOW() + deadlineIn; nil = NULL
-	updatedAgo  time.Duration  // updated_at = NOW() - updatedAgo
-	key, errMsg *string
-	set         uint16 // bitmask of explicitly set fields, for SetJob
+// Fixture inserts and updates notasap_jobs rows directly, bypassing the store.
+// Failures are reported on the T returned by t at call time, so a fixture
+// shared by a suite fails the current test or subtest.
+type Fixture struct {
+	t    func() *testing.T
+	pool *pgxpool.Pool
 }
 
-func defaults() jobSpec {
-	return jobSpec{kind: 1, status: store.StatusPending, payload: `{}`, maxAttempts: 3}
-}
-
-// WithKind sets the kind column.
-func WithKind[K ~int16](k K) JobOption {
-	return func(j *jobSpec) { j.kind = int16(k); j.set |= fKind }
-}
-
-// WithStatus sets the status column.
-func WithStatus[S ~int16](s S) JobOption {
-	return func(j *jobSpec) { j.status = int16(s); j.set |= fStatus }
-}
-
-// WithPayload sets the payload column to the JSON text.
-func WithPayload(json string) JobOption {
-	return func(j *jobSpec) { j.payload = json; j.set |= fPayload }
-}
-
-// WithAttempt sets the attempt and max_attempts columns.
-func WithAttempt(attempt, max int) JobOption {
-	return func(j *jobSpec) { j.attempt, j.maxAttempts = attempt, max; j.set |= fAttempt }
-}
-
-// WithLease sets the lease column.
-func WithLease(n int64) JobOption {
-	return func(j *jobSpec) { j.lease = n; j.set |= fLease }
-}
-
-// WithRunIn sets run_at to NOW() + d; negative means due.
-func WithRunIn(d time.Duration) JobOption {
-	return func(j *jobSpec) { j.runIn = d; j.set |= fRunAt }
-}
-
-// WithDeadlineIn sets deadline to NOW() + d; negative means expired.
-func WithDeadlineIn(d time.Duration) JobOption {
-	return func(j *jobSpec) { j.deadlineIn = &d; j.set |= fDeadline }
-}
-
-// WithUpdatedAgo sets updated_at to NOW() - d.
-func WithUpdatedAgo(d time.Duration) JobOption {
-	return func(j *jobSpec) { j.updatedAgo = d; j.set |= fUpdatedAt }
-}
-
-// WithKey sets the idempotency_key column.
-func WithKey(k string) JobOption {
-	return func(j *jobSpec) { j.key = &k; j.set |= fKey }
-}
-
-// WithError sets the error column.
-func WithError(msg string) JobOption {
-	return func(j *jobSpec) { j.errMsg = &msg; j.set |= fError }
-}
-
-// Running makes a claimed job: status running and a deadline deadlineIn from
-// now. It names no other column, so SetJob leaves them alone; InsertJob
-// defaults attempt and lease to 1 for a running row.
-func Running(deadlineIn time.Duration) JobOption {
-	return func(j *jobSpec) {
-		WithStatus(store.StatusRunning)(j)
-		WithDeadlineIn(deadlineIn)(j)
+// NewFixture returns a fixture writing through pool; t is usually s.T.
+func NewFixture(t func() *testing.T, pool *pgxpool.Pool) *Fixture {
+	return &Fixture{
+		t:    t,
+		pool: pool,
 	}
 }
 
-// Finished makes a job in a final status last updated ago in the past.
-func Finished[S ~int16](status S, ago time.Duration) JobOption {
-	return func(j *jobSpec) {
-		WithStatus(status)(j)
-		WithUpdatedAgo(ago)(j)
+func opt[T any](opts []T) T {
+	if len(opts) > 0 {
+		return opts[0]
 	}
+
+	return lo.Empty[T]()
+}
+
+// JobOpt sets columns of a fixture row; nil means default (Job) or unchanged (SetJob).
+// Durations are relative to the database NOW().
+type JobOpt struct {
+	Kind        *int16
+	Status      *int16
+	Payload     *string
+	Attempt     *int
+	MaxAttempts *int
+	Lease       *int64
+	RunIn       *time.Duration
+	DeadlineIn  *time.Duration
+	UpdatedAgo  *time.Duration
+	Key         *string
+	Error       *string
 }
 
 const insertJobSQL = `
@@ -131,103 +75,114 @@ SELECT $1::smallint, $2::smallint, $3::jsonb, $4::int, $5::int, $6::bigint,
        $9::text, $10::text,
        NOW() - make_interval(secs => $11::float8)
 FROM generate_series(1, $12::int)
-RETURNING id`
+RETURNING ` + jobColumns
 
-// InsertJob inserts one row and returns its id.
-func (s *Suite) InsertJob(opts ...JobOption) int64 {
-	s.T().Helper()
-	return s.InsertJobs(1, opts...)[0]
+// Job inserts one row and returns it. Defaults: kind 1, pending, payload {},
+// attempt 0, max_attempts 3, lease 0, due now, no deadline, updated now; a
+// running row defaults attempt and lease to 1.
+func (f *Fixture) Job(ctx context.Context, opts ...JobOpt) JobRow {
+	t := f.t()
+	t.Helper()
+	rows := f.Jobs(ctx, 1, opts...)
+	require.Len(t, rows, 1)
+
+	return rows[0]
 }
 
-// InsertJobs inserts n identical rows in one statement; they share one NOW(),
-// so run_at and updated_at tie exactly.
-func (s *Suite) InsertJobs(n int, opts ...JobOption) []int64 {
-	s.T().Helper()
-	j := defaults()
-	for _, o := range opts {
-		o(&j)
+// Jobs inserts n identical rows in one statement; they share one NOW(), so
+// run_at and updated_at tie exactly.
+func (f *Fixture) Jobs(ctx context.Context, n int, opts ...JobOpt) []JobRow {
+	t := f.t()
+	t.Helper()
+	o := opt(opts)
+
+	status := lo.FromPtrOr(o.Status, store.StatusPending)
+	attempt, lease := 0, int64(0)
+	if status == store.StatusRunning {
+		attempt, lease = 1, 1
 	}
-	if j.status == store.StatusRunning {
-		if j.set&fAttempt == 0 {
-			j.attempt = 1
-		}
-		if j.set&fLease == 0 {
-			j.lease = 1
-		}
-	}
+
 	var deadline *float64
-	if j.deadlineIn != nil {
-		d := j.deadlineIn.Seconds()
-		deadline = &d
+	if o.DeadlineIn != nil {
+		deadline = lo.ToPtr(o.DeadlineIn.Seconds())
 	}
-	rows, err := s.Pool.Query(context.Background(), insertJobSQL,
-		j.kind, j.status, j.payload, j.attempt, j.maxAttempts, j.lease,
-		j.runIn.Seconds(), deadline, j.key, j.errMsg, j.updatedAgo.Seconds(), n)
-	s.Require().NoError(err)
-	defer rows.Close()
-	ids := make([]int64, 0, n)
-	for rows.Next() {
-		var id int64
-		s.Require().NoError(rows.Scan(&id))
-		ids = append(ids, id)
-	}
-	s.Require().NoError(rows.Err())
-	return ids
+
+	rows, err := f.pool.Query(ctx, insertJobSQL,
+		lo.FromPtrOr(o.Kind, 1),
+		status,
+		lo.FromPtrOr(o.Payload, `{}`),
+		lo.FromPtrOr(o.Attempt, attempt),
+		lo.FromPtrOr(o.MaxAttempts, 3),
+		lo.FromPtrOr(o.Lease, lease),
+		lo.FromPtrOr(o.RunIn, 0).Seconds(),
+		deadline,
+		o.Key,
+		o.Error,
+		lo.FromPtrOr(o.UpdatedAgo, 0).Seconds(),
+		n,
+	)
+	require.NoError(t, err)
+
+	jobs, err := pgx.CollectRows(rows, pgx.RowToStructByName[JobRow])
+	require.NoError(t, err)
+
+	return jobs
 }
 
-// SetJob updates only the columns set by opts, e.g. to move a scheduled job
-// into a given status for Cancel or idempotency tests.
-func (s *Suite) SetJob(id int64, opts ...JobOption) {
-	s.T().Helper()
-	j := defaults()
-	for _, o := range opts {
-		o(&j)
-	}
+// SetJob updates only the non-nil columns of opt, e.g. to move a scheduled
+// job into a given status for Cancel or idempotency tests.
+func (f *Fixture) SetJob(ctx context.Context, id int64, opt JobOpt) {
+	t := f.t()
+	t.Helper()
+
 	var sets []string
 	var args []any
 	add := func(col string, expr string, v any) {
 		args = append(args, v)
 		sets = append(sets, col+" = "+fmt.Sprintf(expr, len(args)))
 	}
-	if j.set&fKind != 0 {
-		add("kind", "$%d", j.kind)
+	if opt.Kind != nil {
+		add("kind", "$%d", *opt.Kind)
 	}
-	if j.set&fStatus != 0 {
-		add("status", "$%d", j.status)
+	if opt.Status != nil {
+		add("status", "$%d", *opt.Status)
 	}
-	if j.set&fPayload != 0 {
-		add("payload", "$%d::jsonb", j.payload)
+	if opt.Payload != nil {
+		add("payload", "$%d::jsonb", *opt.Payload)
 	}
-	if j.set&fAttempt != 0 {
-		add("attempt", "$%d", j.attempt)
-		add("max_attempts", "$%d", j.maxAttempts)
+	if opt.Attempt != nil {
+		add("attempt", "$%d", *opt.Attempt)
 	}
-	if j.set&fLease != 0 {
-		add("lease", "$%d", j.lease)
+	if opt.MaxAttempts != nil {
+		add("max_attempts", "$%d", *opt.MaxAttempts)
 	}
-	if j.set&fRunAt != 0 {
-		add("run_at", "NOW() + make_interval(secs => $%d::float8)", j.runIn.Seconds())
+	if opt.Lease != nil {
+		add("lease", "$%d", *opt.Lease)
 	}
-	if j.set&fDeadline != 0 {
-		add("deadline", "NOW() + make_interval(secs => $%d::float8)", j.deadlineIn.Seconds())
+	if opt.RunIn != nil {
+		add("run_at", "NOW() + make_interval(secs => $%d::float8)", opt.RunIn.Seconds())
 	}
-	if j.set&fUpdatedAt != 0 {
-		add("updated_at", "NOW() - make_interval(secs => $%d::float8)", j.updatedAgo.Seconds())
+	if opt.DeadlineIn != nil {
+		add("deadline", "NOW() + make_interval(secs => $%d::float8)", opt.DeadlineIn.Seconds())
 	}
-	if j.set&fKey != 0 {
-		add("idempotency_key", "$%d", j.key)
+	if opt.UpdatedAgo != nil {
+		add("updated_at", "NOW() - make_interval(secs => $%d::float8)", opt.UpdatedAgo.Seconds())
 	}
-	if j.set&fError != 0 {
-		add("error", "$%d", j.errMsg)
+	if opt.Key != nil {
+		add("idempotency_key", "$%d", *opt.Key)
+	}
+	if opt.Error != nil {
+		add("error", "$%d", *opt.Error)
 	}
 	if len(sets) == 0 {
 		return
 	}
+
 	args = append(args, id)
-	tag, err := s.Pool.Exec(context.Background(),
+	tag, err := f.pool.Exec(ctx,
 		fmt.Sprintf("UPDATE notasap_jobs SET %s WHERE id = $%d", strings.Join(sets, ", "), len(args)), args...)
-	s.Require().NoError(err)
-	s.Require().EqualValues(1, tag.RowsAffected(), "SetJob: no job %d", id)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, tag.RowsAffected(), "SetJob: no job %d", id)
 }
 
 // Exists reports whether job id is in the table.
@@ -310,7 +265,7 @@ func WaitStatus[S ~int16](s *Suite, id int64, st S) JobRow {
 	s.T().Helper()
 	var row JobRow
 	s.WaitFor(func() bool {
-		row = s.Job(id)
+		row = s.GetJob(id)
 		return row.Status == int16(st)
 	}, "job %d did not reach status %d", id, int16(st))
 	return row

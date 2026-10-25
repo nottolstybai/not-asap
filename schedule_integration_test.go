@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/suite"
 
 	notasap "github.com/nottolstybai/not-asap"
@@ -45,7 +46,7 @@ func (s *ScheduleSuite) TestSchedule() {
 		id, err := c.Schedule(ctx, p)
 		s.Require().NoError(err)
 
-		row := s.Job(id)
+		row := s.GetJob(id)
 		s.Equal(int16(kindA), row.Kind)
 		s.Equal(notasap.StatusPending, notasap.Status(row.Status))
 		s.Equal(0, row.Attempt)
@@ -60,7 +61,7 @@ func (s *ScheduleSuite) TestSchedule() {
 		id, err := c.Schedule(ctx, payloadA{}, notasap.WithDelay(time.Hour))
 		s.Require().NoError(err)
 
-		row := s.Job(id)
+		row := s.GetJob(id)
 		d := row.RunAt.Sub(row.CreatedAt)
 		s.GreaterOrEqual(d, time.Hour-time.Second)
 		s.LessOrEqual(d, time.Hour+time.Second)
@@ -112,8 +113,13 @@ func (s *ScheduleSuite) seedKey(c *testClient, key string, st notasap.Status) in
 	s.T().Helper()
 	id, err := c.Schedule(context.Background(), payloadA{Msg: "old"}, notasap.WithIdempotencyKey(key))
 	s.Require().NoError(err)
-	s.SetJob(id, pgtest.WithStatus(st), pgtest.WithAttempt(2, 99),
-		pgtest.WithError("boom"), pgtest.WithDeadlineIn(0))
+	s.Fixture.SetJob(context.Background(), id, pgtest.JobOpt{
+		Status:      lo.ToPtr(int16(st)),
+		Attempt:     lo.ToPtr(2),
+		MaxAttempts: lo.ToPtr(99),
+		Error:       lo.ToPtr("boom"),
+		DeadlineIn:  lo.ToPtr(time.Duration(0)),
+	})
 	return id
 }
 
@@ -133,7 +139,7 @@ func (s *ScheduleSuite) TestIdempotency() {
 				id, err := c.Schedule(ctx, payloadA{Msg: "new"}, notasap.WithIdempotencyKey("k"))
 				s.Require().ErrorIs(err, notasap.ErrDuplicate)
 				s.Equal(origID, id)
-				row := s.Job(origID)
+				row := s.GetJob(origID)
 				s.Equal(st, notasap.Status(row.Status))
 				s.JSONEq(`{"msg":"old","n":0}`, string(row.Payload))
 				s.Equal(1, s.CountJobs())
@@ -150,7 +156,7 @@ func (s *ScheduleSuite) TestIdempotency() {
 				id, err := c.Schedule(ctx, payloadA{Msg: "new"}, notasap.WithIdempotencyKey("k"), notasap.WithReplace())
 				s.Require().NoError(err)
 				s.Equal(origID, id)
-				row := s.Job(origID)
+				row := s.GetJob(origID)
 				s.Equal(notasap.StatusPending, notasap.Status(row.Status))
 				s.Equal(0, row.Attempt)
 				s.Equal(7, row.MaxAttempts)
@@ -167,14 +173,17 @@ func (s *ScheduleSuite) TestIdempotency() {
 		id, err := c.Schedule(ctx, payloadA{Msg: "new"}, notasap.WithIdempotencyKey("k"), notasap.WithReplace())
 		s.Require().ErrorIs(err, notasap.ErrJobRunning)
 		s.Equal(origID, id)
-		row := s.Job(origID)
+		row := s.GetJob(origID)
 		s.Equal(notasap.StatusRunning, notasap.Status(row.Status))
 		s.JSONEq(`{"msg":"old","n":0}`, string(row.Payload))
 	})
 	s.Run("replace running takes no lock", func() {
 		id, err := c.Schedule(ctx, payloadA{Msg: "old"}, notasap.WithIdempotencyKey("k"))
 		s.Require().NoError(err)
-		s.SetJob(id, pgtest.WithStatus(notasap.StatusRunning), pgtest.WithLease(1))
+		s.Fixture.SetJob(ctx, id, pgtest.JobOpt{
+			Status: lo.ToPtr(int16(notasap.StatusRunning)),
+			Lease:  lo.ToPtr(int64(1)),
+		})
 
 		tx, err := s.Pool.Begin(ctx)
 		s.Require().NoError(err)
@@ -193,7 +202,10 @@ func (s *ScheduleSuite) TestIdempotency() {
 	s.Run("replace rolled back", func() {
 		id, err := c.Schedule(ctx, payloadA{Msg: "old"}, notasap.WithIdempotencyKey("k"))
 		s.Require().NoError(err)
-		s.SetJob(id, pgtest.WithStatus(notasap.StatusFailed), pgtest.WithError("boom"))
+		s.Fixture.SetJob(ctx, id, pgtest.JobOpt{
+			Status: lo.ToPtr(int16(notasap.StatusFailed)),
+			Error:  lo.ToPtr("boom"),
+		})
 
 		tx, err := s.Pool.Begin(ctx)
 		s.Require().NoError(err)
@@ -202,7 +214,7 @@ func (s *ScheduleSuite) TestIdempotency() {
 		s.Equal(id, got)
 		s.Require().NoError(tx.Rollback(ctx))
 
-		row := s.Job(id)
+		row := s.GetJob(id)
 		s.Equal(notasap.StatusFailed, notasap.Status(row.Status))
 		s.JSONEq(`{"msg":"old","n":0}`, string(row.Payload))
 	})
@@ -268,7 +280,7 @@ func (s *ScheduleSuite) TestScheduleBatch() {
 		s.Require().NoError(err)
 		runID, err := c.Schedule(ctx, payloadA{}, notasap.WithIdempotencyKey("run"))
 		s.Require().NoError(err)
-		s.SetJob(runID, pgtest.WithStatus(notasap.StatusRunning))
+		s.Fixture.SetJob(ctx, runID, pgtest.JobOpt{Status: lo.ToPtr(int16(notasap.StatusRunning))})
 
 		res, err := c.ScheduleBatch(ctx,
 			notasap.Item(payloadA{Msg: "new"}),
@@ -358,7 +370,7 @@ func (s *ScheduleSuite) TestScheduleBatch() {
 		s.NoError(res[0].Err)
 		s.Equal(res[0].ID, res[1].ID)
 		s.ErrorIs(res[1].Err, notasap.ErrDuplicate)
-		s.JSONEq(`{"msg":"A","n":0}`, string(s.Job(res[0].ID).Payload))
+		s.JSONEq(`{"msg":"A","n":0}`, string(s.GetJob(res[0].ID).Payload))
 		s.Equal(1, s.CountJobs())
 	})
 	s.Run("same key twice with replace", func() {
@@ -371,7 +383,7 @@ func (s *ScheduleSuite) TestScheduleBatch() {
 		s.NoError(res[0].Err)
 		s.NoError(res[1].Err)
 		s.Equal(res[0].ID, res[1].ID)
-		s.JSONEq(`{"msg":"B","n":0}`, string(s.Job(res[0].ID).Payload))
+		s.JSONEq(`{"msg":"B","n":0}`, string(s.GetJob(res[0].ID).Payload))
 		s.Equal(1, s.CountJobs())
 	})
 	s.Run("opposite key order does not deadlock", func() {
@@ -386,7 +398,7 @@ func (s *ScheduleSuite) TestScheduleBatch() {
 		for _, k := range []string{"k1", "k2"} {
 			id, err := c.Schedule(ctx, payloadA{Msg: "old"}, notasap.WithIdempotencyKey(k))
 			s.Require().NoError(err)
-			s.SetJob(id, pgtest.WithStatus(notasap.StatusDone))
+			s.Fixture.SetJob(ctx, id, pgtest.JobOpt{Status: lo.ToPtr(int16(notasap.StatusDone))})
 		}
 		resB, idA1, idA2 := s.oppositeKeyOrder(c, notasap.WithReplace())
 		s.Equal(idA2, resB[0].ID)

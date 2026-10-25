@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/suite"
 
 	notasap "github.com/nottolstybai/not-asap"
@@ -25,10 +26,22 @@ func TestJanitorSuite(t *testing.T) {
 // CleanNow.
 func (s *JanitorSuite) TestCleanNow() {
 	s.Run("default retention", func() {
-		doneOld := s.InsertJob(pgtest.Finished(store.StatusDone, 25*time.Hour))
-		cancelledOld := s.InsertJob(pgtest.Finished(store.StatusCancelled, 25*time.Hour))
-		doneNew := s.InsertJob(pgtest.Finished(store.StatusDone, time.Hour))
-		failedOld := s.InsertJob(pgtest.Finished(store.StatusFailed, 30*24*time.Hour))
+		doneOld := s.Fixture.Job(context.Background(), pgtest.JobOpt{
+			Status:     lo.ToPtr(store.StatusDone),
+			UpdatedAgo: lo.ToPtr(25 * time.Hour),
+		}).ID
+		cancelledOld := s.Fixture.Job(context.Background(), pgtest.JobOpt{
+			Status:     lo.ToPtr(store.StatusCancelled),
+			UpdatedAgo: lo.ToPtr(25 * time.Hour),
+		}).ID
+		doneNew := s.Fixture.Job(context.Background(), pgtest.JobOpt{
+			Status:     lo.ToPtr(store.StatusDone),
+			UpdatedAgo: lo.ToPtr(time.Hour),
+		}).ID
+		failedOld := s.Fixture.Job(context.Background(), pgtest.JobOpt{
+			Status:     lo.ToPtr(store.StatusFailed),
+			UpdatedAgo: lo.ToPtr(30 * 24 * time.Hour),
+		}).ID
 
 		s.newClient(nil).CleanNow(context.Background())
 		s.False(s.Exists(doneOld))
@@ -38,9 +51,18 @@ func (s *JanitorSuite) TestCleanNow() {
 	})
 
 	s.Run("custom retention merged", func() {
-		doneOld := s.InsertJob(pgtest.Finished(store.StatusDone, 2*time.Minute))
-		cancelledOld := s.InsertJob(pgtest.Finished(store.StatusCancelled, 25*time.Hour))
-		cancelledNew := s.InsertJob(pgtest.Finished(store.StatusCancelled, time.Hour))
+		doneOld := s.Fixture.Job(context.Background(), pgtest.JobOpt{
+			Status:     lo.ToPtr(store.StatusDone),
+			UpdatedAgo: lo.ToPtr(2 * time.Minute),
+		}).ID
+		cancelledOld := s.Fixture.Job(context.Background(), pgtest.JobOpt{
+			Status:     lo.ToPtr(store.StatusCancelled),
+			UpdatedAgo: lo.ToPtr(25 * time.Hour),
+		}).ID
+		cancelledNew := s.Fixture.Job(context.Background(), pgtest.JobOpt{
+			Status:     lo.ToPtr(store.StatusCancelled),
+			UpdatedAgo: lo.ToPtr(time.Hour),
+		}).ID
 
 		s.newClient(nil, notasap.WithJanitor(notasap.JanitorConfig{
 			Retention: map[notasap.Status]time.Duration{notasap.StatusDone: time.Minute},
@@ -51,7 +73,10 @@ func (s *JanitorSuite) TestCleanNow() {
 	})
 
 	s.Run("batches", func() {
-		s.InsertJobs(25, pgtest.Finished(store.StatusDone, 25*time.Hour))
+		s.Fixture.Jobs(context.Background(), 25, pgtest.JobOpt{
+			Status:     lo.ToPtr(store.StatusDone),
+			UpdatedAgo: lo.ToPtr(25 * time.Hour),
+		})
 		c := s.newClient(nil, notasap.WithJanitor(notasap.JanitorConfig{BatchSize: 10}))
 
 		c.CleanNow(context.Background())
@@ -65,7 +90,10 @@ func (s *JanitorSuite) TestLoop() {
 	// Disabled could still miss its first pass. TestJanitorLoopStartsUnlessDisabled
 	// (unit) is the real check.
 	s.Run("disabled smoke", func() {
-		s.InsertJobs(2, pgtest.Finished(store.StatusDone, 25*time.Hour))
+		s.Fixture.Jobs(context.Background(), 2, pgtest.JobOpt{
+			Status:     lo.ToPtr(store.StatusDone),
+			UpdatedAgo: lo.ToPtr(25 * time.Hour),
+		})
 
 		c := s.startClient(nil, notasap.WithJanitor(notasap.JanitorConfig{Disabled: true}))
 		s.stop(c) // no maintenance loop runs after Stop
@@ -74,7 +102,10 @@ func (s *JanitorSuite) TestLoop() {
 	})
 
 	s.Run("stop interrupts pass", func() {
-		s.InsertJobs(5000, pgtest.Finished(store.StatusDone, 25*time.Hour))
+		s.Fixture.Jobs(context.Background(), 5000, pgtest.JobOpt{
+			Status:     lo.ToPtr(store.StatusDone),
+			UpdatedAgo: lo.ToPtr(25 * time.Hour),
+		})
 
 		c := s.startClient(nil, notasap.WithJanitor(notasap.JanitorConfig{BatchSize: 1}))
 		s.WaitFor(func() bool { return s.CountJobs() < 5000 }, "janitor did not start deleting")

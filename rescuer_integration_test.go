@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/suite"
 
 	notasap "github.com/nottolstybai/not-asap"
@@ -30,10 +31,16 @@ func TestRescuerSuite(t *testing.T) {
 func (s *RescuerSuite) TestRescueNow() {
 	s.Run("retries with kind backoff", func() {
 		c := s.newClient([]kindReg{reg(noop[payloadA], notasap.KindConfig{Name: "a", Backoff: notasap.Constant(time.Hour)})})
-		id := s.InsertJob(pgtest.WithKind(kindA), pgtest.Running(-time.Minute), pgtest.WithAttempt(1, 3))
+		id := s.Fixture.Job(context.Background(), pgtest.JobOpt{
+			Kind:        lo.ToPtr(int16(kindA)),
+			Status:      lo.ToPtr(store.StatusRunning),
+			DeadlineIn:  lo.ToPtr(-time.Minute),
+			Attempt:     lo.ToPtr(1),
+			MaxAttempts: lo.ToPtr(3),
+		}).ID
 
 		c.RescueNow(context.Background())
-		row := s.Job(id)
+		row := s.GetJob(id)
 		s.Equal(notasap.StatusPending, notasap.Status(row.Status))
 		s.Require().NotNil(row.Error)
 		s.Equal(store.RescuedError, *row.Error)
@@ -46,10 +53,16 @@ func (s *RescuerSuite) TestRescueNow() {
 
 	s.Run("fails without attempts left", func() {
 		c := s.newClient([]kindReg{reg(noop[payloadA], notasap.KindConfig{Name: "a"})})
-		id := s.InsertJob(pgtest.WithKind(kindA), pgtest.Running(-time.Minute), pgtest.WithAttempt(3, 3))
+		id := s.Fixture.Job(context.Background(), pgtest.JobOpt{
+			Kind:        lo.ToPtr(int16(kindA)),
+			Status:      lo.ToPtr(store.StatusRunning),
+			DeadlineIn:  lo.ToPtr(-time.Minute),
+			Attempt:     lo.ToPtr(3),
+			MaxAttempts: lo.ToPtr(3),
+		}).ID
 
 		c.RescueNow(context.Background())
-		row := s.Job(id)
+		row := s.GetJob(id)
 		s.Equal(notasap.StatusFailed, notasap.Status(row.Status))
 		s.Require().NotNil(row.Error)
 		s.Equal(store.RescuedError, *row.Error)
@@ -60,21 +73,33 @@ func (s *RescuerSuite) TestRescueNow() {
 
 	s.Run("ignores live deadline", func() {
 		c := s.newClient([]kindReg{reg(noop[payloadA], notasap.KindConfig{Name: "a"})})
-		id := s.InsertJob(pgtest.WithKind(kindA), pgtest.Running(time.Hour), pgtest.WithAttempt(1, 3))
-		before := s.Job(id)
+		id := s.Fixture.Job(context.Background(), pgtest.JobOpt{
+			Kind:        lo.ToPtr(int16(kindA)),
+			Status:      lo.ToPtr(store.StatusRunning),
+			DeadlineIn:  lo.ToPtr(time.Hour),
+			Attempt:     lo.ToPtr(1),
+			MaxAttempts: lo.ToPtr(3),
+		}).ID
+		before := s.GetJob(id)
 
 		c.RescueNow(context.Background())
-		s.Equal(before, s.Job(id))
+		s.Equal(before, s.GetJob(id))
 		s.Equal(0, c.obs.Count("rescued/a"))
 	})
 
 	s.Run("unknown kind uses client defaults", func() {
 		c := s.newClient([]kindReg{reg(noop[payloadA], notasap.KindConfig{Name: "a", Backoff: notasap.Constant(time.Hour)})},
 			notasap.WithDefaults(notasap.KindConfig{Backoff: notasap.Constant(2 * time.Hour)}))
-		id := s.InsertJob(pgtest.WithKind(unregisteredPayload{}.Kind()), pgtest.Running(-time.Minute), pgtest.WithAttempt(1, 3))
+		id := s.Fixture.Job(context.Background(), pgtest.JobOpt{
+			Kind:        lo.ToPtr(int16(unregisteredPayload{}.Kind())),
+			Status:      lo.ToPtr(store.StatusRunning),
+			DeadlineIn:  lo.ToPtr(-time.Minute),
+			Attempt:     lo.ToPtr(1),
+			MaxAttempts: lo.ToPtr(3),
+		}).ID
 
 		c.RescueNow(context.Background())
-		row := s.Job(id)
+		row := s.GetJob(id)
 		s.Equal(notasap.StatusPending, notasap.Status(row.Status))
 		s.Require().NotNil(row.Error)
 		s.Equal(store.RescuedError, *row.Error)
@@ -105,7 +130,7 @@ func (s *RescuerSuite) TestBackgroundRescue() {
 	s.waitStatus(id, notasap.StatusPending)
 	unblock()
 	s.stop(c) // drains the stale handler and its fenced write
-	row := s.Job(id)
+	row := s.GetJob(id)
 	s.Equal(notasap.StatusPending, notasap.Status(row.Status))
 	s.Require().NotNil(row.Error)
 	s.Equal(store.RescuedError, *row.Error)
@@ -136,7 +161,7 @@ func (s *RescuerSuite) TestStaleWorker() {
 		id := s.schedule(c, payloadA{})
 		recv(s.T(), started)
 
-		s.SetJob(id, pgtest.WithDeadlineIn(-time.Minute))
+		s.Fixture.SetJob(context.Background(), id, pgtest.JobOpt{DeadlineIn: lo.ToPtr(-time.Minute)})
 		c.RescueNow(context.Background())
 		row := s.waitStatus(id, notasap.StatusPending)
 		s.Equal(1, row.Attempt)
@@ -177,19 +202,19 @@ func (s *RescuerSuite) TestStaleWorker() {
 		id := s.schedule(c, payloadA{})
 		recv(s.T(), startedStale)
 
-		s.SetJob(id, pgtest.WithDeadlineIn(-time.Minute))
+		s.Fixture.SetJob(context.Background(), id, pgtest.JobOpt{DeadlineIn: lo.ToPtr(-time.Minute)})
 		c.RescueNow(context.Background())
 		// The rescued job is due at once (backoff 0) and claimed again with
 		// lease 2; its new deadline is an hour away, so no further rescue.
 		recv(s.T(), startedSecond)
-		row := s.Job(id)
+		row := s.GetJob(id)
 		s.Equal(notasap.StatusRunning, notasap.Status(row.Status))
 		s.Equal(int64(2), row.Lease)
 		s.Equal(2, row.Attempt)
 
 		unblockStale()
 		s.WaitFor(func() bool { return strings.Contains(logs.String(), "job lost lease") }, "no lost lease warning")
-		row = s.Job(id)
+		row = s.GetJob(id)
 		s.Equal(notasap.StatusRunning, notasap.Status(row.Status))
 		s.Equal(int64(2), row.Lease)
 		s.Equal(2, row.Attempt)
