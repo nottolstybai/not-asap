@@ -21,8 +21,6 @@ type finishCall struct {
 // are returned by Claim; status writes are recorded and always succeed.
 type fakeStore struct {
 	pending chan store.ClaimedJob
-	// deleted receives a value on the first DeleteFinished call.
-	deleted chan struct{}
 	// claimHook, if set before Start, runs at the start of every Claim; a
 	// non-nil error is returned from Claim.
 	claimHook func(ctx context.Context) error
@@ -50,7 +48,7 @@ type writeResult struct {
 var _ jobStore = (*fakeStore)(nil)
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{pending: make(chan store.ClaimedJob, 1000), deleted: make(chan struct{}, 1)}
+	return &fakeStore{pending: make(chan store.ClaimedJob, 1000)}
 }
 
 // feed queues n jobs of kind 1 with ids starting at 1.
@@ -177,9 +175,6 @@ func (f *fakeStore) Rescue(context.Context, int, func(store.StuckJob) store.Resc
 func (f *fakeStore) DeleteFinished(ctx context.Context, _ int16, _ time.Duration, _ int) (int64, error) {
 	f.mu.Lock()
 	f.deletes++
-	if f.deletes == 1 {
-		f.deleted <- struct{}{}
-	}
 	f.mu.Unlock()
 	if f.deleteHook != nil {
 		if err := f.deleteHook(ctx); err != nil {

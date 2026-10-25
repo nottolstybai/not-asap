@@ -82,11 +82,6 @@ func (s *RescuerSuite) TestRescueNow() {
 	})
 }
 
-// TestStaleWorker needs running handlers, so the client is started. Its
-// claims get a deadline an hour away; the test expires it with SetJob and
-// rescues with RescueNow. The Start pass only sees rows already past their
-// deadline, so at worst it performs that same rescue: the subtests wait for
-// the rescued status rather than reading it right after RescueNow.
 // TestBackgroundRescue covers the real path end to end: a claim's lease is
 // Timeout + Grace, the handler outlives it, and the background loop (not
 // RescueNow) returns the job to pending.
@@ -118,6 +113,11 @@ func (s *RescuerSuite) TestBackgroundRescue() {
 	s.Equal(0, c.obs.Count("finished/done"))
 }
 
+// TestStaleWorker needs running handlers, so the client is started. Its
+// claims get a deadline an hour away; the test expires it with SetJob and
+// rescues with RescueNow. The Start pass only sees rows already past their
+// deadline, so at worst it performs that same rescue: the subtests wait for
+// the rescued status rather than reading it right after RescueNow.
 func (s *RescuerSuite) TestStaleWorker() {
 	s.Run("write fenced after rescue", func() {
 		started := make(chan struct{}, 1)

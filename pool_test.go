@@ -11,9 +11,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -408,30 +410,47 @@ func TestStartPoolWarning(t *testing.T) {
 }
 
 func TestJanitorLoopStartsUnlessDisabled(t *testing.T) {
-	// Both maintenance loops tick every millisecond. The rescuer blocks on
-	// its ticker between passes, leaving the scheduler idle, so a janitor
-	// loop that was started runs long before the rescuer completes 20 passes.
-	fast := []Option{
-		WithRescuer(RescuerConfig{Interval: time.Millisecond}),
-		WithJanitor(JanitorConfig{Interval: time.Millisecond}),
+	// In a synctest bubble, synctest.Wait returns only once every goroutine
+	// of the client is durably blocked, so a janitor loop that was started
+	// has finished its first pass by then.
+	run := func(t *testing.T, opts ...Option) (*fakeStore, *Client) {
+		st := newFakeStore()
+		c := newPoolClient(t, st, noop[testPayload], KindConfig{}, opts...)
+		require.NoError(t, c.Start(context.Background()))
+		synctest.Wait()
+		return st, c
 	}
 	t.Run("enabled", func(t *testing.T) {
-		st := newFakeStore()
-		c := newPoolClient(t, st, noop[testPayload], KindConfig{}, fast...)
-		stopOnCleanup(t, c)
-		require.NoError(t, c.Start(context.Background()))
-		recv(t, st.deleted)
+		synctest.Test(t, func(t *testing.T) {
+			st, c := run(t)
+			defer stopInBubble(t, c)
+			// One empty batch per status with a positive retention.
+			var want int
+			for _, status := range janitorStatuses {
+				if c.janitor.Retention[status] > 0 {
+					want++
+				}
+			}
+			require.Positive(t, want)
+			require.Equal(t, want, st.Deletes())
+			require.Equal(t, 1, st.Rescues())
+		})
 	})
 	t.Run("disabled", func(t *testing.T) {
-		st := newFakeStore()
-		c := newPoolClient(t, st, noop[testPayload], KindConfig{},
-			append(fast, WithJanitor(JanitorConfig{Disabled: true}))...)
-		stopOnCleanup(t, c)
-		require.NoError(t, c.Start(context.Background()))
-		require.Eventually(t, func() bool { return st.Rescues() >= 20 && st.Claims() >= 1 }, waitFor, tick)
-		stop(t, c)
-		require.Zero(t, st.Deletes())
+		synctest.Test(t, func(t *testing.T) {
+			st, c := run(t, WithJanitor(JanitorConfig{Disabled: true}))
+			defer stopInBubble(t, c)
+			require.Equal(t, 1, st.Rescues()) // maintenance did start
+			require.Zero(t, st.Deletes())
+		})
 	})
+}
+
+// stopInBubble stops c inside its synctest bubble, also after a failed
+// assert, so no client goroutine outlives the bubble.
+func stopInBubble(t *testing.T, c *Client) {
+	t.Helper()
+	assert.NoError(t, c.Stop(context.Background()))
 }
 
 func TestStopCancelsJanitorPass(t *testing.T) {
