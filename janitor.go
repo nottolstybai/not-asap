@@ -38,7 +38,7 @@ func (c *Client) clean(ctx context.Context) {
 			n, err := c.st.DeleteFinished(ctx, int16(status), retention, c.janitor.BatchSize)
 			if err != nil {
 				if ctx.Err() == nil {
-					c.logger.Error("notasap: delete finished jobs", "status", status, "error", err)
+					c.logger.Warn("notasap: delete finished jobs", "status", status, "error", err)
 				}
 				break
 			}

@@ -90,7 +90,8 @@ type InsertResult struct {
 // trip is a single batch, so outside a transaction a round is atomic, but
 // rounds after the first (key conflict lookups and re-inserts) commit
 // separately: callers needing the whole call to be atomic must pass a
-// transaction.
+// transaction. db is the pool or the caller's transaction; Insert does not
+// use the Store's own pool.
 func (s *Store) Insert(ctx context.Context, db DB, params []InsertParams) ([]InsertResult, error) {
 	results := make([]InsertResult, len(params))
 	todo := make([]int, len(params))

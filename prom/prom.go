@@ -16,15 +16,15 @@ import (
 // Metrics exports notasap job metrics to Prometheus. Create it with New and
 // pass it to notasap.WithObserver.
 type Metrics struct {
-	scheduled   *prometheus.CounterVec
-	finished    *prometheus.CounterVec
-	retried     *prometheus.CounterVec
-	jobDuration *prometheus.HistogramVec
-	running     *prometheus.GaugeVec
-	pollTime    *prometheus.HistogramVec
-	rescued     *prometheus.CounterVec
-	stuck       *prometheus.CounterVec
-	janitor     *prometheus.CounterVec
+	scheduled    *prometheus.CounterVec
+	finished     *prometheus.CounterVec
+	retried      *prometheus.CounterVec
+	jobDuration  *prometheus.HistogramVec
+	running      *prometheus.GaugeVec
+	pollDuration *prometheus.HistogramVec
+	rescued      *prometheus.CounterVec
+	stuck        *prometheus.CounterVec
+	deleted      *prometheus.CounterVec
 }
 
 var _ notasap.Observer = (*Metrics)(nil)
@@ -34,7 +34,7 @@ type config struct {
 	pollBuckets []float64
 }
 
-// Option configures New.
+// Option configures New. Nil options are skipped.
 type Option func(*config)
 
 // WithJobDurationBuckets overrides the buckets of notasap_job_duration_seconds.
@@ -60,7 +60,9 @@ func New(reg prometheus.Registerer, opts ...Option) (*Metrics, error) {
 		pollBuckets: prometheus.ExponentialBuckets(0.0005, 2, 12),
 	}
 	for _, o := range opts {
-		o(&cfg)
+		if o != nil {
+			o(&cfg)
+		}
 	}
 	if err := checkBuckets("WithJobDurationBuckets", cfg.jobBuckets); err != nil {
 		return nil, err
@@ -85,7 +87,7 @@ func New(reg prometheus.Registerer, opts ...Option) (*Metrics, error) {
 		running: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "notasap_jobs_running", Help: "Jobs currently executing.",
 		}, []string{"kind"}),
-		pollTime: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		pollDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name: "notasap_poll_duration_seconds", Help: "Duration of a poll for jobs.", Buckets: cfg.pollBuckets,
 		}, []string{"kind"}),
 		rescued: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -94,14 +96,14 @@ func New(reg prometheus.Registerer, opts ...Option) (*Metrics, error) {
 		stuck: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "notasap_jobs_stuck_total", Help: "Jobs found stuck.",
 		}, []string{"kind"}),
-		janitor: prometheus.NewCounterVec(prometheus.CounterOpts{
+		deleted: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "notasap_janitor_deleted_total", Help: "Jobs deleted by the janitor.",
 		}, []string{"status"}),
 	}
 
 	cs := []prometheus.Collector{
 		m.scheduled, m.finished, m.retried, m.jobDuration, m.running,
-		m.pollTime, m.rescued, m.stuck, m.janitor,
+		m.pollDuration, m.rescued, m.stuck, m.deleted,
 	}
 	for i, c := range cs {
 		if err := reg.Register(c); err != nil {
@@ -160,10 +162,10 @@ func (m *Metrics) JobRescued(kind string) { m.rescued.WithLabelValues(kind).Inc(
 
 // Polled implements notasap.Observer.
 func (m *Metrics) Polled(kind string, took time.Duration) {
-	m.pollTime.WithLabelValues(kind).Observe(took.Seconds())
+	m.pollDuration.WithLabelValues(kind).Observe(took.Seconds())
 }
 
 // JanitorDeleted implements notasap.Observer.
 func (m *Metrics) JanitorDeleted(status notasap.Status, n int64) {
-	m.janitor.WithLabelValues(status.String()).Add(float64(n))
+	m.deleted.WithLabelValues(status.String()).Add(float64(n))
 }

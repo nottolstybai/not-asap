@@ -92,44 +92,46 @@ func TestRegisterValidation(t *testing.T) {
 	})
 }
 
-func TestRegisterRunDecodesPayload(t *testing.T) {
+func TestRegisterRun(t *testing.T) {
 	t.Parallel()
-	c := newTestClient(t)
-	want := errors.New("boom")
-	var got *Job[testPayload]
-	require.NoError(t, Register(c, func(_ context.Context, j *Job[testPayload]) error {
-		got = j
-		return want
-	}, KindConfig{Name: "a"}))
+	t.Run("decodes payload", func(t *testing.T) {
+		t.Parallel()
+		c := newTestClient(t)
+		want := errors.New("boom")
+		var got *Job[testPayload]
+		require.NoError(t, Register(c, func(_ context.Context, j *Job[testPayload]) error {
+			got = j
+			return want
+		}, KindConfig{Name: "a"}))
 
-	e, ok := c.entry(1)
-	require.True(t, ok)
+		e, ok := c.entry(1)
+		require.True(t, ok)
 
-	decodeErr, handlerErr := e.run(context.Background(), store.ClaimedJob{
-		ID: 7, Kind: 1, Payload: []byte(`{"n":42}`), Attempt: 2, MaxAttempts: 3,
+		res := e.run(context.Background(), store.ClaimedJob{
+			ID: 7, Kind: 1, Payload: []byte(`{"n":42}`), Attempt: 2, MaxAttempts: 3,
+		})
+		require.NoError(t, res.decodeErr)
+		require.ErrorIs(t, res.err, want)
+		require.NotNil(t, got)
+		require.EqualValues(t, 7, got.ID)
+		require.Equal(t, Kind(1), got.Kind)
+		require.Equal(t, 42, got.Payload.N)
+		require.Equal(t, 2, got.Attempt)
+		require.Equal(t, 3, got.MaxAttempts)
 	})
-	require.NoError(t, decodeErr)
-	require.ErrorIs(t, handlerErr, want)
-	require.NotNil(t, got)
-	require.EqualValues(t, 7, got.ID)
-	require.Equal(t, Kind(1), got.Kind)
-	require.Equal(t, 42, got.Payload.N)
-	require.Equal(t, 2, got.Attempt)
-	require.Equal(t, 3, got.MaxAttempts)
-}
+	t.Run("decode error", func(t *testing.T) {
+		t.Parallel()
+		c := newTestClient(t)
+		called := false
+		require.NoError(t, Register(c, func(context.Context, *Job[testPayload]) error {
+			called = true
+			return nil
+		}, KindConfig{Name: "a"}))
 
-func TestRegisterRunDecodeError(t *testing.T) {
-	t.Parallel()
-	c := newTestClient(t)
-	called := false
-	require.NoError(t, Register(c, func(context.Context, *Job[testPayload]) error {
-		called = true
-		return nil
-	}, KindConfig{Name: "a"}))
-
-	e, _ := c.entry(1)
-	decodeErr, handlerErr := e.run(context.Background(), store.ClaimedJob{ID: 1, Kind: 1, Payload: []byte("not-json")})
-	require.Error(t, decodeErr)
-	require.NoError(t, handlerErr)
-	require.False(t, called)
+		e, _ := c.entry(1)
+		res := e.run(context.Background(), store.ClaimedJob{ID: 1, Kind: 1, Payload: []byte("not-json")})
+		require.Error(t, res.decodeErr)
+		require.NoError(t, res.err)
+		require.False(t, called)
+	})
 }

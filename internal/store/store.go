@@ -3,7 +3,8 @@ package store
 
 import (
 	"context"
-	"time"
+	"errors"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -29,6 +30,9 @@ const (
 	StatusCancelled int16 = 5
 )
 
+// ErrNoTable means the notasap_jobs table does not exist.
+var ErrNoTable = errors.New("notasap: table notasap_jobs not found; apply migrations")
+
 // RescuedError is the error stored on a job rescued after its deadline.
 const RescuedError = "rescued: deadline exceeded"
 
@@ -42,13 +46,24 @@ func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
 
-// ClaimedJob is a job row taken for execution.
-type ClaimedJob struct {
-	ID          int64
-	Kind        int16
-	Payload     []byte
-	Attempt     int
-	MaxAttempts int
-	Lease       int64
-	CreatedAt   time.Time
+// CheckSchema verifies that the notasap_jobs table is reachable. A missing
+// table is reported as ErrNoTable.
+func (s *Store) CheckSchema(ctx context.Context) error {
+	_, err := s.pool.Exec(ctx, "SELECT 1 FROM notasap_jobs LIMIT 0")
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
+		return ErrNoTable
+	}
+	if err != nil {
+		return fmt.Errorf("notasap: check schema: %w", err)
+	}
+	return nil
+}
+
+// nullable maps an empty string to NULL.
+func nullable(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }

@@ -12,21 +12,33 @@ import (
 	"github.com/nottolstybai/not-asap/prom"
 )
 
-func TestNewErrors(t *testing.T) {
+func TestNew(t *testing.T) {
 	t.Parallel()
-	_, err := prom.New(nil)
-	require.Error(t, err)
-
-	reg := prometheus.NewRegistry()
-	_, err = prom.New(reg)
-	require.NoError(t, err)
-	_, err = prom.New(reg)
-	require.Error(t, err)
-
-	_, err = prom.New(prometheus.NewRegistry(), prom.WithJobDurationBuckets(nil))
-	require.Error(t, err)
-	_, err = prom.New(prometheus.NewRegistry(), prom.WithPollDurationBuckets([]float64{}))
-	require.Error(t, err)
+	t.Run("nil registerer", func(t *testing.T) {
+		t.Parallel()
+		_, err := prom.New(nil)
+		require.Error(t, err)
+	})
+	t.Run("registered twice", func(t *testing.T) {
+		t.Parallel()
+		reg := prometheus.NewRegistry()
+		_, err := prom.New(reg)
+		require.NoError(t, err)
+		_, err = prom.New(reg)
+		require.Error(t, err)
+	})
+	t.Run("empty buckets", func(t *testing.T) {
+		t.Parallel()
+		_, err := prom.New(prometheus.NewRegistry(), prom.WithJobDurationBuckets(nil))
+		require.Error(t, err)
+		_, err = prom.New(prometheus.NewRegistry(), prom.WithPollDurationBuckets([]float64{}))
+		require.Error(t, err)
+	})
+	t.Run("nil option skipped", func(t *testing.T) {
+		t.Parallel()
+		_, err := prom.New(prometheus.NewRegistry(), nil, prom.WithPollDurationBuckets([]float64{1}))
+		require.NoError(t, err)
+	})
 }
 
 func TestNewFailureLeavesRegistryClean(t *testing.T) {

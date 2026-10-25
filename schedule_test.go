@@ -44,7 +44,12 @@ func TestScheduleOptionsValidation(t *testing.T) {
 	t.Run("replace without key", func(t *testing.T) {
 		t.Parallel()
 		_, err := c.Schedule(ctx, testPayload{}, WithReplace())
-		require.ErrorContains(t, err, "WithReplace requires WithIdempotencyKey")
+		require.ErrorContains(t, err, "notasap: Schedule: WithReplace requires WithIdempotencyKey")
+	})
+	t.Run("first error wins", func(t *testing.T) {
+		t.Parallel()
+		_, err := c.Schedule(ctx, testPayload{}, WithDelay(-time.Second), WithIdempotencyKey(""))
+		require.ErrorContains(t, err, "WithDelay: delay must not be negative")
 	})
 	t.Run("unknown kind", func(t *testing.T) {
 		t.Parallel()
@@ -55,7 +60,7 @@ func TestScheduleOptionsValidation(t *testing.T) {
 	t.Run("nil payload", func(t *testing.T) {
 		t.Parallel()
 		_, err := c.Schedule(ctx, nil)
-		require.ErrorContains(t, err, "payload is nil")
+		require.ErrorContains(t, err, "notasap: Schedule: payload is nil")
 	})
 	t.Run("batch rejected as a whole", func(t *testing.T) {
 		t.Parallel()

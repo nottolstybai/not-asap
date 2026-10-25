@@ -12,8 +12,8 @@ import (
 	"github.com/nottolstybai/not-asap/internal/store"
 )
 
-// jobStore is the persistence contract of the Client; methods are added as
-// the features that need them are introduced.
+// jobStore is the persistence layer of the Client: *store.Store in
+// production, fakeStore in unit tests.
 type jobStore interface {
 	Insert(ctx context.Context, db store.DB, params []store.InsertParams) ([]store.InsertResult, error)
 	Claim(ctx context.Context, kind int16, limit int, lease time.Duration) ([]store.ClaimedJob, error)
@@ -140,10 +140,10 @@ func (c *Client) Start(ctx context.Context) error {
 
 	slices.Sort(names)
 	if c.maxConns > 0 && c.maxConns < int32(len(names)+2) {
-		c.logger.Warn("notasap: connection pool is smaller than kinds + 2; status writes may starve, give notasap its own pool with MaxConns >= kinds + 4",
+		c.logger.Warn("notasap: connection pool is smaller than kinds + 2; status writes may starve, give notasap its own pool with MaxConns >= kinds + 2",
 			"max_conns", c.maxConns, "kinds", len(names))
 	}
-	c.logger.Info("notasap started", "kinds", names)
+	c.logger.Info("notasap: started", "kinds", names)
 	return nil
 }
 
@@ -197,22 +197,20 @@ func (c *Client) Stop(ctx context.Context) error {
 	case <-drained:
 	case <-ctx.Done():
 	}
-	select {
-	case <-drained:
-		c.cancelRun(errShutdown)
-		c.logger.Info("notasap stopped")
-		return nil
-	default:
-	}
-
 	c.cancelRun(errShutdown)
-	grace := time.NewTimer(c.stopGrace)
-	defer grace.Stop()
+	var err error
 	select {
-	case <-drained:
-	case <-grace.C:
-		c.logger.Warn("notasap: handlers still running after stop grace")
+	case <-drained: // drained wins, even if ctx is done too
+	default:
+		err = ctx.Err()
+		grace := time.NewTimer(c.stopGrace)
+		defer grace.Stop()
+		select {
+		case <-drained:
+		case <-grace.C:
+			c.logger.Warn("notasap: handlers still running after stop grace")
+		}
 	}
-	c.logger.Info("notasap stopped")
-	return ctx.Err()
+	c.logger.Info("notasap: stopped")
+	return err
 }

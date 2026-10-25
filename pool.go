@@ -42,9 +42,11 @@ type kindPool struct {
 	notify chan struct{}
 }
 
-// loop claims jobs while there are free slots until the client stops. A full
-// batch is followed by an immediate poll, otherwise it waits PollInterval or
-// until the client schedules a ready job of the kind.
+// loop claims jobs while there are free slots until the client stops. After a
+// full batch it claims again once slots free, waiting at most
+// claimCoalesceWindow (20ms) for max(1, Workers/4) of them; after a short
+// batch or a claim error it waits PollInterval or until the client schedules
+// a ready job of the kind.
 func (p *kindPool) loop() {
 	c, cfg := p.c, p.e.cfg
 	lease := cfg.Timeout + c.rescuer.Grace
@@ -118,8 +120,6 @@ func (p *kindPool) waitFree(backlog bool) (int, bool) {
 				}
 				free = cap(p.slots) - len(p.slots)
 			}
-			// Only this loop takes slots, so free has not dropped since.
-			free = cap(p.slots) - len(p.slots)
 		}
 	}
 	select {
@@ -186,8 +186,7 @@ func (p *kindPool) run(ctx context.Context, row store.ClaimedJob, logger *slog.L
 			res = execResult{panicked: true, panicValue: v}
 		}
 	}()
-	res.decodeErr, res.err = p.e.run(ctx, row)
-	return res
+	return p.e.run(ctx, row)
 }
 
 // record writes the job's next state and reports it.
@@ -206,6 +205,7 @@ func (p *kindPool) record(row store.ClaimedJob, a action, took time.Duration, lo
 	// Transient failures are retried with doubling backoff, all within the
 	// single dbCallTimeout budget of ctx.
 	ok, err := write()
+	retried := false
 	for delay := statusWriteBackoff; err != nil && isTransient(err); delay *= 2 {
 		select {
 		case <-time.After(delay):
@@ -215,10 +215,17 @@ func (p *kindPool) record(row store.ClaimedJob, a action, took time.Duration, lo
 			break
 		}
 		ok, err = write()
+		retried = true
 	}
 	switch {
 	case err != nil:
 		logger.Warn("notasap: write job status", "status", a.status, "error", err)
+		return
+	case !ok && retried:
+		// A failed attempt may have committed before its error, so the retry
+		// finds the lease gone either way. The observer is not called, as for
+		// a lost lease.
+		logger.Info("notasap: status write outcome unknown after retry", "status", a.status)
 		return
 	case !ok:
 		logger.Warn("notasap: job lost lease", "status", a.status)

@@ -144,7 +144,7 @@ func TestRescueDecisionPanickingBackoff(t *testing.T) {
 	}, WithLogger(slog.New(slog.NewTextHandler(&buf, nil))))
 
 	r := c.rescueDecision(store.StuckJob{ID: 1, Kind: 1, Attempt: 1, MaxAttempts: 3})
-	require.False(t, r.d.Fail)
-	require.Zero(t, r.d.Delay)
+	require.False(t, r.decision.Fail)
+	require.Zero(t, r.decision.Delay)
 	require.Contains(t, buf.String(), "level=ERROR")
 }

@@ -27,7 +27,7 @@ type Job[T Payload] struct {
 type kindEntry struct {
 	kind Kind
 	cfg  KindConfig
-	run  func(ctx context.Context, row store.ClaimedJob) (decodeErr, handlerErr error)
+	run  func(ctx context.Context, row store.ClaimedJob) execResult
 }
 
 // Register binds handler h to the Kind of payload type T. The kind config is
@@ -69,19 +69,19 @@ func Register[T Payload](c *Client, h Handler[T], cfg KindConfig) error {
 	c.kinds[kind] = &kindEntry{
 		kind: kind,
 		cfg:  merged,
-		run: func(ctx context.Context, row store.ClaimedJob) (error, error) {
+		run: func(ctx context.Context, row store.ClaimedJob) execResult {
 			var p T
 			if err := json.Unmarshal(row.Payload, &p); err != nil {
-				return err, nil
+				return execResult{decodeErr: err}
 			}
-			return nil, h(ctx, &Job[T]{
+			return execResult{err: h(ctx, &Job[T]{
 				ID:          row.ID,
 				Kind:        kind,
 				Payload:     p,
 				Attempt:     row.Attempt,
 				MaxAttempts: row.MaxAttempts,
 				CreatedAt:   row.CreatedAt,
-			})
+			})}
 		},
 	}
 	c.names[merged.Name] = kind

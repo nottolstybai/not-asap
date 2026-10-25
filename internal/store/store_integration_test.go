@@ -233,8 +233,7 @@ func (s *StoreSuite) TestCheckSchemaMissing() {
 	pool := pgtest.NewPool(s.T(), schema)
 
 	err := store.New(pool).CheckSchema(context.Background())
-	s.Require().Error(err)
-	s.Contains(err.Error(), "apply migrations")
+	s.Require().ErrorIs(err, store.ErrNoTable)
 }
 
 func (s *StoreSuite) TestRescue() {

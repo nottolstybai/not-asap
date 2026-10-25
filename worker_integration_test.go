@@ -305,7 +305,7 @@ func (s *WorkerSuite) TestStartFailsWithoutTable() {
 	c, err := notasap.New(pgtest.NewPool(s.T(), schema), notasap.WithLogger(slog.New(slog.DiscardHandler)))
 	s.Require().NoError(err)
 	err = c.Start(context.Background())
-	s.Require().ErrorContains(err, "apply migrations")
+	s.Require().ErrorIs(err, store.ErrNoTable)
 	s.Require().NoError(c.Stop(context.Background()))
 }
 

@@ -2,12 +2,10 @@ package store
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
 const claimSQL = `UPDATE notasap_jobs j
@@ -31,6 +29,17 @@ const rescheduleSQL = `UPDATE notasap_jobs
 SET status = 1 /* pending */, run_at = NOW() + make_interval(secs => $3), error = $4, deadline = NULL,
     attempt = CASE WHEN $5 THEN attempt - 1 ELSE attempt END, updated_at = NOW()
 WHERE id = $1 AND lease = $2 AND status = 2 /* running */`
+
+// ClaimedJob is a job row taken for execution.
+type ClaimedJob struct {
+	ID          int64
+	Kind        int16
+	Payload     []byte
+	Attempt     int
+	MaxAttempts int
+	Lease       int64
+	CreatedAt   time.Time
+}
 
 // Ref identifies one claim of a job: Lease fences out stale owners.
 type Ref struct {
@@ -75,24 +84,4 @@ func (s *Store) Reschedule(ctx context.Context, ref Ref, delay time.Duration, er
 		return false, fmt.Errorf("notasap: reschedule: %w", err)
 	}
 	return tag.RowsAffected() == 1, nil
-}
-
-// CheckSchema verifies that the notasap_jobs table is reachable.
-func (s *Store) CheckSchema(ctx context.Context) error {
-	_, err := s.pool.Exec(ctx, "SELECT 1 FROM notasap_jobs LIMIT 0")
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
-		return errors.New("notasap: table notasap_jobs not found; apply migrations")
-	}
-	if err != nil {
-		return fmt.Errorf("notasap: check schema: %w", err)
-	}
-	return nil
-}
-
-func nullable(s string) *string {
-	if s == "" {
-		return nil
-	}
-	return &s
 }

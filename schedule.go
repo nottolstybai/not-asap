@@ -20,14 +20,22 @@ type scheduleOptions struct {
 	err     error
 }
 
-// ScheduleOption customizes a scheduled job.
+// fail records err unless an earlier option already failed.
+func (o *scheduleOptions) fail(err error) {
+	if o.err == nil {
+		o.err = err
+	}
+}
+
+// ScheduleOption customizes a scheduled job. If several options are invalid,
+// the first error is returned.
 type ScheduleOption func(*scheduleOptions)
 
 // WithDelay sets run_at to the database NOW() plus d. d must not be negative.
 func WithDelay(d time.Duration) ScheduleOption {
 	return func(o *scheduleOptions) {
 		if d < 0 {
-			o.err = errors.New("notasap: WithDelay: delay must not be negative")
+			o.fail(errors.New("notasap: WithDelay: delay must not be negative"))
 			return
 		}
 		o.delay = d
@@ -39,7 +47,7 @@ func WithDelay(d time.Duration) ScheduleOption {
 func WithIdempotencyKey(key string) ScheduleOption {
 	return func(o *scheduleOptions) {
 		if key == "" {
-			o.err = errors.New("notasap: WithIdempotencyKey: key is empty")
+			o.fail(errors.New("notasap: WithIdempotencyKey: key is empty"))
 			return
 		}
 		o.key = &key
@@ -78,11 +86,12 @@ func (c *Client) Schedule(ctx context.Context, p Payload, opts ...ScheduleOption
 }
 
 // ScheduleTx is Schedule within tx. The job becomes visible when tx commits.
-// The observer is notified before the commit. A keyed schedule holds its key
-// until tx ends, so concurrent schedules of that key wait for tx. Several
-// keyed schedules in one tx must be issued in a consistent (kind, key) order
-// across the application, or Postgres may abort tx with a deadlock (SQLSTATE
-// 40P01); retry tx on 40P01.
+// The observer is notified before the commit. A keyed schedule that inserts or
+// replaces a job holds its key until tx ends, so concurrent schedules of that
+// key wait for tx; one that finds a duplicate locks nothing. Several keyed
+// schedules in one tx must be issued in a consistent (kind, key) order across
+// the application, or Postgres may abort tx with a deadlock (SQLSTATE 40P01);
+// retry tx on 40P01.
 func (c *Client) ScheduleTx(ctx context.Context, tx pgx.Tx, p Payload, opts ...ScheduleOption) (int64, error) {
 	if tx == nil {
 		return 0, errors.New("notasap: ScheduleTx: tx is nil")
@@ -90,18 +99,21 @@ func (c *Client) ScheduleTx(ctx context.Context, tx pgx.Tx, p Payload, opts ...S
 	return c.scheduleOne(ctx, tx, p, opts, false)
 }
 
-// ScheduleBatch inserts all items atomically. Per-item idempotency conflicts
-// are reported in the results; any other error fails the whole batch and
-// nothing is written. A batch without idempotency keys takes one round trip;
-// one with keys runs in its own transaction, as resolving conflicts may need
-// more round trips.
+// ScheduleBatch inserts all items atomically. Results are in item order;
+// per-item idempotency conflicts are reported in them, and any other error
+// fails the whole batch and nothing is written. Rows are inserted ordered by
+// kind, then key (keyless items first, in item order; keys compared
+// byte-wise), so jobs of one batch that are due at the same time are claimed
+// in that order, not in item order. A batch without idempotency keys takes one round
+// trip; one with keys runs in its own transaction, as resolving conflicts
+// may take up to three insert and lookup rounds.
 func (c *Client) ScheduleBatch(ctx context.Context, items ...BatchItem) ([]BatchResult, error) {
 	return c.scheduleBatch(ctx, c.db, items, true)
 }
 
 // ScheduleBatchTx is ScheduleBatch within tx. On a database error tx is
 // aborted; validation errors send no SQL and leave tx usable. Items are
-// inserted in (kind, key) order, but keys scheduled by other calls in the
+// inserted in (kind, key) order, keys compared byte-wise, but keys scheduled by other calls in the
 // same tx must follow a consistent (kind, key) order across the application,
 // or Postgres may abort tx with a deadlock (SQLSTATE 40P01); retry tx on 40P01.
 func (c *Client) ScheduleBatchTx(ctx context.Context, tx pgx.Tx, items ...BatchItem) ([]BatchResult, error) {
@@ -178,25 +190,34 @@ func (c *Client) scheduleBatch(ctx context.Context, db store.DB, items []BatchIt
 // notify wakes the idle pollers of kinds without blocking. Before Start it
 // does nothing; after Stop nobody receives the signal.
 func (c *Client) notify(kinds []Kind) {
+	for _, p := range c.pollers(kinds) {
+		select {
+		case p.notify <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// pollers returns the pools of kinds, each once; none before Start.
+func (c *Client) pollers(kinds []Kind) []*kindPool {
 	if len(kinds) == 0 {
-		return
+		return nil
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	var ps []*kindPool
 	for _, k := range kinds {
-		if p := c.pools[k]; p != nil {
-			select {
-			case p.notify <- struct{}{}:
-			default:
-			}
+		if p := c.pools[k]; p != nil && !slices.Contains(ps, p) {
+			ps = append(ps, p)
 		}
 	}
+	return ps
 }
 
 // insertParams validates it and returns its insert parameters and kind name.
 func (c *Client) insertParams(it BatchItem) (store.InsertParams, string, error) {
 	if it.payload == nil {
-		return store.InsertParams{}, "", errors.New("notasap: schedule: payload is nil")
+		return store.InsertParams{}, "", errors.New("notasap: Schedule: payload is nil")
 	}
 	kind := it.payload.Kind()
 	e, ok := c.entry(kind)
@@ -213,11 +234,11 @@ func (c *Client) insertParams(it BatchItem) (store.InsertParams, string, error) 
 		return store.InsertParams{}, "", o.err
 	}
 	if o.replace && o.key == nil {
-		return store.InsertParams{}, "", errors.New("notasap: schedule: WithReplace requires WithIdempotencyKey")
+		return store.InsertParams{}, "", errors.New("notasap: Schedule: WithReplace requires WithIdempotencyKey")
 	}
 	payload, err := json.Marshal(it.payload)
 	if err != nil {
-		return store.InsertParams{}, "", fmt.Errorf("notasap: schedule: marshal payload of kind %d: %w", kind, err)
+		return store.InsertParams{}, "", fmt.Errorf("notasap: Schedule: marshal payload of kind %d: %w", kind, err)
 	}
 	return store.InsertParams{
 		Kind:        int16(kind),

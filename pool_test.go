@@ -342,6 +342,25 @@ func TestStatusWrite(t *testing.T) {
 		require.Zero(t, obs.finished.Load())
 	})
 
+	t.Run("outcome unknown after retry", func(t *testing.T) {
+		st := newFakeStore()
+		// The first write timed out but committed, so the retry finds no row.
+		st.scriptWrites(writeResult{err: retryableErr{}}, writeResult{ok: false})
+		obs := &countObserver{}
+		var buf syncBuffer
+		c := newPoolClient(t, st, noop[testPayload], KindConfig{},
+			WithObserver(obs), WithLogger(slog.New(slog.NewTextHandler(&buf, nil))))
+		stopOnCleanup(t, c)
+		st.feed(1)
+		require.NoError(t, c.Start(context.Background()))
+
+		require.Eventually(t, func() bool { return len(st.Calls()) == 2 }, waitFor, tick)
+		stop(t, c)
+		require.Contains(t, buf.String(), `level=INFO msg="notasap: status write outcome unknown after retry"`)
+		require.NotContains(t, buf.String(), "job lost lease")
+		require.Zero(t, obs.finished.Load())
+	})
+
 	t.Run("no retry on permanent error", func(t *testing.T) {
 		st := newFakeStore()
 		st.scriptWrites(writeResult{err: &pgconn.PgError{Code: "23505"}})
@@ -393,6 +412,8 @@ func TestStartPoolWarning(t *testing.T) {
 
 		require.Contains(t, buf.String(), "level=WARN")
 		require.Contains(t, buf.String(), "max_conns=2")
+		require.Contains(t, buf.String(), "MaxConns >= kinds + 2")
+		require.NotContains(t, buf.String(), "kinds + 4")
 	})
 
 	t.Run("silent when unknown or large", func(t *testing.T) {
@@ -407,6 +428,16 @@ func TestStartPoolWarning(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestStartStopLogged(t *testing.T) {
+	var buf syncBuffer
+	c := newPoolClient(t, newFakeStore(), noop[testPayload], KindConfig{}, WithLogger(slog.New(slog.NewTextHandler(&buf, nil))))
+	stopOnCleanup(t, c)
+	require.NoError(t, c.Start(context.Background()))
+	stop(t, c)
+	require.Contains(t, buf.String(), `level=INFO msg="notasap: started"`)
+	require.Contains(t, buf.String(), `level=INFO msg="notasap: stopped"`)
 }
 
 func TestJanitorLoopStartsUnlessDisabled(t *testing.T) {
@@ -453,27 +484,41 @@ func stopInBubble(t *testing.T, c *Client) {
 	assert.NoError(t, c.Stop(context.Background()))
 }
 
-func TestStopCancelsJanitorPass(t *testing.T) {
-	st := newFakeStore()
-	entered := make(chan struct{}, 1)
-	st.deleteHook = func(ctx context.Context) error {
-		select {
-		case entered <- struct{}{}:
-		default:
+func TestJanitorPass(t *testing.T) {
+	t.Run("stop cancels blocked delete", func(t *testing.T) {
+		st := newFakeStore()
+		entered := make(chan struct{}, 1)
+		st.deleteHook = func(ctx context.Context) error {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			<-ctx.Done()
+			return ctx.Err()
 		}
-		<-ctx.Done()
-		return ctx.Err()
-	}
-	c := newPoolClient(t, st, noop[testPayload], KindConfig{}, WithJanitor(JanitorConfig{BatchSize: 1}))
-	stopOnCleanup(t, c)
-	require.NoError(t, c.Start(context.Background()))
-	recv(t, entered)
+		c := newPoolClient(t, st, noop[testPayload], KindConfig{}, WithJanitor(JanitorConfig{BatchSize: 1}))
+		stopOnCleanup(t, c)
+		require.NoError(t, c.Start(context.Background()))
+		recv(t, entered)
 
-	// Stop returns only if it cancels the blocked delete.
-	stopped := make(chan error, 1)
-	go func() { stopped <- c.Stop(context.Background()) }()
-	require.NoError(t, recv(t, stopped))
-	require.Equal(t, 1, st.Deletes())
+		// Stop returns only if it cancels the blocked delete.
+		stopped := make(chan error, 1)
+		go func() { stopped <- c.Stop(context.Background()) }()
+		require.NoError(t, recv(t, stopped))
+		require.Equal(t, 1, st.Deletes())
+	})
+
+	t.Run("db error logged at warn", func(t *testing.T) {
+		st := newFakeStore()
+		st.deleteHook = func(context.Context) error { return errors.New("db down") }
+		var buf syncBuffer
+		c := newPoolClient(t, st, noop[testPayload], KindConfig{}, WithLogger(slog.New(slog.NewTextHandler(&buf, nil))))
+		stopOnCleanup(t, c)
+		require.NoError(t, c.Start(context.Background()))
+		require.Eventually(t, func() bool { return strings.Contains(buf.String(), "delete finished jobs") }, waitFor, tick)
+		stop(t, c)
+		require.Contains(t, buf.String(), `level=WARN msg="notasap: delete finished jobs"`)
+	})
 }
 
 // syncBuffer is a bytes.Buffer safe for concurrent use by loggers.
@@ -528,7 +573,7 @@ func TestScheduleWakesPoller(t *testing.T) {
 	})
 }
 
-func TestWakeBeforeStartAndAfterStop(t *testing.T) {
+func TestNotify(t *testing.T) {
 	ctx := context.Background()
 	schedule := func(t *testing.T, c *Client) {
 		for range 3 {
@@ -551,32 +596,111 @@ func TestWakeBeforeStartAndAfterStop(t *testing.T) {
 		schedule(t, c)
 		require.Len(t, c.pools[1].notify, 1)
 	})
+	t.Run("each kind once", func(t *testing.T) {
+		c := newPoolClient(t, newFakeStore(), noop[testPayload], KindConfig{})
+		require.NoError(t, Register(c, noop[otherPayload], KindConfig{Name: "b"}))
+		require.NoError(t, c.Start(ctx))
+		stopOnCleanup(t, c)
+		ps := c.pollers([]Kind{1, 2, 1, 99, 2})
+		require.Len(t, ps, 2)
+		require.Same(t, c.pools[1], ps[0])
+		require.Same(t, c.pools[2], ps[1])
+	})
 }
 
-func TestClaimCoalescesUnderBacklog(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		st := newFakeStore()
-		done := make(chan struct{}, 40)
-		// Handlers finish one by one, each within 8ms of its start, so while
-		// two run another slot frees well within the coalesce window.
-		c := newPoolClient(t, st, func(_ context.Context, j *Job[testPayload]) error {
-			time.Sleep(time.Duration(j.ID%8+1) * time.Millisecond)
-			done <- struct{}{}
-			return nil
-		}, KindConfig{Workers: 8, PollInterval: time.Hour})
-		st.feed(40)
-		require.NoError(t, c.Start(context.Background()))
-		defer stopInBubble(t, c)
-		for range 40 {
-			<-done
-		}
+func TestClaimCoalescing(t *testing.T) {
+	const workers = 8 // a poller waits for max(1, workers/4) = 2 free slots
 
-		limits := st.Limits()
-		require.NotContains(t, limits, 1)
-		var sum int
-		for _, l := range limits {
-			sum += l
-		}
-		require.Greater(t, float64(sum)/float64(len(limits)), 1.0)
+	t.Run("backlog claimed in batches", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			st := newFakeStore()
+			done := make(chan struct{}, 40)
+			// Handlers finish one by one, each within 8ms of its start, so while
+			// two run another slot frees well within the coalesce window.
+			c := newPoolClient(t, st, func(_ context.Context, j *Job[testPayload]) error {
+				time.Sleep(time.Duration(j.ID%8+1) * time.Millisecond)
+				done <- struct{}{}
+				return nil
+			}, KindConfig{Workers: workers, PollInterval: time.Hour})
+			st.feed(40)
+			require.NoError(t, c.Start(context.Background()))
+			defer stopInBubble(t, c)
+			for range 40 {
+				<-done
+			}
+
+			limits := st.Limits()
+			require.NotContains(t, limits, 1)
+			var sum int
+			for _, l := range limits {
+				sum += l
+			}
+			require.GreaterOrEqual(t, float64(sum)/float64(len(limits)), float64(workers/4))
+		})
+	})
+
+	t.Run("no wait when enough slots free", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			st := newFakeStore()
+			var mu sync.Mutex
+			var claimedAt []time.Duration
+			start := time.Now()
+			st.claimHook = func(context.Context) error {
+				mu.Lock()
+				defer mu.Unlock()
+				claimedAt = append(claimedAt, time.Since(start))
+				return nil
+			}
+			release := make(chan struct{})
+			// Jobs 1 and 2 free two slots of the first full batch at once.
+			c := newPoolClient(t, st, func(_ context.Context, j *Job[testPayload]) error {
+				if j.ID > 2 {
+					<-release
+				}
+				return nil
+			}, KindConfig{Workers: workers, PollInterval: time.Hour})
+			st.feed(16)
+			require.NoError(t, c.Start(context.Background()))
+			defer stopInBubble(t, c)
+			defer close(release)
+			synctest.Wait()
+
+			require.Equal(t, []int{workers, 2}, st.Limits())
+			mu.Lock()
+			defer mu.Unlock()
+			require.Equal(t, []time.Duration{0, 0}, claimedAt)
+		})
+	})
+
+	t.Run("stop during window", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			st := newFakeStore()
+			release := make(chan struct{})
+			// Job 1 frees one slot, so the poller waits in the coalesce window
+			// for a second one.
+			c := newPoolClient(t, st, func(_ context.Context, j *Job[testPayload]) error {
+				if j.ID > 1 {
+					<-release
+				}
+				return nil
+			}, KindConfig{Workers: workers, PollInterval: time.Hour})
+			st.feed(workers + 1)
+			require.NoError(t, c.Start(context.Background()))
+			synctest.Wait()
+
+			start := time.Now()
+			bgDone := make(chan struct{})
+			go func() {
+				c.bgWG.Wait()
+				close(bgDone)
+			}()
+			stopped := make(chan error, 1)
+			go func() { stopped <- c.Stop(context.Background()) }()
+			<-bgDone
+			require.Zero(t, time.Since(start))
+			close(release)
+			require.NoError(t, <-stopped)
+			require.Equal(t, 1, st.Claims())
+		})
 	})
 }
