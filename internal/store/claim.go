@@ -80,7 +80,8 @@ type Completion struct {
 // the rows written. A ref is missing when its lease no longer matches: the job
 // was rescued or already finished. A row locked by another transaction makes
 // the statement wait for it. There is no deadlock: each (id, lease) has a
-// single owner, and the library's other lockers use SKIP LOCKED.
+// single owner, and the library's other lockers either use SKIP LOCKED or
+// lock a single row.
 func (s *Store) Complete(ctx context.Context, cs []Completion) ([]Ref, error) {
 	ids := make([]int64, len(cs))
 	leases := make([]int64, len(cs))
