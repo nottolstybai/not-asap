@@ -129,13 +129,36 @@ func (s *JobSuite) TestWaitFor() {
 
 func (s *JobSuite) TestWaitStatus() {
 	id := s.InsertJob()
+	done := make(chan error, 1)
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 		_, err := s.Pool.Exec(context.Background(), "UPDATE notasap_jobs SET status = 3 WHERE id = $1", id)
-		s.NoError(err)
+		done <- err
 	}()
 	row := pgtest.WaitStatus(&s.Suite, id, myStatus(3))
 	s.Equal(id, row.ID)
+	s.NoError(<-done)
+}
+
+func (s *JobSuite) TestSetJobRunningKeepsOtherColumns() {
+	id := s.InsertJob(pgtest.WithAttempt(2, 5), pgtest.WithLease(4))
+	s.SetJob(id, pgtest.Running(-time.Minute))
+	row := s.Job(id)
+	s.Equal(store.StatusRunning, row.Status)
+	s.Require().NotNil(row.Deadline)
+	s.True(row.Deadline.Before(s.DBNow()))
+	s.Equal(5, row.MaxAttempts)
+	s.Equal(int64(4), row.Lease)
+	s.Equal(2, row.Attempt)
+}
+
+func (s *JobSuite) TestInsertRunningDefaultsAttemptAndLease() {
+	row := s.Job(s.InsertJob(pgtest.Running(time.Minute)))
+	s.Equal(1, row.Attempt)
+	s.Equal(int64(1), row.Lease)
+	row = s.Job(s.InsertJob(pgtest.Running(time.Minute), pgtest.WithAttempt(2, 3), pgtest.WithLease(7)))
+	s.Equal(2, row.Attempt)
+	s.Equal(int64(7), row.Lease)
 }
 
 type myStatus int16

@@ -102,17 +102,12 @@ func WithError(msg string) JobOption {
 	return func(j *jobSpec) { j.errMsg = &msg; j.set |= fError }
 }
 
-// Running makes a claimed job: status running, attempt and lease at least 1,
-// and a deadline deadlineIn from now.
+// Running makes a claimed job: status running and a deadline deadlineIn from
+// now. It names no other column, so SetJob leaves them alone; InsertJob
+// defaults attempt and lease to 1 for a running row.
 func Running(deadlineIn time.Duration) JobOption {
 	return func(j *jobSpec) {
 		WithStatus(store.StatusRunning)(j)
-		if j.attempt == 0 {
-			WithAttempt(1, j.maxAttempts)(j)
-		}
-		if j.lease == 0 {
-			WithLease(1)(j)
-		}
 		WithDeadlineIn(deadlineIn)(j)
 	}
 }
@@ -149,6 +144,14 @@ func (s *Suite) InsertJobs(n int, opts ...JobOption) []int64 {
 	j := defaults()
 	for _, o := range opts {
 		o(&j)
+	}
+	if j.status == store.StatusRunning {
+		if j.set&fAttempt == 0 {
+			j.attempt = 1
+		}
+		if j.set&fLease == 0 {
+			j.lease = 1
+		}
 	}
 	var deadline *float64
 	if j.deadlineIn != nil {
