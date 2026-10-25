@@ -2,16 +2,21 @@ package notasap
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
 
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
 
+	"github.com/nottolstybai/not-asap/internal/pgtest"
 	"github.com/nottolstybai/not-asap/internal/store"
 )
 
@@ -143,8 +148,153 @@ func TestRescueDecisionPanickingBackoff(t *testing.T) {
 		Backoff: func(int) time.Duration { panic("bad backoff") },
 	}, WithLogger(slog.New(slog.NewTextHandler(&buf, nil))))
 
-	r := c.rescueDecision(store.StuckJob{ID: 1, Kind: 1, Attempt: 1, MaxAttempts: 3})
+	r := c.rescueDecision(store.StuckJob{
+		ID:          1,
+		Kind:        1,
+		Attempt:     1,
+		MaxAttempts: 3,
+	})
 	require.False(t, r.decision.Fail)
 	require.Zero(t, r.decision.Delay)
 	require.Contains(t, buf.String(), "level=ERROR")
+}
+
+type outcomeSuite struct {
+	testSuite
+}
+
+func TestOutcome(t *testing.T) {
+	t.Parallel()
+	suite.Run(t, new(outcomeSuite))
+}
+
+func (s *outcomeSuite) Test_decide() {
+	s.Run("done", func() {
+		c := s.startClient([]kindReg{reg(noop[payloadA], KindConfig{Name: "a"})})
+		id := s.schedule(c, payloadA{N: 1})
+
+		row := pgtest.WaitStatus(&s.Suite, id, StatusDone)
+		s.Equal(1, row.Attempt)
+		s.Nil(row.Error)
+		s.Nil(row.Deadline)
+		s.stop(c)
+		s.Equal(1, c.obs.Count("finished/done"))
+	})
+
+	s.Run("error retries then fails", func() {
+		var calls atomic.Int64
+		c := s.startClient([]kindReg{reg(func(context.Context, *Job[payloadA]) error {
+			calls.Add(1)
+			return errors.New("boom")
+		}, KindConfig{
+			Name:        "a",
+			MaxAttempts: 3,
+		})})
+		id := s.schedule(c, payloadA{})
+
+		row := pgtest.WaitStatus(&s.Suite, id, StatusFailed)
+		s.Equal(3, row.Attempt)
+		s.Require().NotNil(row.Error)
+		s.Equal("boom", *row.Error)
+		s.EqualValues(3, calls.Load())
+	})
+
+	s.Run("panic retried", func() {
+		c := s.startClient([]kindReg{reg(func(_ context.Context, j *Job[payloadA]) error {
+			if j.Attempt == 1 {
+				panic("kaboom")
+			}
+			return nil
+		}, KindConfig{Name: "a"})})
+		id := s.schedule(c, payloadA{})
+
+		row := pgtest.WaitStatus(&s.Suite, id, StatusDone)
+		s.Equal(2, row.Attempt)
+		s.stop(c)
+		s.Equal(1, c.obs.Count("retried/panic"))
+	})
+
+	s.Run("timeout retried", func() {
+		c := s.startClient([]kindReg{reg(func(ctx context.Context, _ *Job[payloadA]) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}, KindConfig{
+			Name:        "a",
+			Timeout:     20 * time.Millisecond,
+			MaxAttempts: 2,
+		})})
+		id := s.schedule(c, payloadA{})
+
+		row := pgtest.WaitStatus(&s.Suite, id, StatusFailed)
+		s.Equal(2, row.Attempt)
+		s.stop(c)
+		s.Equal(1, c.obs.Count("retried/timeout"))
+		s.Equal(1, c.obs.Count("finished/failed"))
+	})
+
+	s.Run("ErrCancel cancels", func() {
+		c := s.startClient([]kindReg{reg(func(context.Context, *Job[payloadA]) error {
+			return fmt.Errorf("give up: %w", ErrCancel)
+		}, KindConfig{Name: "a"})})
+		id := s.schedule(c, payloadA{})
+
+		row := pgtest.WaitStatus(&s.Suite, id, StatusCancelled)
+		s.Require().NotNil(row.Error)
+		s.Contains(*row.Error, "cancel")
+		s.Equal(1, row.Attempt)
+	})
+
+	s.Run("ErrKeepAttempt keeps attempt", func() {
+		var calls atomic.Int64
+		c := s.startClient([]kindReg{reg(func(context.Context, *Job[payloadA]) error {
+			if calls.Add(1) <= 3 {
+				return fmt.Errorf("not yet: %w", ErrKeepAttempt)
+			}
+			return nil
+		}, KindConfig{
+			Name:        "a",
+			MaxAttempts: 2,
+		})})
+		id := s.schedule(c, payloadA{})
+
+		row := pgtest.WaitStatus(&s.Suite, id, StatusDone)
+		s.Equal(1, row.Attempt)
+		s.stop(c)
+		s.Equal(3, c.obs.Count("retried/keep_attempt"))
+		s.EqualValues(4, calls.Load())
+	})
+
+	s.Run("bad payload fails without handler", func() {
+		var called atomic.Bool
+		s.startClient([]kindReg{reg(func(context.Context, *Job[payloadA]) error {
+			called.Store(true)
+			return nil
+		}, KindConfig{Name: "a"})})
+		id := s.Fixture.Job(s.ctx, pgtest.JobOpt{
+			Kind:    lo.ToPtr(int16(kindA)),
+			Payload: lo.ToPtr(`{"n":"str"}`),
+		}).ID
+
+		row := pgtest.WaitStatus(&s.Suite, id, StatusFailed)
+		s.Equal(1, row.Attempt)
+		s.Require().NotNil(row.Error)
+		s.True(strings.HasPrefix(*row.Error, "decode payload"), *row.Error)
+		s.False(called.Load())
+	})
+
+	s.Run("long error stored as valid UTF-8", func() {
+		c := s.startClient([]kindReg{reg(func(context.Context, *Job[payloadA]) error {
+			return errors.New(strings.Repeat("я", 3000))
+		}, KindConfig{
+			Name:        "a",
+			MaxAttempts: 1,
+		})})
+		id := s.schedule(c, payloadA{})
+
+		row := pgtest.WaitStatus(&s.Suite, id, StatusFailed)
+		s.Require().NotNil(row.Error)
+		s.True(utf8.ValidString(*row.Error))
+		s.LessOrEqual(len(*row.Error), 4096)
+		s.Greater(len(*row.Error), 4000)
+	})
 }

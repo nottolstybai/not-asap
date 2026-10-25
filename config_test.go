@@ -51,9 +51,19 @@ func TestNewValidation(t *testing.T) {
 		c, err := newClient(nil, nil,
 			WithLogger(slog.Default()),
 			WithObserver(NopObserver{}),
-			WithDefaults(KindConfig{Workers: 2, Backoff: Constant(time.Second)}),
-			WithRescuer(RescuerConfig{Interval: time.Second, Grace: time.Second}),
-			WithJanitor(JanitorConfig{Interval: time.Minute, BatchSize: 10, Retention: map[Status]time.Duration{StatusDone: time.Hour}}),
+			WithDefaults(KindConfig{
+				Workers: 2,
+				Backoff: Constant(time.Second),
+			}),
+			WithRescuer(RescuerConfig{
+				Interval: time.Second,
+				Grace:    time.Second,
+			}),
+			WithJanitor(JanitorConfig{
+				Interval:  time.Minute,
+				BatchSize: 10,
+				Retention: map[Status]time.Duration{StatusDone: time.Hour},
+			}),
 			WithStopGrace(time.Second),
 		)
 		require.NoError(t, err)
@@ -69,7 +79,10 @@ func TestMergeKindConfig(t *testing.T) {
 	require.NoError(t, err)
 	got := mergeKindConfig(c.defaults, KindConfig{Name: "x"})
 	require.Equal(t, 5, got.Workers)
-	got = mergeKindConfig(c.defaults, KindConfig{Name: "x", Workers: 7})
+	got = mergeKindConfig(c.defaults, KindConfig{
+		Name:    "x",
+		Workers: 7,
+	})
 	require.Equal(t, 7, got.Workers)
 	require.Equal(t, 3, got.MaxAttempts)
 	require.Equal(t, time.Minute, got.Timeout)
@@ -85,7 +98,14 @@ func TestMergeKindConfig(t *testing.T) {
 
 func TestValidateKindConfig(t *testing.T) {
 	t.Parallel()
-	valid := KindConfig{Name: "x", Workers: 1, MaxAttempts: 1, Timeout: time.Second, PollInterval: time.Second, Backoff: Constant(0)}
+	valid := KindConfig{
+		Name:         "x",
+		Workers:      1,
+		MaxAttempts:  1,
+		Timeout:      time.Second,
+		PollInterval: time.Second,
+		Backoff:      Constant(0),
+	}
 	require.NoError(t, validateKindConfig(valid))
 
 	tests := []struct {

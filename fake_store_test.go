@@ -57,7 +57,12 @@ func newFakeStore() *fakeStore {
 func (f *fakeStore) feed(n int) {
 	for i := range n {
 		f.pending <- store.ClaimedJob{
-			ID: int64(i + 1), Kind: 1, Payload: []byte(`{}`), Attempt: 1, MaxAttempts: 3, Lease: 1,
+			ID:          int64(i + 1),
+			Kind:        1,
+			Payload:     []byte(`{}`),
+			Attempt:     1,
+			MaxAttempts: 3,
+			Lease:       1,
 		}
 	}
 }
@@ -126,7 +131,10 @@ func (f *fakeStore) Calls() []finishCall {
 func (f *fakeStore) Insert(_ context.Context, _ store.DB, params []store.InsertParams) ([]store.InsertResult, error) {
 	res := make([]store.InsertResult, len(params))
 	for i := range res {
-		res[i] = store.InsertResult{ID: int64(i + 1), Outcome: store.Inserted}
+		res[i] = store.InsertResult{
+			ID:      int64(i + 1),
+			Outcome: store.Inserted,
+		}
 	}
 	return res, nil
 }
@@ -164,14 +172,24 @@ func (f *fakeStore) Claim(ctx context.Context, _ int16, limit int, _ time.Durati
 func (f *fakeStore) Finish(_ context.Context, ref store.Ref, status int16, errMsg string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, finishCall{ref: ref, status: Status(status), errMsg: errMsg})
+	f.calls = append(f.calls, finishCall{
+		ref:    ref,
+		status: Status(status),
+		errMsg: errMsg,
+	})
 	return f.nextWrite()
 }
 
 func (f *fakeStore) Reschedule(_ context.Context, ref store.Ref, delay time.Duration, errMsg string, refund bool) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, finishCall{ref: ref, status: StatusPending, errMsg: errMsg, delay: delay, refund: refund})
+	f.calls = append(f.calls, finishCall{
+		ref:    ref,
+		status: StatusPending,
+		errMsg: errMsg,
+		delay:  delay,
+		refund: refund,
+	})
 	return f.nextWrite()
 }
 

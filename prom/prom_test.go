@@ -1,14 +1,20 @@
 package prom_test
 
 import (
+	"context"
+	"log/slog"
 	"math"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
 
 	notasap "github.com/nottolstybai/not-asap"
+	"github.com/nottolstybai/not-asap/internal/pgtest"
 	"github.com/nottolstybai/not-asap/prom"
 )
 
@@ -44,7 +50,10 @@ func TestNew(t *testing.T) {
 func TestNewFailureLeavesRegistryClean(t *testing.T) {
 	t.Parallel()
 	reg := prometheus.NewRegistry()
-	blocker := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "notasap_janitor_deleted_total", Help: "x"}, []string{"status"})
+	blocker := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "notasap_janitor_deleted_total",
+		Help: "x",
+	}, []string{"status"})
 	require.NoError(t, reg.Register(blocker))
 
 	_, err := prom.New(reg)
@@ -55,7 +64,10 @@ func TestNewFailureLeavesRegistryClean(t *testing.T) {
 	require.Empty(t, mfs)
 
 	// Earlier collectors were unregistered, so their names are free again.
-	again := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "notasap_jobs_scheduled_total", Help: "Jobs scheduled."}, []string{"kind"})
+	again := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "notasap_jobs_scheduled_total",
+		Help: "Jobs scheduled.",
+	}, []string{"kind"})
 	require.NoError(t, reg.Register(again))
 }
 
@@ -195,4 +207,65 @@ func TestInvalidBuckets(t *testing.T) {
 			require.Error(t, err)
 		})
 	}
+}
+
+func TestMain(m *testing.M) {
+	os.Exit(pgtest.Run(m))
+}
+
+type payloadA struct{}
+
+func (payloadA) Kind() notasap.Kind { return 1 }
+
+type promSuite struct {
+	pgtest.Suite
+	ctx context.Context
+}
+
+func TestProm(t *testing.T) {
+	t.Parallel()
+	suite.Run(t, new(promSuite))
+}
+
+func (s *promSuite) SetupTest() {
+	s.Suite.SetupTest()
+	s.ctx = s.T().Context()
+}
+
+func (s *promSuite) TestMetrics_AfterProcessing() {
+	reg := prometheus.NewRegistry()
+	m, err := prom.New(reg)
+	s.Require().NoError(err)
+
+	c, err := notasap.New(s.Pool, notasap.WithObserver(m), notasap.WithLogger(slog.New(slog.DiscardHandler)))
+	s.Require().NoError(err)
+	s.Require().NoError(notasap.Register(c,
+		func(context.Context, *notasap.Job[payloadA]) error { return nil },
+		notasap.KindConfig{
+			Name:         "a",
+			PollInterval: 10 * time.Millisecond,
+		}))
+
+	s.Require().NoError(c.Start(s.ctx))
+	t := s.T() // the cleanup reports on this T
+	stop := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		assert.NoError(t, c.Stop(ctx))
+	}
+	s.T().Cleanup(stop)
+
+	_, err = c.Schedule(s.ctx, payloadA{})
+	s.Require().NoError(err)
+
+	s.WaitFor(func() bool {
+		v, _ := lookup(reg, "notasap_jobs_finished_total", "a", "done")
+		return v == 1
+	}, "job not finished")
+	// Stop drains the handler including its observer calls, so the
+	// histogram observed after the counter is complete too.
+	stop()
+
+	s.EqualValues(1, value(s.T(), reg, "notasap_jobs_scheduled_total", "a"))
+	s.Equal(1, histCount(s.T(), reg, "notasap_job_duration_seconds", "outcome", "done"))
 }

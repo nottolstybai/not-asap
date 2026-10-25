@@ -108,7 +108,11 @@ func TestRegisterRun(t *testing.T) {
 		require.True(t, ok)
 
 		res := e.run(context.Background(), store.ClaimedJob{
-			ID: 7, Kind: 1, Payload: []byte(`{"n":42}`), Attempt: 2, MaxAttempts: 3,
+			ID:          7,
+			Kind:        1,
+			Payload:     []byte(`{"n":42}`),
+			Attempt:     2,
+			MaxAttempts: 3,
 		})
 		require.NoError(t, res.decodeErr)
 		require.ErrorIs(t, res.err, want)
@@ -129,7 +133,11 @@ func TestRegisterRun(t *testing.T) {
 		}, KindConfig{Name: "a"}))
 
 		e, _ := c.entry(1)
-		res := e.run(context.Background(), store.ClaimedJob{ID: 1, Kind: 1, Payload: []byte("not-json")})
+		res := e.run(context.Background(), store.ClaimedJob{
+			ID:      1,
+			Kind:    1,
+			Payload: []byte("not-json"),
+		})
 		require.Error(t, res.decodeErr)
 		require.NoError(t, res.err)
 		require.False(t, called)

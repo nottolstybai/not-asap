@@ -17,10 +17,14 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
+
+	"github.com/nottolstybai/not-asap/internal/pgtest"
+	"github.com/nottolstybai/not-asap/internal/store"
 )
 
 const (
-	waitFor = 5 * time.Second
+	waitFor = pgtest.WaitTimeout
 	tick    = 5 * time.Millisecond
 )
 
@@ -165,7 +169,10 @@ func TestFullBatchRepollsImmediately(t *testing.T) {
 	c := newPoolClient(t, st, func(context.Context, *Job[testPayload]) error {
 		executed.Add(1)
 		return nil
-	}, KindConfig{Workers: 3, PollInterval: time.Hour})
+	}, KindConfig{
+		Workers:      3,
+		PollInterval: time.Hour,
+	})
 	stopOnCleanup(t, c)
 	st.feed(6)
 	require.NoError(t, c.Start(context.Background()))
@@ -675,7 +682,10 @@ func TestClaimCoalescing(t *testing.T) {
 				time.Sleep(time.Duration(j.ID%8+1) * time.Millisecond)
 				done <- struct{}{}
 				return nil
-			}, KindConfig{Workers: workers, PollInterval: time.Hour})
+			}, KindConfig{
+				Workers:      workers,
+				PollInterval: time.Hour,
+			})
 			st.feed(40)
 			require.NoError(t, c.Start(context.Background()))
 			defer stopInBubble(t, c)
@@ -707,7 +717,10 @@ func TestClaimCoalescing(t *testing.T) {
 					<-release
 				}
 				return nil
-			}, KindConfig{Workers: workers, PollInterval: time.Hour})
+			}, KindConfig{
+				Workers:      workers,
+				PollInterval: time.Hour,
+			})
 			st.feed(16)
 			require.NoError(t, c.Start(context.Background()))
 			defer stopInBubble(t, c)
@@ -733,7 +746,10 @@ func TestClaimCoalescing(t *testing.T) {
 					<-release
 				}
 				return nil
-			}, KindConfig{Workers: workers, PollInterval: time.Hour})
+			}, KindConfig{
+				Workers:      workers,
+				PollInterval: time.Hour,
+			})
 			st.feed(workers + 1)
 			require.NoError(t, c.Start(context.Background()))
 			synctest.Wait()
@@ -753,4 +769,126 @@ func TestClaimCoalescing(t *testing.T) {
 			require.Equal(t, 1, st.Claims())
 		})
 	})
+}
+
+type poolSuite struct {
+	testSuite
+}
+
+func TestPool(t *testing.T) {
+	t.Parallel()
+	suite.Run(t, new(poolSuite))
+}
+
+func (s *poolSuite) Test_kindPool_DelayedNotRunEarly() {
+	c := s.startClient([]kindReg{reg(noop[payloadA], KindConfig{Name: "a"})})
+	delayed := s.schedule(c, payloadA{N: 1}, WithDelay(time.Hour))
+	now := s.schedule(c, payloadA{N: 2})
+
+	pgtest.WaitStatus(&s.Suite, now, StatusDone)
+	row := s.GetJob(delayed)
+	s.Equal(StatusPending, Status(row.Status))
+	s.Equal(0, row.Attempt)
+}
+
+func (s *poolSuite) Test_kindPool_KindIsolation() {
+	release := make(chan struct{})
+	defer close(release)
+	started := make(chan struct{}, 1)
+	c := s.startClient([]kindReg{
+		reg(func(context.Context, *Job[payloadA]) error {
+			started <- struct{}{}
+			<-release
+			return nil
+		}, KindConfig{
+			Name:    "a",
+			Workers: 1,
+			Timeout: 10 * time.Minute,
+		}),
+		reg(noop[payloadB], KindConfig{Name: "b"}),
+	}, WithRescuer(RescuerConfig{Grace: 5 * time.Minute}))
+	blocked := s.schedule(c, payloadA{})
+	recv(s.T(), started)
+
+	// The claim's lease is Timeout + Grace, measured on the DB clock.
+	var leaseLeft float64
+	s.Require().NoError(s.Pool.QueryRow(s.ctx,
+		`SELECT EXTRACT(EPOCH FROM deadline - NOW())::float8 FROM notasap_jobs WHERE id = $1`, blocked).Scan(&leaseLeft))
+	s.InDelta((15 * time.Minute).Seconds(), leaseLeft, 2)
+
+	ids := make([]int64, 5)
+	for i := range ids {
+		ids[i] = s.schedule(c, payloadB{Msg: fmt.Sprint(i)})
+	}
+	for _, id := range ids {
+		pgtest.WaitStatus(&s.Suite, id, StatusDone)
+	}
+	s.Equal(StatusRunning, Status(s.GetJob(blocked).Status))
+}
+
+func (s *poolSuite) Test_kindPool_TwoClientsNoDoubleExecution() {
+	const n = 200
+	var seen sync.Map
+	// Each client's first handler call waits until both clients have run
+	// one, so neither can drain the queue alone: Workers bounds the claim.
+	var ready sync.WaitGroup
+	ready.Add(2)
+	bothReady := make(chan struct{})
+	go func() { ready.Wait(); close(bothReady) }()
+	handler := func(processed *atomic.Int64) Handler[payloadA] {
+		arrived := sync.OnceFunc(ready.Done)
+		return func(ctx context.Context, j *Job[payloadA]) error {
+			cnt, _ := seen.LoadOrStore(j.ID, new(atomic.Int64))
+			cnt.(*atomic.Int64).Add(1)
+			processed.Add(1)
+			arrived()
+			select {
+			case <-bothReady:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			time.Sleep(2 * time.Millisecond) // simulated work
+			return nil
+		}
+	}
+	var processed1, processed2 atomic.Int64
+	cfg := KindConfig{
+		Name:    "a",
+		Workers: 2,
+	}
+	c1 := s.startClient([]kindReg{reg(handler(&processed1), cfg)})
+	s.startClientOn(pgtest.NewPool(s.T(), s.Schema), []kindReg{reg(handler(&processed2), cfg)})
+
+	items := make([]BatchItem, n)
+	for i := range items {
+		items[i] = Item(payloadA{N: i})
+	}
+	_, err := c1.ScheduleBatch(s.ctx, items...)
+	s.Require().NoError(err)
+
+	s.WaitFor(func() bool { return s.CountJobs(store.StatusDone) == n }, "not all jobs done")
+
+	var total int
+	seen.Range(func(_, v any) bool {
+		total++
+		s.EqualValues(1, v.(*atomic.Int64).Load())
+		return true
+	})
+	s.Equal(n, total)
+	s.Positive(processed1.Load())
+	s.Positive(processed2.Load())
+	s.EqualValues(n, processed1.Load()+processed2.Load())
+}
+
+func (s *poolSuite) Test_kindPool_ScheduleWakesIdlePoller() {
+	c := s.startClient([]kindReg{reg(noop[payloadA], KindConfig{
+		Name:         "a",
+		PollInterval: time.Hour,
+	})})
+	// The first poll finds nothing, so the poller sleeps for PollInterval.
+	s.Eventually(func() bool { return c.obs.Count("polled/a") >= 1 }, waitFor, tick)
+	id := s.schedule(c, payloadA{})
+
+	pgtest.WaitStatus(&s.Suite, id, StatusDone)
+	s.Equal(2, c.obs.Count("polled/a"))
 }

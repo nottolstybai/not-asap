@@ -16,17 +16,23 @@ func TestMain(m *testing.M) {
 	os.Exit(pgtest.Run(m))
 }
 
-type MigrationsSuite struct {
+type migrationsSuite struct {
 	pgtest.Suite
+	ctx context.Context
 }
 
-func TestMigrationsSuite(t *testing.T) {
+func TestMigrations(t *testing.T) {
 	t.Parallel()
-	suite.Run(t, new(MigrationsSuite))
+	suite.Run(t, new(migrationsSuite))
+}
+
+func (s *migrationsSuite) SetupTest() {
+	s.Suite.SetupTest()
+	s.ctx = s.T().Context()
 }
 
 // gooseSections returns the Up and Down halves of the goose migration.
-func gooseSections(s *MigrationsSuite) (up, down string) {
+func gooseSections(s *migrationsSuite) (up, down string) {
 	raw, err := migrations.Goose.ReadFile("goose/00001_notasap_jobs.sql")
 	s.Require().NoError(err)
 	text := string(raw)
@@ -37,16 +43,15 @@ func gooseSections(s *MigrationsSuite) (up, down string) {
 }
 
 // newSchema creates a schema named after the suite's random schema name.
-func (s *MigrationsSuite) newSchema(prefix string) string {
+func (s *migrationsSuite) newSchema(prefix string) string {
 	name := s.Schema + "_" + prefix
 	s.Exec("CREATE SCHEMA " + name)
 	s.ExecOnCleanup("DROP SCHEMA IF EXISTS " + name + " CASCADE")
 	return name
 }
 
-func (s *MigrationsSuite) schemaShape(schema string) (columns, indexes []string) {
-	ctx := context.Background()
-	rows, err := s.Pool.Query(ctx, `
+func (s *migrationsSuite) schemaShape(schema string) (columns, indexes []string) {
+	rows, err := s.Pool.Query(s.ctx, `
 SELECT column_name || '|' || data_type || '|' || is_nullable || '|' || COALESCE(column_default, '')
 FROM information_schema.columns
 WHERE table_schema = $1 AND table_name = 'notasap_jobs'
@@ -60,7 +65,7 @@ ORDER BY ordinal_position`, schema)
 	s.Require().NoError(rows.Err())
 	rows.Close()
 
-	rows, err = s.Pool.Query(ctx, `
+	rows, err = s.Pool.Query(s.ctx, `
 SELECT indexdef FROM pg_indexes
 WHERE schemaname = $1 AND tablename = 'notasap_jobs'
 ORDER BY indexname`, schema)
@@ -75,13 +80,13 @@ ORDER BY indexname`, schema)
 	return columns, indexes
 }
 
-func (s *MigrationsSuite) apply(schema, sql string) {
+func (s *migrationsSuite) apply(schema, sql string) {
 	pool := pgtest.NewPool(s.T(), schema)
-	_, err := pool.Exec(context.Background(), sql)
+	_, err := pool.Exec(s.ctx, sql)
 	s.Require().NoError(err)
 }
 
-func (s *MigrationsSuite) TestGooseAndGolangMigrateProduceSameSchema() {
+func (s *migrationsSuite) TestMigrations_GooseAndGolangMigrateSameSchema() {
 	g, m := s.newSchema("g"), s.newSchema("m")
 
 	gooseUp, _ := gooseSections(s)
@@ -93,12 +98,12 @@ func (s *MigrationsSuite) TestGooseAndGolangMigrateProduceSameSchema() {
 	gc, gi := s.schemaShape(g)
 	mc, mi := s.schemaShape(m)
 	s.Require().NotEmpty(gc)
-	s.Require().Equal(gc, mc)
-	s.Require().Equal(gi, mi)
-	s.Require().Len(gi, 5)
+	s.Equal(gc, mc)
+	s.Equal(gi, mi)
+	s.Len(gi, 5)
 }
 
-func (s *MigrationsSuite) TestDownDropsTable() {
+func (s *migrationsSuite) TestMigrations_DownDropsTable() {
 	g, m := s.newSchema("g"), s.newSchema("m")
 
 	up, err := migrations.GolangMigrate.ReadFile("golang-migrate/000001_notasap_jobs.up.sql")
@@ -114,8 +119,8 @@ func (s *MigrationsSuite) TestDownDropsTable() {
 
 	for _, schema := range []string{g, m} {
 		var reg *string
-		s.Require().NoError(s.Pool.QueryRow(context.Background(),
+		s.Require().NoError(s.Pool.QueryRow(s.ctx,
 			"SELECT to_regclass($1)::text", schema+".notasap_jobs").Scan(&reg))
-		s.Require().Nil(reg, schema)
+		s.Nil(reg, schema)
 	}
 }
