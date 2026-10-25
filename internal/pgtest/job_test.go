@@ -20,6 +20,7 @@ type JobSuite struct {
 }
 
 func TestJobSuite(t *testing.T) {
+	t.Parallel()
 	suite.Run(t, new(JobSuite))
 }
 

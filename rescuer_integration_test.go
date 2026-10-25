@@ -21,6 +21,7 @@ type RescuerSuite struct {
 }
 
 func TestRescuerSuite(t *testing.T) {
+	t.Parallel()
 	suite.Run(t, new(RescuerSuite))
 }
 

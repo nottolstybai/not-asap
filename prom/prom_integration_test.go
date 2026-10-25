@@ -29,6 +29,7 @@ type PromSuite struct {
 }
 
 func TestPromSuite(t *testing.T) {
+	t.Parallel()
 	suite.Run(t, new(PromSuite))
 }
 

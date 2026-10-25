@@ -17,6 +17,7 @@ type JanitorSuite struct {
 }
 
 func TestJanitorSuite(t *testing.T) {
+	t.Parallel()
 	suite.Run(t, new(JanitorSuite))
 }
 

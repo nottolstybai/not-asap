@@ -27,6 +27,7 @@ type StoreSuite struct {
 }
 
 func TestStoreSuite(t *testing.T) {
+	t.Parallel()
 	suite.Run(t, new(StoreSuite))
 }
 

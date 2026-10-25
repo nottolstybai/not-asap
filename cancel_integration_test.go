@@ -15,6 +15,7 @@ type CancelSuite struct {
 }
 
 func TestCancelSuite(t *testing.T) {
+	t.Parallel()
 	suite.Run(t, new(CancelSuite))
 }
 

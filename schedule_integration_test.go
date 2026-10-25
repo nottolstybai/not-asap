@@ -23,6 +23,7 @@ type ScheduleSuite struct {
 }
 
 func TestScheduleSuite(t *testing.T) {
+	t.Parallel()
 	suite.Run(t, new(ScheduleSuite))
 }
 

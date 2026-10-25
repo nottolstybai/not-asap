@@ -24,6 +24,7 @@ type WorkerSuite struct {
 }
 
 func TestWorkerSuite(t *testing.T) {
+	t.Parallel()
 	suite.Run(t, new(WorkerSuite))
 }
 

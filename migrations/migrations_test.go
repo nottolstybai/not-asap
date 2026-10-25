@@ -21,6 +21,7 @@ type MigrationsSuite struct {
 }
 
 func TestMigrationsSuite(t *testing.T) {
+	t.Parallel()
 	suite.Run(t, new(MigrationsSuite))
 }
 

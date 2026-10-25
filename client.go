@@ -48,6 +48,10 @@ type Client struct {
 	names   map[string]Kind
 	// maxConns is the pool's MaxConns; 0 means unknown.
 	maxConns int32
+	// dbCallTimeout bounds claiming jobs and writing a job's status after its
+	// handler returns, retries included. Neither inherits the handler or
+	// shutdown contexts. It is a field only so tests can shorten it.
+	dbCallTimeout time.Duration
 
 	// Set by Start. stopCh and bgCtx stop pollers and maintenance loops;
 	// runCtx is the parent of handler contexts, cancelled with errShutdown
@@ -88,12 +92,13 @@ func newClient(st jobStore, db store.DB, opts ...Option) (*Client, error) {
 		}
 	}
 	return &Client{
-		options: o,
-		st:      st,
-		db:      db,
-		stopped: make(chan struct{}),
-		kinds:   make(map[Kind]*kindEntry),
-		names:   make(map[string]Kind),
+		options:       o,
+		st:            st,
+		db:            db,
+		stopped:       make(chan struct{}),
+		kinds:         make(map[Kind]*kindEntry),
+		names:         make(map[string]Kind),
+		dbCallTimeout: defaultDBCallTimeout,
 	}, nil
 }
 
