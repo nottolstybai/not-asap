@@ -161,8 +161,8 @@ func (c *Client) startMaintenance() {
 // their context may still be running after Stop returns, and a handler that
 // has returned may still retry its status write for up to 10s (dbCallTimeout);
 // keep the pool open that long, or the write fails and the rescuer recovers
-// the job. When Stop returns nil, all status writes are done. Stop on a Client that was never started returns
-// nil. A later Stop waits until the first one returns, then returns nil, or
+// the job. When Stop returns nil, all status writes are done. Stop on a
+// Client that was never started returns nil. A later Stop waits until the first one returns, then returns nil, or
 // returns ctx.Err() if ctx is done first.
 func (c *Client) Stop(ctx context.Context) error {
 	c.mu.Lock()
