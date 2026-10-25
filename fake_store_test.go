@@ -31,6 +31,13 @@ type fakeStore struct {
 	claims     int
 	maxLimit   int
 	calls      []finishCall
+	writes     []writeResult // scripted results of upcoming Finish/Reschedule calls
+}
+
+// writeResult is a scripted result of a status write.
+type writeResult struct {
+	ok  bool
+	err error
 }
 
 var _ jobStore = (*fakeStore)(nil)
@@ -52,6 +59,24 @@ func (f *fakeStore) failClaims(n int, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.claimFails, f.claimErr = n, err
+}
+
+// scriptWrites makes the next Finish/Reschedule calls return rs in order;
+// later calls succeed.
+func (f *fakeStore) scriptWrites(rs ...writeResult) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.writes = rs
+}
+
+// nextWrite pops the next scripted result; f.mu must be held.
+func (f *fakeStore) nextWrite() (bool, error) {
+	if len(f.writes) == 0 {
+		return true, nil
+	}
+	r := f.writes[0]
+	f.writes = f.writes[1:]
+	return r.ok, r.err
 }
 
 func (f *fakeStore) Claims() int {
@@ -109,14 +134,14 @@ func (f *fakeStore) Finish(_ context.Context, ref store.Ref, status int16, errMs
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, finishCall{ref: ref, status: Status(status), errMsg: errMsg})
-	return true, nil
+	return f.nextWrite()
 }
 
 func (f *fakeStore) Reschedule(_ context.Context, ref store.Ref, delay time.Duration, errMsg string, refund bool) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, finishCall{ref: ref, status: StatusPending, errMsg: errMsg, delay: delay, refund: refund})
-	return true, nil
+	return f.nextWrite()
 }
 
 func (f *fakeStore) Cancel(context.Context, int64) (store.CancelOutcome, error) {

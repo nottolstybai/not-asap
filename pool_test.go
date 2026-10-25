@@ -1,14 +1,17 @@
 package notasap
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/require"
 )
 
@@ -261,4 +264,109 @@ func TestConcurrentStopWaitsForFirst(t *testing.T) {
 	}
 	require.Len(t, st.Calls(), 1)
 	require.NoError(t, <-first)
+}
+
+// retryableErr is a transient error: pgconn.SafeToRetry reports true for it.
+type retryableErr struct{}
+
+func (retryableErr) Error() string     { return "acquire conn" }
+func (retryableErr) SafeToRetry() bool { return true }
+
+type thirdPayload struct{}
+
+func (thirdPayload) Kind() Kind { return 4 }
+
+// finishObserver counts JobFinished calls.
+type finishObserver struct {
+	NopObserver
+	finished atomic.Int64
+}
+
+func (o *finishObserver) JobFinished(string, Status, time.Duration) { o.finished.Add(1) }
+
+func TestStatusWriteRetriesTransient(t *testing.T) {
+	st := newFakeStore()
+	st.scriptWrites(writeResult{err: retryableErr{}}, writeResult{err: retryableErr{}})
+	obs := &finishObserver{}
+	var runs atomic.Int64
+	c := newPoolClient(t, st, func(context.Context, *Job[testPayload]) error {
+		runs.Add(1)
+		return nil
+	}, KindConfig{}, WithObserver(obs))
+	stopOnCleanup(t, c)
+	st.feed(1)
+	require.NoError(t, c.Start(context.Background()))
+
+	require.Eventually(t, func() bool { return obs.finished.Load() == 1 }, 5*time.Second, 5*time.Millisecond)
+	require.Len(t, st.Calls(), 3)
+	require.Never(t, func() bool { return runs.Load() > 1 || obs.finished.Load() > 1 }, 200*time.Millisecond, 5*time.Millisecond)
+}
+
+func TestStatusWriteStopsOnLostLease(t *testing.T) {
+	st := newFakeStore()
+	st.scriptWrites(writeResult{ok: false})
+	obs := &finishObserver{}
+	c := newPoolClient(t, st, noopHandler[testPayload](), KindConfig{}, WithObserver(obs))
+	stopOnCleanup(t, c)
+	st.feed(1)
+	require.NoError(t, c.Start(context.Background()))
+
+	require.Eventually(t, func() bool { return len(st.Calls()) == 1 }, 5*time.Second, 5*time.Millisecond)
+	require.Never(t, func() bool { return len(st.Calls()) > 1 || obs.finished.Load() > 0 }, 300*time.Millisecond, 5*time.Millisecond)
+}
+
+func TestStatusWriteNoRetryPermanent(t *testing.T) {
+	st := newFakeStore()
+	st.scriptWrites(writeResult{err: &pgconn.PgError{Code: "23505"}})
+	var buf syncBuffer
+	c := newPoolClient(t, st, noopHandler[testPayload](), KindConfig{}, WithLogger(slog.New(slog.NewTextHandler(&buf, nil))))
+	stopOnCleanup(t, c)
+	st.feed(1)
+	require.NoError(t, c.Start(context.Background()))
+
+	require.Eventually(t, func() bool { return strings.Contains(buf.String(), "write job status") }, 5*time.Second, 5*time.Millisecond)
+	require.Never(t, func() bool { return len(st.Calls()) > 1 }, 300*time.Millisecond, 5*time.Millisecond)
+	require.Len(t, st.Calls(), 1)
+}
+
+func TestStartWarnsSmallPool(t *testing.T) {
+	var buf syncBuffer
+	c := newPoolClient(t, newFakeStore(), noopHandler[testPayload](), KindConfig{}, WithLogger(slog.New(slog.NewTextHandler(&buf, nil))))
+	require.NoError(t, Register(c, noopHandler[otherPayload](), KindConfig{Name: "b"}))
+	require.NoError(t, Register(c, noopHandler[thirdPayload](), KindConfig{Name: "c"}))
+	c.maxConns = 2
+	stopOnCleanup(t, c)
+	require.NoError(t, c.Start(context.Background()))
+
+	require.Contains(t, buf.String(), "level=WARN")
+	require.Contains(t, buf.String(), "pool")
+}
+
+func TestStartNoPoolWarningWhenUnknownOrLarge(t *testing.T) {
+	for _, maxConns := range []int32{0, 5} {
+		var buf syncBuffer
+		c := newPoolClient(t, newFakeStore(), noopHandler[testPayload](), KindConfig{}, WithLogger(slog.New(slog.NewTextHandler(&buf, nil))))
+		c.maxConns = maxConns
+		require.NoError(t, c.Start(context.Background()))
+		require.NotContains(t, buf.String(), "level=WARN")
+		require.NoError(t, c.Stop(context.Background()))
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for concurrent use by loggers.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

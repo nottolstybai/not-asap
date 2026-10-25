@@ -6,12 +6,26 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/nottolstybai/not-asap/internal/store"
 )
 
-// statusWriteTimeout bounds claiming jobs and writing a job's status after its
-// handler returns. Neither inherits the handler or shutdown contexts.
-const statusWriteTimeout = 10 * time.Second
+// dbCallTimeout bounds claiming jobs and writing a job's status after its
+// handler returns, retries included. Neither inherits the handler or shutdown
+// contexts.
+const dbCallTimeout = 10 * time.Second
+
+// statusWriteBackoff is the delay before the first retry of a status write; it
+// doubles after each attempt.
+const statusWriteBackoff = 50 * time.Millisecond
+
+// isTransient reports whether err is a connection-level failure (pool acquire
+// or timeout) after which retrying a status write is safe: the lease makes the
+// write idempotent.
+func isTransient(err error) bool {
+	return pgconn.SafeToRetry(err) || pgconn.Timeout(err)
+}
 
 // kindPool polls and runs the jobs of one Kind with at most Workers handlers.
 type kindPool struct {
@@ -59,7 +73,7 @@ func (p *kindPool) loop() {
 		// the claim while losing its rows. Claimed rows are always dispatched
 		// and then drained by Stop.
 		start := time.Now()
-		ctx, cancel := context.WithTimeout(context.Background(), statusWriteTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), dbCallTimeout)
 		rows, err := c.st.Claim(ctx, int16(p.e.kind), free, lease)
 		cancel()
 		c.observer.Polled(cfg.Name, time.Since(start))
@@ -129,16 +143,28 @@ func (p *kindPool) run(ctx context.Context, row store.ClaimedJob, logger *slog.L
 // record writes the job's next state and reports it.
 func (p *kindPool) record(row store.ClaimedJob, a action, took time.Duration, logger *slog.Logger) {
 	c, name := p.c, p.e.cfg.Name
-	ctx, cancel := context.WithTimeout(context.Background(), statusWriteTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), dbCallTimeout)
 	defer cancel()
 
 	ref := store.Ref{ID: row.ID, Lease: row.Lease}
-	var ok bool
-	var err error
-	if a.status == StatusPending {
-		ok, err = c.st.Reschedule(ctx, ref, a.delay, a.errMsg, a.refund)
-	} else {
-		ok, err = c.st.Finish(ctx, ref, int16(a.status), a.errMsg)
+	write := func() (bool, error) {
+		if a.status == StatusPending {
+			return c.st.Reschedule(ctx, ref, a.delay, a.errMsg, a.refund)
+		}
+		return c.st.Finish(ctx, ref, int16(a.status), a.errMsg)
+	}
+	// Transient failures are retried with doubling backoff, all within the
+	// single dbCallTimeout budget of ctx.
+	ok, err := write()
+	for delay := statusWriteBackoff; err != nil && isTransient(err); delay *= 2 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		ok, err = write()
 	}
 	switch {
 	case err != nil:

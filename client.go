@@ -46,6 +46,8 @@ type Client struct {
 	stopped chan struct{}
 	kinds   map[Kind]*kindEntry
 	names   map[string]Kind
+	// maxConns is the pool's MaxConns; 0 means unknown.
+	maxConns int32
 
 	// Set by Start. stopCh and bgCtx stop pollers and maintenance loops;
 	// runCtx is the parent of handler contexts, cancelled with errShutdown
@@ -65,7 +67,12 @@ func New(pool *pgxpool.Pool, opts ...Option) (*Client, error) {
 	if pool == nil {
 		return nil, errors.New("notasap: New: pool is nil")
 	}
-	return newClient(store.New(pool), pool, opts...)
+	c, err := newClient(store.New(pool), pool, opts...)
+	if err != nil {
+		return nil, err
+	}
+	c.maxConns = pool.Config().MaxConns
+	return c, nil
 }
 
 func newClient(st jobStore, db store.DB, opts ...Option) (*Client, error) {
@@ -127,6 +134,10 @@ func (c *Client) Start(ctx context.Context) error {
 	c.startMaintenance()
 
 	slices.Sort(names)
+	if c.maxConns > 0 && c.maxConns < int32(len(names)+2) {
+		c.logger.Warn("notasap: connection pool is smaller than kinds + 2; status writes may starve, give notasap its own pool with MaxConns >= kinds + 4",
+			"max_conns", c.maxConns, "kinds", len(names))
+	}
 	c.logger.Info("notasap started", "kinds", names)
 	return nil
 }
