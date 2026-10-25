@@ -4,7 +4,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/samber/lo"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/nottolstybai/not-asap/internal/pgtest"
@@ -23,29 +22,29 @@ func TestRescue(t *testing.T) {
 func (s *rescueSuite) TestStore_Rescue() {
 	s.Run("retries or fails expired jobs", func() {
 		retry := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Kind:        lo.ToPtr(int16(1)),
-			Status:      lo.ToPtr(store.StatusRunning),
-			DeadlineIn:  lo.ToPtr(-time.Minute),
-			Attempt:     lo.ToPtr(1),
-			MaxAttempts: lo.ToPtr(3),
+			Kind:        new(int16(1)),
+			Status:      new(store.StatusRunning),
+			DeadlineIn:  new(-time.Minute),
+			Attempt:     new(1),
+			MaxAttempts: new(3),
 		}).ID
 		fail := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Kind:        lo.ToPtr(int16(7)),
-			Status:      lo.ToPtr(store.StatusRunning),
-			DeadlineIn:  lo.ToPtr(-2 * time.Minute),
-			Attempt:     lo.ToPtr(3),
-			MaxAttempts: lo.ToPtr(3),
+			Kind:        new(int16(7)),
+			Status:      new(store.StatusRunning),
+			DeadlineIn:  new(-2 * time.Minute),
+			Attempt:     new(3),
+			MaxAttempts: new(3),
 		}).ID
 		live := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Kind:        lo.ToPtr(int16(1)),
-			Status:      lo.ToPtr(store.StatusRunning),
-			DeadlineIn:  lo.ToPtr(time.Hour),
-			Attempt:     lo.ToPtr(1),
-			MaxAttempts: lo.ToPtr(3),
+			Kind:        new(int16(1)),
+			Status:      new(store.StatusRunning),
+			DeadlineIn:  new(time.Hour),
+			Attempt:     new(1),
+			MaxAttempts: new(3),
 		}).ID
 		pending := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Kind:  lo.ToPtr(int16(1)),
-			RunIn: lo.ToPtr(-time.Second),
+			Kind:  new(int16(1)),
+			RunIn: new(-time.Second),
 		}).ID
 
 		var seen []store.StuckJob
@@ -84,25 +83,25 @@ func (s *rescueSuite) TestStore_Rescue() {
 
 	s.Run("limit and skip locked", func() {
 		locked := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Kind:        lo.ToPtr(int16(1)),
-			Status:      lo.ToPtr(store.StatusRunning),
-			DeadlineIn:  lo.ToPtr(-3 * time.Minute),
-			Attempt:     lo.ToPtr(1),
-			MaxAttempts: lo.ToPtr(3),
+			Kind:        new(int16(1)),
+			Status:      new(store.StatusRunning),
+			DeadlineIn:  new(-3 * time.Minute),
+			Attempt:     new(1),
+			MaxAttempts: new(3),
 		}).ID
 		first := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Kind:        lo.ToPtr(int16(1)),
-			Status:      lo.ToPtr(store.StatusRunning),
-			DeadlineIn:  lo.ToPtr(-2 * time.Minute),
-			Attempt:     lo.ToPtr(1),
-			MaxAttempts: lo.ToPtr(3),
+			Kind:        new(int16(1)),
+			Status:      new(store.StatusRunning),
+			DeadlineIn:  new(-2 * time.Minute),
+			Attempt:     new(1),
+			MaxAttempts: new(3),
 		}).ID
 		s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Kind:        lo.ToPtr(int16(1)),
-			Status:      lo.ToPtr(store.StatusRunning),
-			DeadlineIn:  lo.ToPtr(-time.Minute),
-			Attempt:     lo.ToPtr(1),
-			MaxAttempts: lo.ToPtr(3),
+			Kind:        new(int16(1)),
+			Status:      new(store.StatusRunning),
+			DeadlineIn:  new(-time.Minute),
+			Attempt:     new(1),
+			MaxAttempts: new(3),
 		})
 		tx, err := s.Pool.Begin(s.ctx)
 		s.Require().NoError(err)
@@ -123,11 +122,11 @@ func (s *rescueSuite) TestStore_Rescue() {
 
 	s.Run("nothing expired", func() {
 		s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Kind:        lo.ToPtr(int16(1)),
-			Status:      lo.ToPtr(store.StatusRunning),
-			DeadlineIn:  lo.ToPtr(time.Hour),
-			Attempt:     lo.ToPtr(1),
-			MaxAttempts: lo.ToPtr(3),
+			Kind:        new(int16(1)),
+			Status:      new(store.StatusRunning),
+			DeadlineIn:  new(time.Hour),
+			Attempt:     new(1),
+			MaxAttempts: new(3),
 		})
 		n, err := s.st.Rescue(s.ctx, 10, func(store.StuckJob) store.RescueDecision {
 			s.Fail("decide called")

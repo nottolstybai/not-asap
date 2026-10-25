@@ -3,7 +3,6 @@ package notasap
 import (
 	"testing"
 
-	"github.com/samber/lo"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/nottolstybai/not-asap/internal/pgtest"
@@ -36,8 +35,8 @@ func (s *cancelSuite) TestClient_Cancel() {
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
 			id := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-				Kind:   lo.ToPtr(int16(kindA)),
-				Status: lo.ToPtr(int16(tt.status)),
+				Kind:   new(int16(kindA)),
+				Status: new(int16(tt.status)),
 			}).ID
 
 			err := c.Cancel(s.ctx, id)

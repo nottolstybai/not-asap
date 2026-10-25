@@ -3,7 +3,6 @@ package store_test
 import (
 	"testing"
 
-	"github.com/samber/lo"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/nottolstybai/not-asap/internal/pgtest"
@@ -33,7 +32,7 @@ func (s *cancelSuite) TestStore_Cancel() {
 	}
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
-			id := s.Fixture.Job(s.ctx, pgtest.JobOpt{Status: lo.ToPtr(tt.status)}).ID
+			id := s.Fixture.Job(s.ctx, pgtest.JobOpt{Status: new(tt.status)}).ID
 			got, err := s.st.Cancel(s.ctx, id)
 			s.Require().NoError(err)
 			s.Equal(tt.want, got)

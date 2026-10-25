@@ -12,7 +12,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/samber/lo"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
@@ -275,8 +274,8 @@ func (s *outcomeSuite) Test_kindPool_execute() {
 			return nil
 		}, KindConfig{Name: "a"})})
 		id := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Kind:    lo.ToPtr(int16(kindA)),
-			Payload: lo.ToPtr(`{"n":"str"}`),
+			Kind:    new(int16(kindA)),
+			Payload: new(`{"n":"str"}`),
 		}).ID
 
 		row := pgtest.WaitStatus(&s.Suite, id, StatusFailed)

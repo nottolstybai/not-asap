@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/samber/lo"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/nottolstybai/not-asap/internal/pgtest"
@@ -36,23 +35,23 @@ func (s *claimSuite) TestStore_Claim() {
 		// run_at order differs from id order: latest has the lowest id, the two
 		// ties share one NOW() and so an exact run_at.
 		latest := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Kind:  lo.ToPtr(int16(1)),
-			RunIn: lo.ToPtr(-time.Second),
+			Kind:  new(int16(1)),
+			RunIn: new(-time.Second),
 		}).ID
-		ties := s.Fixture.Jobs(s.ctx, 2, pgtest.JobOpt{RunIn: lo.ToPtr(-3 * time.Second)})
+		ties := s.Fixture.Jobs(s.ctx, 2, pgtest.JobOpt{RunIn: new(-3 * time.Second)})
 		slices.SortFunc(ties, func(a, b pgtest.JobRow) int { return cmp.Compare(a.ID, b.ID) }) // RETURNING order is not guaranteed
 		tieLow, tieHigh := ties[0].ID, ties[1].ID
 		mid := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Kind:  lo.ToPtr(int16(1)),
-			RunIn: lo.ToPtr(-2 * time.Second),
+			Kind:  new(int16(1)),
+			RunIn: new(-2 * time.Second),
 		}).ID
 		s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Kind:  lo.ToPtr(int16(2)),
-			RunIn: lo.ToPtr(-10 * time.Second),
+			Kind:  new(int16(2)),
+			RunIn: new(-10 * time.Second),
 		})
 		s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Kind:  lo.ToPtr(int16(1)),
-			RunIn: lo.ToPtr(time.Hour),
+			Kind:  new(int16(1)),
+			RunIn: new(time.Hour),
 		})
 
 		// LIMIT 1 on the tie: the id tie-break picks the lower id.
@@ -86,8 +85,8 @@ func (s *claimSuite) TestStore_Claim() {
 
 	s.Run("skips locked", func() {
 		s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Kind:  lo.ToPtr(int16(1)),
-			RunIn: lo.ToPtr(-time.Second),
+			Kind:  new(int16(1)),
+			RunIn: new(-time.Second),
 		})
 		tx, err := s.Pool.Begin(s.ctx)
 		s.Require().NoError(err)
@@ -105,8 +104,8 @@ func (s *claimSuite) TestStore_Claim() {
 func (s *claimSuite) claimOne() store.ClaimedJob {
 	s.T().Helper()
 	s.Fixture.Job(s.ctx, pgtest.JobOpt{
-		Kind:  lo.ToPtr(int16(1)),
-		RunIn: lo.ToPtr(-time.Second),
+		Kind:  new(int16(1)),
+		RunIn: new(-time.Second),
 	})
 	jobs, err := s.st.Claim(s.ctx, 1, 1, time.Minute)
 	s.Require().NoError(err)

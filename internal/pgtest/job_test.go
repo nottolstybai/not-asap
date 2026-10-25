@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/samber/lo"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/nottolstybai/not-asap/internal/pgtest"
@@ -49,9 +48,9 @@ func (s *jobSuite) TestFixture_Job() {
 
 func (s *jobSuite) TestFixture_Job_RunningPreset() {
 	id := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-		Kind:       lo.ToPtr(int16(myKind(7))),
-		Status:     lo.ToPtr(store.StatusRunning),
-		DeadlineIn: lo.ToPtr(-time.Minute),
+		Kind:       new(int16(myKind(7))),
+		Status:     new(store.StatusRunning),
+		DeadlineIn: new(-time.Minute),
 	}).ID
 	row := s.GetJob(id)
 	now := s.DBNow()
@@ -66,15 +65,15 @@ func (s *jobSuite) TestFixture_Job_RunningPreset() {
 
 func (s *jobSuite) TestFixture_Job_Options() {
 	id := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-		Payload:     lo.ToPtr(`{"n":1}`),
-		Attempt:     lo.ToPtr(2),
-		MaxAttempts: lo.ToPtr(9),
-		Lease:       lo.ToPtr(int64(4)),
-		RunIn:       lo.ToPtr(time.Hour),
-		Key:         lo.ToPtr("k"),
-		Error:       lo.ToPtr("boom"),
-		Status:      lo.ToPtr(store.StatusDone),
-		UpdatedAgo:  lo.ToPtr(25 * time.Hour),
+		Payload:     new(`{"n":1}`),
+		Attempt:     new(2),
+		MaxAttempts: new(9),
+		Lease:       new(int64(4)),
+		RunIn:       new(time.Hour),
+		Key:         new("k"),
+		Error:       new("boom"),
+		Status:      new(store.StatusDone),
+		UpdatedAgo:  new(25 * time.Hour),
 	}).ID
 	row := s.GetJob(id)
 	now := s.DBNow()
@@ -92,7 +91,7 @@ func (s *jobSuite) TestFixture_Job_Options() {
 }
 
 func (s *jobSuite) TestFixture_Jobs() {
-	rows := s.Fixture.Jobs(s.ctx, 3, pgtest.JobOpt{RunIn: lo.ToPtr(-3 * time.Second)})
+	rows := s.Fixture.Jobs(s.ctx, 3, pgtest.JobOpt{RunIn: new(-3 * time.Second)})
 	s.Require().Len(rows, 3)
 	a, b, c := s.GetJob(rows[0].ID), s.GetJob(rows[1].ID), s.GetJob(rows[2].ID)
 	s.True(a.RunAt.Equal(b.RunAt))
@@ -103,18 +102,18 @@ func (s *jobSuite) TestFixture_Jobs() {
 
 func (s *jobSuite) TestFixture_SetJob() {
 	id := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-		Payload:     lo.ToPtr(`{"a":1}`),
-		Attempt:     lo.ToPtr(1),
-		MaxAttempts: lo.ToPtr(5),
-		Key:         lo.ToPtr("k"),
-		RunIn:       lo.ToPtr(time.Hour),
+		Payload:     new(`{"a":1}`),
+		Attempt:     new(1),
+		MaxAttempts: new(5),
+		Key:         new("k"),
+		RunIn:       new(time.Hour),
 	}).ID
 	before := s.GetJob(id)
 
 	s.Fixture.SetJob(s.ctx, id, pgtest.JobOpt{
-		Status:     lo.ToPtr(store.StatusFailed),
-		Error:      lo.ToPtr("x"),
-		DeadlineIn: lo.ToPtr(-time.Minute),
+		Status:     new(store.StatusFailed),
+		Error:      new("x"),
+		DeadlineIn: new(-time.Minute),
 	})
 	after := s.GetJob(id)
 	s.Equal(store.StatusFailed, after.Status)
@@ -135,8 +134,8 @@ func (s *jobSuite) TestFixture_SetJob() {
 
 func (s *jobSuite) TestSuite_ExistsAndCountJobs() {
 	id := s.Fixture.Job(s.ctx).ID
-	s.Fixture.Job(s.ctx, pgtest.JobOpt{Status: lo.ToPtr(store.StatusDone)})
-	s.Fixture.Job(s.ctx, pgtest.JobOpt{Status: lo.ToPtr(store.StatusFailed)})
+	s.Fixture.Job(s.ctx, pgtest.JobOpt{Status: new(store.StatusDone)})
+	s.Fixture.Job(s.ctx, pgtest.JobOpt{Status: new(store.StatusFailed)})
 	s.True(s.Exists(id))
 	s.False(s.Exists(-1))
 	s.Equal(3, s.CountJobs())
@@ -169,13 +168,13 @@ func (s *jobSuite) Test_WaitStatus() {
 
 func (s *jobSuite) TestFixture_SetJob_RunningKeepsOtherColumns() {
 	id := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-		Attempt:     lo.ToPtr(2),
-		MaxAttempts: lo.ToPtr(5),
-		Lease:       lo.ToPtr(int64(4)),
+		Attempt:     new(2),
+		MaxAttempts: new(5),
+		Lease:       new(int64(4)),
 	}).ID
 	s.Fixture.SetJob(s.ctx, id, pgtest.JobOpt{
-		Status:     lo.ToPtr(store.StatusRunning),
-		DeadlineIn: lo.ToPtr(-time.Minute),
+		Status:     new(store.StatusRunning),
+		DeadlineIn: new(-time.Minute),
 	})
 	row := s.GetJob(id)
 	s.Equal(store.StatusRunning, row.Status)
@@ -188,17 +187,17 @@ func (s *jobSuite) TestFixture_SetJob_RunningKeepsOtherColumns() {
 
 func (s *jobSuite) TestFixture_Job_RunningDefaults() {
 	row := s.GetJob(s.Fixture.Job(s.ctx, pgtest.JobOpt{
-		Status:     lo.ToPtr(store.StatusRunning),
-		DeadlineIn: lo.ToPtr(time.Minute),
+		Status:     new(store.StatusRunning),
+		DeadlineIn: new(time.Minute),
 	}).ID)
 	s.Equal(1, row.Attempt)
 	s.Equal(int64(1), row.Lease)
 	row = s.GetJob(s.Fixture.Job(s.ctx, pgtest.JobOpt{
-		Status:      lo.ToPtr(store.StatusRunning),
-		DeadlineIn:  lo.ToPtr(time.Minute),
-		Attempt:     lo.ToPtr(2),
-		MaxAttempts: lo.ToPtr(3),
-		Lease:       lo.ToPtr(int64(7)),
+		Status:      new(store.StatusRunning),
+		DeadlineIn:  new(time.Minute),
+		Attempt:     new(2),
+		MaxAttempts: new(3),
+		Lease:       new(int64(7)),
 	}).ID)
 	s.Equal(2, row.Attempt)
 	s.Equal(int64(7), row.Lease)

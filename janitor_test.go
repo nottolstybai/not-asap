@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/samber/lo"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/nottolstybai/not-asap/internal/pgtest"
@@ -26,20 +25,20 @@ func TestJanitor(t *testing.T) {
 func (s *janitorSuite) TestClient_clean() {
 	s.Run("default retention", func() {
 		doneOld := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Status:     lo.ToPtr(store.StatusDone),
-			UpdatedAgo: lo.ToPtr(25 * time.Hour),
+			Status:     new(store.StatusDone),
+			UpdatedAgo: new(25 * time.Hour),
 		}).ID
 		cancelledOld := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Status:     lo.ToPtr(store.StatusCancelled),
-			UpdatedAgo: lo.ToPtr(25 * time.Hour),
+			Status:     new(store.StatusCancelled),
+			UpdatedAgo: new(25 * time.Hour),
 		}).ID
 		doneNew := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Status:     lo.ToPtr(store.StatusDone),
-			UpdatedAgo: lo.ToPtr(time.Hour),
+			Status:     new(store.StatusDone),
+			UpdatedAgo: new(time.Hour),
 		}).ID
 		failedOld := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Status:     lo.ToPtr(store.StatusFailed),
-			UpdatedAgo: lo.ToPtr(30 * 24 * time.Hour),
+			Status:     new(store.StatusFailed),
+			UpdatedAgo: new(30 * 24 * time.Hour),
 		}).ID
 
 		s.newClient(nil).clean(s.ctx)
@@ -51,16 +50,16 @@ func (s *janitorSuite) TestClient_clean() {
 
 	s.Run("custom retention merged", func() {
 		doneOld := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Status:     lo.ToPtr(store.StatusDone),
-			UpdatedAgo: lo.ToPtr(2 * time.Minute),
+			Status:     new(store.StatusDone),
+			UpdatedAgo: new(2 * time.Minute),
 		}).ID
 		cancelledOld := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Status:     lo.ToPtr(store.StatusCancelled),
-			UpdatedAgo: lo.ToPtr(25 * time.Hour),
+			Status:     new(store.StatusCancelled),
+			UpdatedAgo: new(25 * time.Hour),
 		}).ID
 		cancelledNew := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Status:     lo.ToPtr(store.StatusCancelled),
-			UpdatedAgo: lo.ToPtr(time.Hour),
+			Status:     new(store.StatusCancelled),
+			UpdatedAgo: new(time.Hour),
 		}).ID
 
 		s.newClient(nil, WithJanitor(JanitorConfig{
@@ -73,8 +72,8 @@ func (s *janitorSuite) TestClient_clean() {
 
 	s.Run("batches", func() {
 		s.Fixture.Jobs(s.ctx, 25, pgtest.JobOpt{
-			Status:     lo.ToPtr(store.StatusDone),
-			UpdatedAgo: lo.ToPtr(25 * time.Hour),
+			Status:     new(store.StatusDone),
+			UpdatedAgo: new(25 * time.Hour),
 		})
 		c := s.newClient(nil, WithJanitor(JanitorConfig{BatchSize: 10}))
 
@@ -90,8 +89,8 @@ func (s *janitorSuite) TestClient_janitorLoop() {
 	// (unit) is the real check.
 	s.Run("disabled smoke", func() {
 		s.Fixture.Jobs(s.ctx, 2, pgtest.JobOpt{
-			Status:     lo.ToPtr(store.StatusDone),
-			UpdatedAgo: lo.ToPtr(25 * time.Hour),
+			Status:     new(store.StatusDone),
+			UpdatedAgo: new(25 * time.Hour),
 		})
 
 		c := s.startClient(nil, WithJanitor(JanitorConfig{Disabled: true}))
@@ -102,8 +101,8 @@ func (s *janitorSuite) TestClient_janitorLoop() {
 
 	s.Run("stop interrupts pass", func() {
 		s.Fixture.Jobs(s.ctx, 5000, pgtest.JobOpt{
-			Status:     lo.ToPtr(store.StatusDone),
-			UpdatedAgo: lo.ToPtr(25 * time.Hour),
+			Status:     new(store.StatusDone),
+			UpdatedAgo: new(25 * time.Hour),
 		})
 
 		c := s.startClient(nil, WithJanitor(JanitorConfig{BatchSize: 1}))

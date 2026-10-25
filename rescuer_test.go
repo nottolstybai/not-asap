@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/samber/lo"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/nottolstybai/not-asap/internal/pgtest"
@@ -34,11 +33,11 @@ func (s *rescuerSuite) TestClient_rescue() {
 			Backoff: Constant(time.Hour),
 		})})
 		id := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Kind:        lo.ToPtr(int16(kindA)),
-			Status:      lo.ToPtr(store.StatusRunning),
-			DeadlineIn:  lo.ToPtr(-time.Minute),
-			Attempt:     lo.ToPtr(1),
-			MaxAttempts: lo.ToPtr(3),
+			Kind:        new(int16(kindA)),
+			Status:      new(store.StatusRunning),
+			DeadlineIn:  new(-time.Minute),
+			Attempt:     new(1),
+			MaxAttempts: new(3),
 		}).ID
 
 		c.rescue(s.ctx)
@@ -56,11 +55,11 @@ func (s *rescuerSuite) TestClient_rescue() {
 	s.Run("fails without attempts left", func() {
 		c := s.newClient([]kindReg{reg(noop[payloadA], KindConfig{Name: "a"})})
 		id := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Kind:        lo.ToPtr(int16(kindA)),
-			Status:      lo.ToPtr(store.StatusRunning),
-			DeadlineIn:  lo.ToPtr(-time.Minute),
-			Attempt:     lo.ToPtr(3),
-			MaxAttempts: lo.ToPtr(3),
+			Kind:        new(int16(kindA)),
+			Status:      new(store.StatusRunning),
+			DeadlineIn:  new(-time.Minute),
+			Attempt:     new(3),
+			MaxAttempts: new(3),
 		}).ID
 
 		c.rescue(s.ctx)
@@ -76,11 +75,11 @@ func (s *rescuerSuite) TestClient_rescue() {
 	s.Run("ignores live deadline", func() {
 		c := s.newClient([]kindReg{reg(noop[payloadA], KindConfig{Name: "a"})})
 		id := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Kind:        lo.ToPtr(int16(kindA)),
-			Status:      lo.ToPtr(store.StatusRunning),
-			DeadlineIn:  lo.ToPtr(time.Hour),
-			Attempt:     lo.ToPtr(1),
-			MaxAttempts: lo.ToPtr(3),
+			Kind:        new(int16(kindA)),
+			Status:      new(store.StatusRunning),
+			DeadlineIn:  new(time.Hour),
+			Attempt:     new(1),
+			MaxAttempts: new(3),
 		}).ID
 		before := s.GetJob(id)
 
@@ -96,11 +95,11 @@ func (s *rescuerSuite) TestClient_rescue() {
 		})},
 			WithDefaults(KindConfig{Backoff: Constant(2 * time.Hour)}))
 		id := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Kind:        lo.ToPtr(int16(unknownPayload{}.Kind())),
-			Status:      lo.ToPtr(store.StatusRunning),
-			DeadlineIn:  lo.ToPtr(-time.Minute),
-			Attempt:     lo.ToPtr(1),
-			MaxAttempts: lo.ToPtr(3),
+			Kind:        new(int16(unknownPayload{}.Kind())),
+			Status:      new(store.StatusRunning),
+			DeadlineIn:  new(-time.Minute),
+			Attempt:     new(1),
+			MaxAttempts: new(3),
 		}).ID
 
 		c.rescue(s.ctx)
@@ -175,7 +174,7 @@ func (s *rescuerSuite) TestClient_rescue_StaleWorker() {
 		id := s.schedule(c, payloadA{})
 		recv(s.T(), started)
 
-		s.Fixture.SetJob(s.ctx, id, pgtest.JobOpt{DeadlineIn: lo.ToPtr(-time.Minute)})
+		s.Fixture.SetJob(s.ctx, id, pgtest.JobOpt{DeadlineIn: new(-time.Minute)})
 		c.rescue(s.ctx)
 		row := pgtest.WaitStatus(&s.Suite, id, StatusPending)
 		s.Equal(1, row.Attempt)
@@ -219,7 +218,7 @@ func (s *rescuerSuite) TestClient_rescue_StaleWorker() {
 		id := s.schedule(c, payloadA{})
 		recv(s.T(), startedStale)
 
-		s.Fixture.SetJob(s.ctx, id, pgtest.JobOpt{DeadlineIn: lo.ToPtr(-time.Minute)})
+		s.Fixture.SetJob(s.ctx, id, pgtest.JobOpt{DeadlineIn: new(-time.Minute)})
 		c.rescue(s.ctx)
 		// The rescued job is due at once (backoff 0) and claimed again with
 		// lease 2; its new deadline is an hour away, so no further rescue.

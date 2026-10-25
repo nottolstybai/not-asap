@@ -11,7 +11,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/samber/lo"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
@@ -184,11 +183,11 @@ func (s *scheduleSuite) seedKey(c *testClient, key string, st Status) int64 {
 	id, err := c.Schedule(s.ctx, payloadA{Msg: "old"}, WithIdempotencyKey(key))
 	s.Require().NoError(err)
 	s.Fixture.SetJob(s.ctx, id, pgtest.JobOpt{
-		Status:      lo.ToPtr(int16(st)),
-		Attempt:     lo.ToPtr(2),
-		MaxAttempts: lo.ToPtr(99),
-		Error:       lo.ToPtr("boom"),
-		DeadlineIn:  lo.ToPtr(time.Duration(0)),
+		Status:      new(int16(st)),
+		Attempt:     new(2),
+		MaxAttempts: new(99),
+		Error:       new("boom"),
+		DeadlineIn:  new(time.Duration(0)),
 	})
 	return id
 }
@@ -250,8 +249,8 @@ func (s *scheduleSuite) TestClient_Schedule_Idempotency() {
 		id, err := c.Schedule(s.ctx, payloadA{Msg: "old"}, WithIdempotencyKey("k"))
 		s.Require().NoError(err)
 		s.Fixture.SetJob(s.ctx, id, pgtest.JobOpt{
-			Status: lo.ToPtr(int16(StatusRunning)),
-			Lease:  lo.ToPtr(int64(1)),
+			Status: new(int16(StatusRunning)),
+			Lease:  new(int64(1)),
 		})
 
 		tx, err := s.Pool.Begin(s.ctx)
@@ -278,8 +277,8 @@ func (s *scheduleSuite) TestClient_Schedule_Idempotency() {
 		id, err := c.Schedule(s.ctx, payloadA{Msg: "old"}, WithIdempotencyKey("k"))
 		s.Require().NoError(err)
 		s.Fixture.SetJob(s.ctx, id, pgtest.JobOpt{
-			Status: lo.ToPtr(int16(StatusFailed)),
-			Error:  lo.ToPtr("boom"),
+			Status: new(int16(StatusFailed)),
+			Error:  new("boom"),
 		})
 
 		tx, err := s.Pool.Begin(s.ctx)
@@ -357,7 +356,7 @@ func (s *scheduleSuite) TestClient_ScheduleBatch() {
 		s.Require().NoError(err)
 		runID, err := c.Schedule(s.ctx, payloadA{}, WithIdempotencyKey("run"))
 		s.Require().NoError(err)
-		s.Fixture.SetJob(s.ctx, runID, pgtest.JobOpt{Status: lo.ToPtr(int16(StatusRunning))})
+		s.Fixture.SetJob(s.ctx, runID, pgtest.JobOpt{Status: new(int16(StatusRunning))})
 
 		res, err := c.ScheduleBatch(s.ctx,
 			Item(payloadA{Msg: "new"}),
@@ -479,7 +478,7 @@ func (s *scheduleSuite) TestClient_ScheduleBatch() {
 		for _, k := range []string{"k1", "k2"} {
 			id, err := c.Schedule(s.ctx, payloadA{Msg: "old"}, WithIdempotencyKey(k))
 			s.Require().NoError(err)
-			s.Fixture.SetJob(s.ctx, id, pgtest.JobOpt{Status: lo.ToPtr(int16(StatusDone))})
+			s.Fixture.SetJob(s.ctx, id, pgtest.JobOpt{Status: new(int16(StatusDone))})
 		}
 		resB, idA1, idA2 := s.oppositeKeyOrder(c, WithReplace())
 		s.Equal(idA2, resB[0].ID)

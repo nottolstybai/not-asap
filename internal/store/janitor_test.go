@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 
@@ -25,26 +24,26 @@ func TestJanitor(t *testing.T) {
 
 func (s *janitorSuite) TestStore_DeleteFinished() {
 	oldest := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-		Status:     lo.ToPtr(store.StatusDone),
-		UpdatedAgo: lo.ToPtr(5 * time.Hour),
+		Status:     new(store.StatusDone),
+		UpdatedAgo: new(5 * time.Hour),
 	}).ID
 	older := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-		Status:     lo.ToPtr(store.StatusDone),
-		UpdatedAgo: lo.ToPtr(4 * time.Hour),
+		Status:     new(store.StatusDone),
+		UpdatedAgo: new(4 * time.Hour),
 	}).ID
 	old := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-		Status:     lo.ToPtr(store.StatusDone),
-		UpdatedAgo: lo.ToPtr(3 * time.Hour),
+		Status:     new(store.StatusDone),
+		UpdatedAgo: new(3 * time.Hour),
 	}).ID
 	fresh := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-		Status:     lo.ToPtr(store.StatusDone),
-		UpdatedAgo: lo.ToPtr(time.Minute),
+		Status:     new(store.StatusDone),
+		UpdatedAgo: new(time.Minute),
 	}).ID
 	failed := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-		Status:     lo.ToPtr(store.StatusFailed),
-		UpdatedAgo: lo.ToPtr(5 * time.Hour),
+		Status:     new(store.StatusFailed),
+		UpdatedAgo: new(5 * time.Hour),
 	}).ID
-	pending := s.Fixture.Job(s.ctx, pgtest.JobOpt{UpdatedAgo: lo.ToPtr(5 * time.Hour)}).ID
+	pending := s.Fixture.Job(s.ctx, pgtest.JobOpt{UpdatedAgo: new(5 * time.Hour)}).ID
 
 	n, err := s.st.DeleteFinished(s.ctx, store.StatusDone, time.Hour, 2)
 	s.Require().NoError(err)
@@ -89,8 +88,8 @@ func (s *janitorSuite) holdJanitorLock(pool *pgxpool.Pool) (release func()) {
 
 func (s *janitorSuite) TestStore_DeleteFinished_SkipsWhileLocked() {
 	id := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-		Status:     lo.ToPtr(store.StatusDone),
-		UpdatedAgo: lo.ToPtr(3 * time.Hour),
+		Status:     new(store.StatusDone),
+		UpdatedAgo: new(3 * time.Hour),
 	}).ID
 	release := s.holdJanitorLock(s.Pool)
 

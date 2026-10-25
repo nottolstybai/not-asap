@@ -104,7 +104,7 @@ func (f *Fixture) Jobs(ctx context.Context, n int, opts ...JobOpt) []JobRow {
 
 	var deadline *float64
 	if o.DeadlineIn != nil {
-		deadline = lo.ToPtr(o.DeadlineIn.Seconds())
+		deadline = new(o.DeadlineIn.Seconds())
 	}
 
 	rows, err := f.pool.Query(ctx, insertJobSQL,

@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/samber/lo"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/nottolstybai/not-asap/internal/pgtest"
@@ -31,8 +30,8 @@ func (s *insertSuite) TestStore_Insert_OutcomesInParamsOrder() {
 		{Kind: 1, Payload: []byte("{}"), MaxAttempts: 3, Key: key("run")},
 	})
 	s.Require().NoError(err)
-	s.Fixture.SetJob(s.ctx, seed[1].ID, pgtest.JobOpt{Status: lo.ToPtr(store.StatusDone)})
-	s.Fixture.SetJob(s.ctx, seed[2].ID, pgtest.JobOpt{Status: lo.ToPtr(store.StatusRunning)})
+	s.Fixture.SetJob(s.ctx, seed[1].ID, pgtest.JobOpt{Status: new(store.StatusDone)})
+	s.Fixture.SetJob(s.ctx, seed[2].ID, pgtest.JobOpt{Status: new(store.StatusRunning)})
 
 	res, err := s.st.Insert(s.ctx, s.Pool, []store.InsertParams{
 		{Kind: 2, Payload: []byte("{}"), MaxAttempts: 3, Key: key("dup")},
@@ -84,8 +83,8 @@ func (s *insertSuite) TestStore_Insert_ReplaceClaimedMeanwhile() {
 	// check, and returns the transaction and the new lease.
 	claim := func() (pgx.Tx, int64, int64) {
 		id := s.Fixture.Job(s.ctx, pgtest.JobOpt{
-			Kind: lo.ToPtr(int16(1)),
-			Key:  lo.ToPtr(key),
+			Kind: new(int16(1)),
+			Key:  new(key),
 		}).ID
 		tx, err := s.Pool.Begin(s.ctx)
 		s.Require().NoError(err)
