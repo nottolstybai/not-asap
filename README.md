@@ -332,14 +332,16 @@ err := client.Stop(ctx)  // graceful shutdown
 1. Stops claiming new jobs and stops the background loops.
    A claim already in flight finishes first (up to 10 s), and its jobs are run.
 2. Waits for running handlers until `ctx` is done, then for the writes of their results.
-   When `Stop` returns `nil`, every result is saved.
+   When `Stop` returns `nil`, a write of every result has been attempted; a write that failed is
+   logged (`write job status`) and the rescuer recovers its job.
 3. If `ctx` expires, cancels the handlers, waits `StopGrace` for them to return and their results
    to be saved, and returns `ctx.Err()`. Interrupted jobs go back to `pending` without losing an attempt.
 
 A second concurrent `Stop` waits for the first one, so `defer pool.Close()` is safe.
-If `Stop` returns `ctx.Err()`, handlers that were still running save their result after it returns,
-and a result write already in flight may retry for up to 10 s. Keep the pool open that long, or the write
-fails and the rescuer recovers the job.
+If `Stop` returns `ctx.Err()`, writes may go on after it returns: results still queued (up to 4000,
+that is several batches, each retried for up to 10 s), rows waiting for a lock held by another transaction,
+and the results of handlers that were still running, which they write themselves. Keep the pool open until
+then, or those writes fail and the rescuer recovers the jobs.
 
 ## Reliability
 
@@ -407,11 +409,18 @@ In each replica the pollers, the rescuer and the janitor use up to kinds + 2 con
 Job results are saved in batches by one writer: a result is written at once if no write is in flight,
 otherwise it joins the next write (up to 1000 jobs in one statement). If 4000 results are already
 waiting, a finished handler keeps its worker slot until there is room, so claiming slows down with the
-database. The writer holds one more connection, so plan for kinds + 3, each held for milliseconds. Your handlers' queries come on top of that.
+database. The writer holds one more connection and the second writer described below one more, so plan for kinds + 4,
+each held for milliseconds unless the second writer waits for a lock. Your handlers' queries come on top of that.
+A batch skips rows locked by another transaction; such rows, and rows whose lease looks lost, are written
+one at a time by a second writer that waits for the lock, so the batches go on meanwhile. Once `Stop` has
+closed the writers, each late handler writes its result itself, on a connection of its own.
 A status write that gets no connection within 10 s, retries included, is lost for every job in the batch
-(`write job status` in the log), and those jobs run again after `Timeout + Grace`.
+(`write job statuses` in the log at Warn, each job at Debug), and those jobs run again after
+`Timeout + Grace`. A batch rejected for another reason, such as one bad row, is written again row by row,
+so only the bad row is lost (`write job status` at Warn).
 
-- Give notasap its own `pgxpool` with `MaxConns` of at least kinds + 3, or size the shared pool for kinds + 3 plus your handlers.
+- Give notasap its own `pgxpool` with `MaxConns` of at least kinds + 4, or size the shared pool for kinds + 4 plus your handlers
+  (plus one per handler that may outlive `Stop`).
 - `Start` logs a warning when `MaxConns` is below kinds + 2.
 - In a handler that holds a transaction, use `ScheduleTx`: `Schedule` and `Cancel` take a second connection,
   and many such handlers at once can exhaust the pool. Worse, if that transaction already locks the key or row

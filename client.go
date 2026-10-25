@@ -181,15 +181,17 @@ func (c *Client) startMaintenance() {
 // Stop stops polling and maintenance and waits until ctx is done for running
 // handlers and then for the writes of their results. If ctx is done first,
 // it cancels handler contexts, waits up to the stop grace for handlers to
-// return and their results to be written, and returns ctx.Err(); it returns
-// nil only if all handlers had returned and all results are written by then.
-// Handlers that ignore their context may still be running after Stop
-// returns, and a result write still in flight may retry for up to 10s
-// (dbCallTimeout); keep the pool open that long, or the write fails and the
-// rescuer recovers the job. When Stop returns nil, all status writes are
-// done. Stop on a Client that was never started returns nil. A later Stop
-// waits until the first one returns, then returns nil, or returns ctx.Err()
-// if ctx is done first.
+// return and their results to be written, and returns ctx.Err(). Stop returns
+// nil only if all handlers had returned and every status write had been
+// attempted by then; a write that failed is logged and its job is recovered
+// by the rescuer. When Stop returns ctx.Err(), writing may go on after it
+// returns: the queued results (up to 4000, several batches, each retried for
+// up to 10s, dbCallTimeout), rows waiting for a lock held by another
+// transaction, and the results of handlers still running, which they write
+// directly. Keep the pool open until then, or those writes fail and the
+// rescuer recovers the jobs. Stop on a Client that was never started returns
+// nil. A later Stop waits until the first one returns, then returns nil, or
+// returns ctx.Err() if ctx is done first.
 func (c *Client) Stop(ctx context.Context) error {
 	c.mu.Lock()
 	prev := c.state
