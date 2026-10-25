@@ -153,6 +153,12 @@ func (s *Suite) SetupTest() {
 	s.Exec("TRUNCATE notasap_jobs")
 }
 
+// SetupSubTest empties the table before every s.Run subtest too, so
+// subtests do not see each other's rows.
+func (s *Suite) SetupSubTest() {
+	s.Exec("TRUNCATE notasap_jobs")
+}
+
 // Exec runs SQL on the suite pool and requires success.
 func (s *Suite) Exec(sql string, args ...any) {
 	s.T().Helper()

@@ -3,7 +3,6 @@ package notasap_test
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,231 +15,462 @@ import (
 
 	notasap "github.com/nottolstybai/not-asap"
 	"github.com/nottolstybai/not-asap/internal/pgtest"
+	"github.com/nottolstybai/not-asap/internal/store"
 )
 
 type ScheduleSuite struct {
-	pgtest.Suite
+	clientSuite
 }
 
 func TestScheduleSuite(t *testing.T) {
 	suite.Run(t, new(ScheduleSuite))
 }
 
-func (s *ScheduleSuite) newClient(opts ...notasap.Option) *notasap.Client {
-	c, err := notasap.New(s.Pool, opts...)
-	s.Require().NoError(err)
-	s.Require().NoError(notasap.Register(c, noop[payloadA], notasap.KindConfig{Name: "a", MaxAttempts: 7}))
-	s.Require().NoError(notasap.Register(c, noop[payloadB], notasap.KindConfig{Name: "b"}))
-	return c
+// client returns an unstarted client with kinds a (MaxAttempts 7) and b.
+func (s *ScheduleSuite) client(opts ...notasap.Option) *testClient {
+	s.T().Helper()
+	return s.newClient([]kindReg{
+		reg(noop[payloadA], notasap.KindConfig{Name: "a", MaxAttempts: 7}),
+		reg(noop[payloadB], notasap.KindConfig{Name: "b"}),
+	}, opts...)
 }
 
-func (s *ScheduleSuite) dbNow() time.Time {
-	var now time.Time
-	s.Require().NoError(s.Pool.QueryRow(context.Background(), "SELECT now()").Scan(&now))
-	return now
-}
-
-func (s *ScheduleSuite) TestScheduleInsertsRow() {
-	c := s.newClient()
-	p := payloadA{Msg: "hello", N: 3}
-	id, err := c.Schedule(context.Background(), p)
-	s.Require().NoError(err)
-
-	row := s.Job(id)
-	s.Equal(int16(kindA), row.Kind)
-	s.Equal(int16(notasap.StatusPending), row.Status)
-	s.Equal(0, row.Attempt)
-	s.Equal(7, row.MaxAttempts)
-	s.Nil(row.Key)
-	want, err := json.Marshal(p)
-	s.Require().NoError(err)
-	s.JSONEq(string(want), string(row.Payload))
-	s.WithinDuration(s.dbNow(), row.RunAt, time.Second)
-}
-
-func (s *ScheduleSuite) TestScheduleDelay() {
-	c := s.newClient()
-	id, err := c.Schedule(context.Background(), payloadA{}, notasap.WithDelay(time.Hour))
-	s.Require().NoError(err)
-
-	row := s.Job(id)
-	d := row.RunAt.Sub(row.CreatedAt)
-	s.GreaterOrEqual(d, time.Hour-time.Second)
-	s.LessOrEqual(d, time.Hour+time.Second)
-}
-
-func (s *ScheduleSuite) TestUnknownKind() {
-	c := s.newClient()
-	_, err := c.Schedule(context.Background(), unregisteredPayload{})
-	s.Require().ErrorIs(err, notasap.ErrUnknownKind)
-	s.Equal(0, countJobs(&s.Suite))
-}
-
-func (s *ScheduleSuite) TestScheduleTxCommitRollback() {
+func (s *ScheduleSuite) TestSchedule() {
 	ctx := context.Background()
-	c := s.newClient()
+	c := s.client()
 
-	tx, err := s.Pool.Begin(ctx)
-	s.Require().NoError(err)
-	id, err := c.ScheduleTx(ctx, tx, payloadA{Msg: "commit"})
-	s.Require().NoError(err)
-	s.Require().NoError(tx.Commit(ctx))
-	s.Equal(int16(notasap.StatusPending), s.Job(id).Status)
+	s.Run("inserts row", func() {
+		p := payloadA{Msg: "hello", N: 3}
+		id, err := c.Schedule(ctx, p)
+		s.Require().NoError(err)
 
-	tx, err = s.Pool.Begin(ctx)
+		row := s.Job(id)
+		s.Equal(int16(kindA), row.Kind)
+		s.Equal(notasap.StatusPending, notasap.Status(row.Status))
+		s.Equal(0, row.Attempt)
+		s.Equal(7, row.MaxAttempts)
+		s.Nil(row.Key)
+		want, err := json.Marshal(p)
+		s.Require().NoError(err)
+		s.JSONEq(string(want), string(row.Payload))
+		s.WithinDuration(s.DBNow(), row.RunAt, time.Second)
+	})
+	s.Run("delay", func() {
+		id, err := c.Schedule(ctx, payloadA{}, notasap.WithDelay(time.Hour))
+		s.Require().NoError(err)
+
+		row := s.Job(id)
+		d := row.RunAt.Sub(row.CreatedAt)
+		s.GreaterOrEqual(d, time.Hour-time.Second)
+		s.LessOrEqual(d, time.Hour+time.Second)
+	})
+	s.Run("unknown kind", func() {
+		_, err := c.Schedule(ctx, unregisteredPayload{})
+		s.Require().ErrorIs(err, notasap.ErrUnknownKind)
+		s.Equal(0, s.CountJobs())
+	})
+	s.Run("observer counts inserts and replaces", func() {
+		c := s.client()
+		_, err := c.Schedule(ctx, payloadA{}, notasap.WithIdempotencyKey("k"))
+		s.Require().NoError(err)
+		_, err = c.Schedule(ctx, payloadA{Msg: "new"}, notasap.WithIdempotencyKey("k"), notasap.WithReplace())
+		s.Require().NoError(err)
+		_, err = c.Schedule(ctx, payloadA{}, notasap.WithIdempotencyKey("k"))
+		s.Require().ErrorIs(err, notasap.ErrDuplicate)
+
+		s.Equal(2, c.obs.Count("scheduled/a"))
+		s.Equal(0, c.obs.Count("scheduled/b"))
+	})
+}
+
+func (s *ScheduleSuite) TestScheduleTx() {
+	ctx := context.Background()
+	c := s.client()
+
+	s.Run("commit", func() {
+		tx, err := s.Pool.Begin(ctx)
+		s.Require().NoError(err)
+		id, err := c.ScheduleTx(ctx, tx, payloadA{Msg: "commit"})
+		s.Require().NoError(err)
+		s.Require().NoError(tx.Commit(ctx))
+		s.Equal(notasap.StatusPending, s.status(id))
+	})
+	s.Run("rollback", func() {
+		tx, err := s.Pool.Begin(ctx)
+		s.Require().NoError(err)
+		_, err = c.ScheduleTx(ctx, tx, payloadA{Msg: "rollback"})
+		s.Require().NoError(err)
+		s.Require().NoError(tx.Rollback(ctx))
+		s.Equal(0, s.CountJobs())
+	})
+}
+
+// seedKey schedules a job with key and moves it into status st after an
+// attempt that failed, as a worker would leave it.
+func (s *ScheduleSuite) seedKey(c *testClient, key string, st notasap.Status) int64 {
+	s.T().Helper()
+	id, err := c.Schedule(context.Background(), payloadA{Msg: "old"}, notasap.WithIdempotencyKey(key))
 	s.Require().NoError(err)
-	_, err = c.ScheduleTx(ctx, tx, payloadA{Msg: "rollback"})
-	s.Require().NoError(err)
-	s.Require().NoError(tx.Rollback(ctx))
-	s.Equal(1, countJobs(&s.Suite))
+	s.SetJob(id, pgtest.WithStatus(st), pgtest.WithAttempt(2, 99),
+		pgtest.WithError("boom"), pgtest.WithDeadlineIn(0))
+	return id
 }
 
 func (s *ScheduleSuite) TestIdempotency() {
 	ctx := context.Background()
-	c := s.newClient()
-	statuses := []notasap.Status{
-		notasap.StatusPending, notasap.StatusDone, notasap.StatusFailed,
-		notasap.StatusCancelled, notasap.StatusRunning,
+	c := s.client()
+	all := []notasap.Status{
+		notasap.StatusPending, notasap.StatusRunning, notasap.StatusDone,
+		notasap.StatusFailed, notasap.StatusCancelled,
 	}
-	for _, st := range statuses {
-		for _, replace := range []bool{false, true} {
-			s.Run(fmt.Sprintf("%s/replace=%v", st, replace), func() {
-				key := fmt.Sprintf("key-%s-%v", st, replace)
-				origID, err := c.Schedule(ctx, payloadA{Msg: "old"}, notasap.WithIdempotencyKey(key))
-				s.Require().NoError(err)
-				s.Exec(`UPDATE notasap_jobs SET status = $2, attempt = 2, max_attempts = 99,
-					error = 'boom', deadline = NOW() WHERE id = $1`, origID, int16(st))
 
-				opts := []notasap.ScheduleOption{notasap.WithIdempotencyKey(key)}
-				if replace {
-					opts = append(opts, notasap.WithReplace())
-				}
-				id, err := c.Schedule(ctx, payloadA{Msg: "new"}, opts...)
+	s.Run("duplicate keeps existing row", func() {
+		for _, st := range all {
+			s.Run(st.String(), func() {
+				origID := s.seedKey(c, "k", st)
+
+				id, err := c.Schedule(ctx, payloadA{Msg: "new"}, notasap.WithIdempotencyKey("k"))
+				s.Require().ErrorIs(err, notasap.ErrDuplicate)
 				s.Equal(origID, id)
-
 				row := s.Job(origID)
-				switch {
-				case !replace:
-					s.Require().ErrorIs(err, notasap.ErrDuplicate)
-					s.Equal(int16(st), row.Status)
-					s.JSONEq(`{"msg":"old","n":0}`, string(row.Payload))
-				case st == notasap.StatusRunning:
-					s.Require().ErrorIs(err, notasap.ErrJobRunning)
-					s.Equal(int16(st), row.Status)
-					s.JSONEq(`{"msg":"old","n":0}`, string(row.Payload))
-				default:
-					s.Require().NoError(err)
-					s.Equal(int16(notasap.StatusPending), row.Status)
-					s.Equal(0, row.Attempt)
-					s.Equal(7, row.MaxAttempts)
-					s.Nil(row.Error)
-					s.Nil(row.Deadline)
-					s.JSONEq(`{"msg":"new","n":0}`, string(row.Payload))
-				}
+				s.Equal(st, notasap.Status(row.Status))
+				s.JSONEq(`{"msg":"old","n":0}`, string(row.Payload))
+				s.Equal(1, s.CountJobs())
 			})
 		}
-	}
-	s.Equal(len(statuses)*2, countJobs(&s.Suite))
-}
+	})
+	s.Run("replace resets the row", func() {
+		for _, st := range []notasap.Status{
+			notasap.StatusPending, notasap.StatusDone, notasap.StatusFailed, notasap.StatusCancelled,
+		} {
+			s.Run(st.String(), func() {
+				origID := s.seedKey(c, "k", st)
 
-func (s *ScheduleSuite) TestIdempotencySameKeyDifferentKind() {
-	ctx := context.Background()
-	c := s.newClient()
-	idA, err := c.Schedule(ctx, payloadA{}, notasap.WithIdempotencyKey("k"))
-	s.Require().NoError(err)
-	idB, err := c.Schedule(ctx, payloadB{}, notasap.WithIdempotencyKey("k"))
-	s.Require().NoError(err)
-	s.NotEqual(idA, idB)
-	s.Equal(2, countJobs(&s.Suite))
-}
-
-func (s *ScheduleSuite) TestIdempotencyConcurrent() {
-	ctx := context.Background()
-	c := s.newClient()
-	const n = 20
-	ids := make([]int64, n)
-	errs := make([]error, n)
-	start := make(chan struct{})
-	var wg sync.WaitGroup
-	for i := range n {
-		wg.Go(func() {
-			<-start
-			ids[i], errs[i] = c.Schedule(ctx, payloadA{N: i}, notasap.WithIdempotencyKey("same"))
-		})
-	}
-	close(start)
-	wg.Wait()
-
-	var ok, dup int
-	for i := range n {
-		switch {
-		case errs[i] == nil:
-			ok++
-		case s.ErrorIs(errs[i], notasap.ErrDuplicate):
-			dup++
+				id, err := c.Schedule(ctx, payloadA{Msg: "new"}, notasap.WithIdempotencyKey("k"), notasap.WithReplace())
+				s.Require().NoError(err)
+				s.Equal(origID, id)
+				row := s.Job(origID)
+				s.Equal(notasap.StatusPending, notasap.Status(row.Status))
+				s.Equal(0, row.Attempt)
+				s.Equal(7, row.MaxAttempts)
+				s.Nil(row.Error)
+				s.Nil(row.Deadline)
+				s.JSONEq(`{"msg":"new","n":0}`, string(row.Payload))
+				s.Equal(1, s.CountJobs())
+			})
 		}
-		s.Equal(ids[0], ids[i])
+	})
+	s.Run("replace running is refused", func() {
+		origID := s.seedKey(c, "k", notasap.StatusRunning)
+
+		id, err := c.Schedule(ctx, payloadA{Msg: "new"}, notasap.WithIdempotencyKey("k"), notasap.WithReplace())
+		s.Require().ErrorIs(err, notasap.ErrJobRunning)
+		s.Equal(origID, id)
+		row := s.Job(origID)
+		s.Equal(notasap.StatusRunning, notasap.Status(row.Status))
+		s.JSONEq(`{"msg":"old","n":0}`, string(row.Payload))
+	})
+	s.Run("replace running takes no lock", func() {
+		id, err := c.Schedule(ctx, payloadA{Msg: "old"}, notasap.WithIdempotencyKey("k"))
+		s.Require().NoError(err)
+		s.SetJob(id, pgtest.WithStatus(notasap.StatusRunning), pgtest.WithLease(1))
+
+		tx, err := s.Pool.Begin(ctx)
+		s.Require().NoError(err)
+		defer func() { _ = tx.Rollback(ctx) }()
+		got, err := c.ScheduleTx(ctx, tx, payloadA{Msg: "new"}, notasap.WithIdempotencyKey("k"), notasap.WithReplace())
+		s.Require().ErrorIs(err, notasap.ErrJobRunning)
+		s.Equal(id, got)
+
+		// The worker's status write must not wait for tx.
+		finishCtx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		ok, err := store.New(s.Pool).Finish(finishCtx, store.Ref{ID: id, Lease: 1}, store.StatusDone, "")
+		s.Require().NoError(err)
+		s.True(ok)
+	})
+	s.Run("replace rolled back", func() {
+		id, err := c.Schedule(ctx, payloadA{Msg: "old"}, notasap.WithIdempotencyKey("k"))
+		s.Require().NoError(err)
+		s.SetJob(id, pgtest.WithStatus(notasap.StatusFailed), pgtest.WithError("boom"))
+
+		tx, err := s.Pool.Begin(ctx)
+		s.Require().NoError(err)
+		got, err := c.ScheduleTx(ctx, tx, payloadA{Msg: "new"}, notasap.WithIdempotencyKey("k"), notasap.WithReplace())
+		s.Require().NoError(err)
+		s.Equal(id, got)
+		s.Require().NoError(tx.Rollback(ctx))
+
+		row := s.Job(id)
+		s.Equal(notasap.StatusFailed, notasap.Status(row.Status))
+		s.JSONEq(`{"msg":"old","n":0}`, string(row.Payload))
+	})
+	s.Run("same key different kind", func() {
+		idA, err := c.Schedule(ctx, payloadA{}, notasap.WithIdempotencyKey("k"))
+		s.Require().NoError(err)
+		idB, err := c.Schedule(ctx, payloadB{}, notasap.WithIdempotencyKey("k"))
+		s.Require().NoError(err)
+		s.NotEqual(idA, idB)
+		s.Equal(2, s.CountJobs())
+	})
+	s.Run("concurrent", func() {
+		const n = 20
+		ids := make([]int64, n)
+		errs := make([]error, n)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := range n {
+			wg.Go(func() {
+				<-start
+				ids[i], errs[i] = c.Schedule(ctx, payloadA{N: i}, notasap.WithIdempotencyKey("same"))
+			})
+		}
+		close(start)
+		wg.Wait()
+
+		var ok, dup int
+		for i := range n {
+			switch {
+			case errs[i] == nil:
+				ok++
+			case s.ErrorIs(errs[i], notasap.ErrDuplicate):
+				dup++
+			}
+			s.Equal(ids[0], ids[i])
+		}
+		s.Equal(1, ok)
+		s.Equal(n-1, dup)
+		s.Equal(1, s.CountJobs())
+	})
+	s.Run("duplicate takes one round trip", func() {
+		id, err := c.Schedule(ctx, payloadA{}, notasap.WithIdempotencyKey("dup"))
+		s.Require().NoError(err)
+
+		db := countingDB{Pool: s.Pool, calls: new(atomic.Int32)}
+		counted, err := notasap.NewWithDB(s.Pool, db)
+		s.Require().NoError(err)
+		s.Require().NoError(notasap.Register(counted, noop[payloadA], notasap.KindConfig{Name: "a"}))
+
+		got, err := counted.Schedule(ctx, payloadA{}, notasap.WithIdempotencyKey("dup"))
+		s.Require().ErrorIs(err, notasap.ErrDuplicate)
+		s.Equal(id, got)
+		s.Equal(int32(1), db.calls.Load())
+	})
+}
+
+func (s *ScheduleSuite) TestScheduleBatch() {
+	ctx := context.Background()
+	c := s.client()
+
+	s.Run("outcomes per item", func() {
+		dupID, err := c.Schedule(ctx, payloadA{}, notasap.WithIdempotencyKey("dup"))
+		s.Require().NoError(err)
+		runID, err := c.Schedule(ctx, payloadA{}, notasap.WithIdempotencyKey("run"))
+		s.Require().NoError(err)
+		s.SetJob(runID, pgtest.WithStatus(notasap.StatusRunning))
+
+		res, err := c.ScheduleBatch(ctx,
+			notasap.Item(payloadA{Msg: "new"}),
+			notasap.Item(payloadA{}, notasap.WithIdempotencyKey("dup")),
+			notasap.Item(payloadA{}, notasap.WithIdempotencyKey("run"), notasap.WithReplace()),
+		)
+		s.Require().NoError(err)
+		s.Require().Len(res, 3)
+		s.NoError(res[0].Err)
+		s.NotZero(res[0].ID)
+		s.NotEqual(dupID, res[0].ID)
+		s.NotEqual(runID, res[0].ID)
+		s.Equal(dupID, res[1].ID)
+		s.ErrorIs(res[1].Err, notasap.ErrDuplicate)
+		s.Equal(runID, res[2].ID)
+		s.ErrorIs(res[2].Err, notasap.ErrJobRunning)
+		s.Equal(3, s.CountJobs())
+	})
+	s.Run("atomic on error", func() {
+		_, err := c.ScheduleBatch(ctx,
+			notasap.Item(payloadA{Msg: "one"}),
+			notasap.Item(payloadA{Msg: "\x00"}),
+			notasap.Item(payloadA{Msg: "three"}),
+		)
+		s.Require().ErrorContains(err, "unsupported Unicode escape")
+		s.Equal(0, s.CountJobs())
+	})
+	s.Run("atomic on lookup error", func() {
+		// The key is committed while the batch waits on it, after the batch
+		// statement's snapshot, so the batch falls back to the lookup round.
+		tx, err := s.Pool.Begin(ctx)
+		s.Require().NoError(err)
+		defer func() { _ = tx.Rollback(ctx) }()
+		_, err = c.ScheduleTx(ctx, tx, payloadA{}, notasap.WithIdempotencyKey("dup"))
+		s.Require().NoError(err)
+
+		db := failingBatchDB{Pool: s.Pool, failAt: 2, calls: new(atomic.Int32)}
+		failing, err := notasap.NewWithDB(s.Pool, db)
+		s.Require().NoError(err)
+		s.Require().NoError(notasap.Register(failing, noop[payloadA], notasap.KindConfig{Name: "a"}))
+
+		var (
+			batchErr error
+			wg       sync.WaitGroup
+		)
+		wg.Go(func() {
+			_, batchErr = failing.ScheduleBatch(ctx,
+				notasap.Item(payloadA{Msg: "new"}),
+				notasap.Item(payloadA{}, notasap.WithIdempotencyKey("dup")),
+			)
+		})
+		s.waitBlockedBy(s.backendPID(tx))
+		s.Require().NoError(tx.Commit(ctx))
+		wg.Wait()
+		s.Require().ErrorIs(batchErr, context.Canceled)
+		s.Equal(int32(2), db.calls.Load())
+		s.Equal(1, s.CountJobs())
+	})
+	s.Run("tx rollback", func() {
+		items := []notasap.BatchItem{
+			notasap.Item(payloadA{N: 1}),
+			notasap.Item(payloadA{N: 2}),
+			notasap.Item(payloadB{}),
+		}
+		tx, err := s.Pool.Begin(ctx)
+		s.Require().NoError(err)
+		_, err = c.ScheduleBatchTx(ctx, tx, items...)
+		s.Require().NoError(err)
+		s.Require().NoError(tx.Rollback(ctx))
+		s.Equal(0, s.CountJobs())
+
+		res, err := c.ScheduleBatch(ctx, items...)
+		s.Require().NoError(err)
+		s.Require().Len(res, 3)
+		for _, r := range res {
+			s.NoError(r.Err)
+		}
+		s.Equal(3, s.CountJobs())
+	})
+	s.Run("same key twice", func() {
+		res, err := c.ScheduleBatch(ctx,
+			notasap.Item(payloadA{Msg: "A"}, notasap.WithIdempotencyKey("x")),
+			notasap.Item(payloadA{Msg: "B"}, notasap.WithIdempotencyKey("x")),
+		)
+		s.Require().NoError(err)
+		s.Require().Len(res, 2)
+		s.NoError(res[0].Err)
+		s.Equal(res[0].ID, res[1].ID)
+		s.ErrorIs(res[1].Err, notasap.ErrDuplicate)
+		s.JSONEq(`{"msg":"A","n":0}`, string(s.Job(res[0].ID).Payload))
+		s.Equal(1, s.CountJobs())
+	})
+	s.Run("same key twice with replace", func() {
+		res, err := c.ScheduleBatch(ctx,
+			notasap.Item(payloadA{Msg: "A"}, notasap.WithIdempotencyKey("y"), notasap.WithReplace()),
+			notasap.Item(payloadA{Msg: "B"}, notasap.WithIdempotencyKey("y"), notasap.WithReplace()),
+		)
+		s.Require().NoError(err)
+		s.Require().Len(res, 2)
+		s.NoError(res[0].Err)
+		s.NoError(res[1].Err)
+		s.Equal(res[0].ID, res[1].ID)
+		s.JSONEq(`{"msg":"B","n":0}`, string(s.Job(res[0].ID).Payload))
+		s.Equal(1, s.CountJobs())
+	})
+	s.Run("opposite key order does not deadlock", func() {
+		resB, idA1, idA2 := s.oppositeKeyOrder(c)
+		s.Equal(idA2, resB[0].ID)
+		s.Equal(idA1, resB[1].ID)
+		for _, r := range resB {
+			s.ErrorIs(r.Err, notasap.ErrDuplicate)
+		}
+	})
+	s.Run("opposite key order with replace does not deadlock", func() {
+		for _, k := range []string{"k1", "k2"} {
+			id, err := c.Schedule(ctx, payloadA{Msg: "old"}, notasap.WithIdempotencyKey(k))
+			s.Require().NoError(err)
+			s.SetJob(id, pgtest.WithStatus(notasap.StatusDone))
+		}
+		resB, idA1, idA2 := s.oppositeKeyOrder(c, notasap.WithReplace())
+		s.Equal(idA2, resB[0].ID)
+		s.Equal(idA1, resB[1].ID)
+		for _, r := range resB {
+			s.NoError(r.Err)
+		}
+	})
+}
+
+// oppositeKeyOrder schedules keys k1 then k2 in transaction A and a batch
+// of k2, k1 in transaction B that blocks on A, commits both, and returns B's
+// results and A's ids for k1 and k2. Neither side may fail with a deadlock,
+// and each key ends up in one row.
+func (s *ScheduleSuite) oppositeKeyOrder(c *testClient, extra ...notasap.ScheduleOption) (resB []notasap.BatchResult, idA1, idA2 int64) {
+	s.T().Helper()
+	ctx := context.Background()
+	opts := func(key string) []notasap.ScheduleOption {
+		return append([]notasap.ScheduleOption{notasap.WithIdempotencyKey(key)}, extra...)
 	}
-	s.Equal(1, ok)
-	s.Equal(n-1, dup)
-	s.Equal(1, countJobs(&s.Suite))
-}
-
-func (s *ScheduleSuite) TestReplaceRolledBack() {
-	ctx := context.Background()
-	c := s.newClient()
-	id, err := c.Schedule(ctx, payloadA{Msg: "old"}, notasap.WithIdempotencyKey("k"))
+	txA, err := s.Pool.Begin(ctx)
 	s.Require().NoError(err)
-	s.Exec("UPDATE notasap_jobs SET status = 4, error = 'boom' WHERE id = $1", id)
-
-	tx, err := s.Pool.Begin(ctx)
+	defer func() { _ = txA.Rollback(ctx) }()
+	txB, err := s.Pool.Begin(ctx)
 	s.Require().NoError(err)
-	got, err := c.ScheduleTx(ctx, tx, payloadA{Msg: "new"}, notasap.WithIdempotencyKey("k"), notasap.WithReplace())
-	s.Require().NoError(err)
-	s.Equal(id, got)
-	s.Require().NoError(tx.Rollback(ctx))
+	defer func() { _ = txB.Rollback(ctx) }()
 
-	row := s.Job(id)
-	s.Equal(int16(notasap.StatusFailed), row.Status)
-	s.JSONEq(`{"msg":"old","n":0}`, string(row.Payload))
-}
-
-func (s *ScheduleSuite) TestBatch() {
-	ctx := context.Background()
-	c := s.newClient()
-	dupID, err := c.Schedule(ctx, payloadA{}, notasap.WithIdempotencyKey("dup"))
+	idA1, err = c.ScheduleTx(ctx, txA, payloadA{Msg: "A"}, opts("k1")...)
 	s.Require().NoError(err)
-	runID, err := c.Schedule(ctx, payloadA{}, notasap.WithIdempotencyKey("run"))
-	s.Require().NoError(err)
-	s.Exec("UPDATE notasap_jobs SET status = 2 WHERE id = $1", runID)
 
-	res, err := c.ScheduleBatch(ctx,
-		notasap.Item(payloadA{Msg: "new"}),
-		notasap.Item(payloadA{}, notasap.WithIdempotencyKey("dup")),
-		notasap.Item(payloadA{}, notasap.WithIdempotencyKey("run"), notasap.WithReplace()),
+	var (
+		errB error
+		wg   sync.WaitGroup
 	)
-	s.Require().NoError(err)
-	s.Require().Len(res, 3)
-	s.NoError(res[0].Err)
-	s.NotZero(res[0].ID)
-	s.NotEqual(dupID, res[0].ID)
-	s.NotEqual(runID, res[0].ID)
-	s.Equal(dupID, res[1].ID)
-	s.ErrorIs(res[1].Err, notasap.ErrDuplicate)
-	s.Equal(runID, res[2].ID)
-	s.ErrorIs(res[2].Err, notasap.ErrJobRunning)
-	s.Equal(3, countJobs(&s.Suite))
+	wg.Go(func() {
+		resB, errB = c.ScheduleBatchTx(ctx, txB,
+			notasap.Item(payloadA{Msg: "B"}, opts("k2")...),
+			notasap.Item(payloadA{Msg: "B"}, opts("k1")...),
+		)
+	})
+	s.waitBlockedBy(s.backendPID(txA))
+
+	idA2, errA := c.ScheduleTx(ctx, txA, payloadA{Msg: "A"}, opts("k2")...)
+	if errA == nil {
+		errA = txA.Commit(ctx)
+	}
+	wg.Wait()
+	if errB == nil {
+		errB = txB.Commit(ctx)
+	}
+	for _, err := range []error{errA, errB} {
+		if err != nil {
+			s.NotContains(err.Error(), "40P01")
+			s.NotContains(err.Error(), "deadlock")
+		}
+	}
+	s.Require().NoError(errA)
+	s.Require().NoError(errB)
+	s.Require().Len(resB, 2)
+	for _, k := range []string{"k1", "k2"} {
+		var n int
+		s.Require().NoError(s.Pool.QueryRow(ctx,
+			"SELECT count(*) FROM notasap_jobs WHERE idempotency_key = $1", k).Scan(&n))
+		s.Equal(1, n)
+	}
+	return resB, idA1, idA2
 }
 
-func (s *ScheduleSuite) TestBatchAtomicOnError() {
-	c := s.newClient()
-	_, err := c.ScheduleBatch(context.Background(),
-		notasap.Item(payloadA{Msg: "one"}),
-		notasap.Item(payloadA{Msg: "\x00"}),
-		notasap.Item(payloadA{Msg: "three"}),
-	)
-	s.Require().ErrorContains(err, "unsupported Unicode escape")
-	s.Equal(0, countJobs(&s.Suite))
+// backendPID returns the backend pid of tx.
+func (s *ScheduleSuite) backendPID(tx pgx.Tx) uint32 {
+	s.T().Helper()
+	var pid uint32
+	s.Require().NoError(tx.QueryRow(context.Background(), "SELECT pg_backend_pid()").Scan(&pid))
+	return pid
+}
+
+// waitBlockedBy waits until some backend waits on a lock held by pid.
+func (s *ScheduleSuite) waitBlockedBy(pid uint32) {
+	s.T().Helper()
+	s.WaitFor(func() bool {
+		var n int
+		s.Require().NoError(s.Pool.QueryRow(context.Background(),
+			"SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))", pid).Scan(&n))
+		return n > 0
+	}, "no backend blocked by pid %d", pid)
 }
 
 // failingBatchDB sends the batch number failAt (1-based, counted over the pool
@@ -282,202 +512,6 @@ func failCtx(ctx context.Context, fail bool) context.Context {
 	return ctx
 }
 
-func (s *ScheduleSuite) TestBatchAtomicOnLookupError() {
-	ctx := context.Background()
-	// The key is committed while the batch waits on it, after the batch
-	// statement's snapshot, so the batch falls back to the lookup round.
-	tx, err := s.Pool.Begin(ctx)
-	s.Require().NoError(err)
-	defer func() { _ = tx.Rollback(ctx) }()
-	_, err = s.newClient().ScheduleTx(ctx, tx, payloadA{}, notasap.WithIdempotencyKey("dup"))
-	s.Require().NoError(err)
-
-	db := failingBatchDB{Pool: s.Pool, failAt: 2, calls: new(atomic.Int32)}
-	c, err := notasap.NewWithDB(s.Pool, db)
-	s.Require().NoError(err)
-	s.Require().NoError(notasap.Register(c, noop[payloadA], notasap.KindConfig{Name: "a"}))
-
-	var (
-		batchErr error
-		wg       sync.WaitGroup
-	)
-	wg.Go(func() {
-		_, batchErr = c.ScheduleBatch(ctx,
-			notasap.Item(payloadA{Msg: "new"}),
-			notasap.Item(payloadA{}, notasap.WithIdempotencyKey("dup")),
-		)
-	})
-	s.waitBlockedBy(s.backendPID(tx))
-	s.Require().NoError(tx.Commit(ctx))
-	wg.Wait()
-	s.Require().ErrorIs(batchErr, context.Canceled)
-	s.Equal(int32(2), db.calls.Load())
-	s.Equal(1, countJobs(&s.Suite))
-}
-
-func (s *ScheduleSuite) TestBatchTxRollback() {
-	ctx := context.Background()
-	c := s.newClient()
-	items := []notasap.BatchItem{
-		notasap.Item(payloadA{N: 1}),
-		notasap.Item(payloadA{N: 2}),
-		notasap.Item(payloadB{}),
-	}
-
-	tx, err := s.Pool.Begin(ctx)
-	s.Require().NoError(err)
-	_, err = c.ScheduleBatchTx(ctx, tx, items...)
-	s.Require().NoError(err)
-	s.Require().NoError(tx.Rollback(ctx))
-	s.Equal(0, countJobs(&s.Suite))
-
-	res, err := c.ScheduleBatch(ctx, items...)
-	s.Require().NoError(err)
-	s.Require().Len(res, 3)
-	for _, r := range res {
-		s.NoError(r.Err)
-	}
-	s.Equal(3, countJobs(&s.Suite))
-}
-
-func (s *ScheduleSuite) TestScheduledObserver() {
-	ctx := context.Background()
-	obs := newCountingObserver()
-	c := s.newClient(notasap.WithObserver(obs))
-
-	_, err := c.Schedule(ctx, payloadA{}, notasap.WithIdempotencyKey("k"))
-	s.Require().NoError(err)
-	_, err = c.Schedule(ctx, payloadA{Msg: "new"}, notasap.WithIdempotencyKey("k"), notasap.WithReplace())
-	s.Require().NoError(err)
-	_, err = c.Schedule(ctx, payloadA{}, notasap.WithIdempotencyKey("k"))
-	s.Require().ErrorIs(err, notasap.ErrDuplicate)
-
-	s.Equal(2, obs.Scheduled("a"))
-	s.Equal(0, obs.Scheduled("b"))
-}
-
-// backendPID returns the backend pid of tx.
-func (s *ScheduleSuite) backendPID(tx pgx.Tx) uint32 {
-	s.T().Helper()
-	var pid uint32
-	s.Require().NoError(tx.QueryRow(context.Background(), "SELECT pg_backend_pid()").Scan(&pid))
-	return pid
-}
-
-// waitBlockedBy waits until some backend waits on a lock held by pid.
-func (s *ScheduleSuite) waitBlockedBy(pid uint32) {
-	s.T().Helper()
-	s.Eventually(func() bool {
-		var n int
-		err := s.Pool.QueryRow(context.Background(),
-			"SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))", pid).Scan(&n)
-		return err == nil && n > 0
-	}, 5*time.Second, 5*time.Millisecond)
-}
-
-func (s *ScheduleSuite) TestBatchOppositeKeyOrderNoDeadlock() {
-	ctx := context.Background()
-	c := s.newClient()
-	for _, replace := range []bool{false, true} {
-		s.Run(fmt.Sprintf("replace=%v", replace), func() {
-			k1, k2 := fmt.Sprintf("k1-%v", replace), fmt.Sprintf("k2-%v", replace)
-			opts := func(key string) []notasap.ScheduleOption {
-				o := []notasap.ScheduleOption{notasap.WithIdempotencyKey(key)}
-				if replace {
-					o = append(o, notasap.WithReplace())
-				}
-				return o
-			}
-			if replace {
-				for _, k := range []string{k1, k2} {
-					id, err := c.Schedule(ctx, payloadA{Msg: "old"}, notasap.WithIdempotencyKey(k))
-					s.Require().NoError(err)
-					s.Exec("UPDATE notasap_jobs SET status = 3 WHERE id = $1", id)
-				}
-			}
-
-			txA, err := s.Pool.Begin(ctx)
-			s.Require().NoError(err)
-			defer func() { _ = txA.Rollback(ctx) }()
-			txB, err := s.Pool.Begin(ctx)
-			s.Require().NoError(err)
-			defer func() { _ = txB.Rollback(ctx) }()
-
-			idA1, err := c.ScheduleTx(ctx, txA, payloadA{Msg: "A"}, opts(k1)...)
-			s.Require().NoError(err)
-
-			var (
-				resB []notasap.BatchResult
-				errB error
-				wg   sync.WaitGroup
-			)
-			wg.Go(func() {
-				resB, errB = c.ScheduleBatchTx(ctx, txB,
-					notasap.Item(payloadA{Msg: "B"}, opts(k2)...),
-					notasap.Item(payloadA{Msg: "B"}, opts(k1)...),
-				)
-			})
-			s.waitBlockedBy(s.backendPID(txA))
-
-			idA2, errA := c.ScheduleTx(ctx, txA, payloadA{Msg: "A"}, opts(k2)...)
-			if errA == nil {
-				errA = txA.Commit(ctx)
-			}
-			wg.Wait()
-			if errB == nil {
-				errB = txB.Commit(ctx)
-			}
-			for _, err := range []error{errA, errB} {
-				if err != nil {
-					s.NotContains(err.Error(), "40P01")
-					s.NotContains(err.Error(), "deadlock")
-				}
-			}
-			s.Require().NoError(errA)
-			s.Require().NoError(errB)
-			s.Require().Len(resB, 2)
-			s.Equal(idA2, resB[0].ID)
-			s.Equal(idA1, resB[1].ID)
-			for _, r := range resB {
-				if replace {
-					s.NoError(r.Err)
-				} else {
-					s.ErrorIs(r.Err, notasap.ErrDuplicate)
-				}
-			}
-			for _, k := range []string{k1, k2} {
-				var n int
-				s.Require().NoError(s.Pool.QueryRow(ctx,
-					"SELECT count(*) FROM notasap_jobs WHERE idempotency_key = $1", k).Scan(&n))
-				s.Equal(1, n)
-			}
-		})
-	}
-}
-
-func (s *ScheduleSuite) TestReplaceRunningTakesNoLock() {
-	ctx := context.Background()
-	c := s.newClient()
-	id, err := c.Schedule(ctx, payloadA{Msg: "old"}, notasap.WithIdempotencyKey("k"))
-	s.Require().NoError(err)
-	s.Exec("UPDATE notasap_jobs SET status = 2, lease = 1 WHERE id = $1", id)
-
-	tx, err := s.Pool.Begin(ctx)
-	s.Require().NoError(err)
-	defer func() { _ = tx.Rollback(ctx) }()
-	got, err := c.ScheduleTx(ctx, tx, payloadA{Msg: "new"}, notasap.WithIdempotencyKey("k"), notasap.WithReplace())
-	s.Require().ErrorIs(err, notasap.ErrJobRunning)
-	s.Equal(id, got)
-
-	finishCtx, cancel := context.WithTimeout(ctx, time.Second)
-	defer cancel()
-	tag, err := s.Pool.Exec(finishCtx,
-		"UPDATE notasap_jobs SET status = 3 WHERE id = $1 AND lease = 1 AND status = 2", id)
-	s.Require().NoError(err)
-	s.Equal(int64(1), tag.RowsAffected())
-	s.Require().NoError(tx.Rollback(ctx))
-}
-
 // countingDB counts round trips sent through the pool.
 type countingDB struct {
 	*pgxpool.Pool
@@ -502,48 +536,4 @@ func (d countingDB) QueryRow(ctx context.Context, sql string, args ...any) pgx.R
 func (d countingDB) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	d.calls.Add(1)
 	return d.Pool.Exec(ctx, sql, args...)
-}
-
-func (s *ScheduleSuite) TestDuplicateSingleRoundTrip() {
-	ctx := context.Background()
-	id, err := s.newClient().Schedule(ctx, payloadA{}, notasap.WithIdempotencyKey("dup"))
-	s.Require().NoError(err)
-
-	db := countingDB{Pool: s.Pool, calls: new(atomic.Int32)}
-	c, err := notasap.NewWithDB(s.Pool, db)
-	s.Require().NoError(err)
-	s.Require().NoError(notasap.Register(c, noop[payloadA], notasap.KindConfig{Name: "a"}))
-
-	got, err := c.Schedule(ctx, payloadA{}, notasap.WithIdempotencyKey("dup"))
-	s.Require().ErrorIs(err, notasap.ErrDuplicate)
-	s.Equal(id, got)
-	s.Equal(int32(1), db.calls.Load())
-}
-
-func (s *ScheduleSuite) TestSameKeyTwiceInBatch() {
-	ctx := context.Background()
-	c := s.newClient()
-
-	res, err := c.ScheduleBatch(ctx,
-		notasap.Item(payloadA{Msg: "A"}, notasap.WithIdempotencyKey("x")),
-		notasap.Item(payloadA{Msg: "B"}, notasap.WithIdempotencyKey("x")),
-	)
-	s.Require().NoError(err)
-	s.Require().Len(res, 2)
-	s.NoError(res[0].Err)
-	s.Equal(res[0].ID, res[1].ID)
-	s.ErrorIs(res[1].Err, notasap.ErrDuplicate)
-	s.JSONEq(`{"msg":"A","n":0}`, string(s.Job(res[0].ID).Payload))
-
-	res, err = c.ScheduleBatch(ctx,
-		notasap.Item(payloadA{Msg: "A"}, notasap.WithIdempotencyKey("y"), notasap.WithReplace()),
-		notasap.Item(payloadA{Msg: "B"}, notasap.WithIdempotencyKey("y"), notasap.WithReplace()),
-	)
-	s.Require().NoError(err)
-	s.Require().Len(res, 2)
-	s.NoError(res[0].Err)
-	s.NoError(res[1].Err)
-	s.Equal(res[0].ID, res[1].ID)
-	s.JSONEq(`{"msg":"B","n":0}`, string(s.Job(res[0].ID).Payload))
-	s.Equal(2, countJobs(&s.Suite))
 }

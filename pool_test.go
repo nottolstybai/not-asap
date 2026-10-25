@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,13 +17,31 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// stuckObserver counts JobStuck calls.
-type stuckObserver struct {
+const (
+	waitFor = 5 * time.Second
+	tick    = 5 * time.Millisecond
+)
+
+// countObserver counts JobStuck and JobFinished calls.
+type countObserver struct {
 	NopObserver
-	stuck atomic.Int64
+	stuck, finished atomic.Int64
 }
 
-func (o *stuckObserver) JobStuck(string) { o.stuck.Add(1) }
+func (o *countObserver) JobStuck(string)                           { o.stuck.Add(1) }
+func (o *countObserver) JobFinished(string, Status, time.Duration) { o.finished.Add(1) }
+
+// recv waits for a value on ch or fails the test after waitFor.
+func recv[T any](t *testing.T, ch <-chan T) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(waitFor):
+		t.Fatal("timed out waiting on channel")
+		panic("unreachable")
+	}
+}
 
 // newPoolClient returns a client over st with kind 1 registered as h.
 func newPoolClient(t *testing.T, st jobStore, h Handler[testPayload], cfg KindConfig, opts ...Option) *Client {
@@ -39,17 +59,22 @@ func newPoolClient(t *testing.T, st jobStore, h Handler[testPayload], cfg KindCo
 
 func stopOnCleanup(t *testing.T, c *Client) {
 	t.Helper()
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		require.NoError(t, c.Stop(ctx))
-	})
+	t.Cleanup(func() { stop(t, c) })
+}
+
+// stop stops c and requires success. Stop drains handlers including their
+// status writes and observer calls, so it is a barrier for asserts.
+func stop(t *testing.T, c *Client) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), waitFor)
+	defer cancel()
+	require.NoError(t, c.Stop(ctx))
 }
 
 func TestLifecycle(t *testing.T) {
 	ctx := context.Background()
 	newC := func(t *testing.T) *Client {
-		return newPoolClient(t, newFakeStore(), noopHandler[testPayload](), KindConfig{})
+		return newPoolClient(t, newFakeStore(), noop[testPayload], KindConfig{})
 	}
 
 	t.Run("start twice", func(t *testing.T) {
@@ -60,6 +85,7 @@ func TestLifecycle(t *testing.T) {
 	})
 	t.Run("start after stop", func(t *testing.T) {
 		c := newC(t)
+		stopOnCleanup(t, c)
 		require.NoError(t, c.Start(ctx))
 		require.NoError(t, c.Stop(ctx))
 		require.ErrorIs(t, c.Start(ctx), ErrStopped)
@@ -71,12 +97,14 @@ func TestLifecycle(t *testing.T) {
 	})
 	t.Run("stop twice", func(t *testing.T) {
 		c := newC(t)
+		stopOnCleanup(t, c)
 		require.NoError(t, c.Start(ctx))
 		require.NoError(t, c.Stop(ctx))
 		require.NoError(t, c.Stop(ctx))
 	})
 	t.Run("concurrent start and stop", func(t *testing.T) {
 		c := newC(t)
+		stopOnCleanup(t, c)
 		var wg sync.WaitGroup
 		var startErr, stopErr error
 		wg.Go(func() { startErr = c.Start(ctx) })
@@ -110,12 +138,12 @@ func TestWorkersLimit(t *testing.T) {
 	st.feed(5)
 	require.NoError(t, c.Start(context.Background()))
 
-	require.Eventually(t, func() bool { return running.Load() == 2 }, 5*time.Second, 5*time.Millisecond)
-	require.Never(t, func() bool { return maxRunning.Load() > 2 }, 200*time.Millisecond, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return running.Load() == 2 }, waitFor, tick)
+	require.Never(t, func() bool { return maxRunning.Load() > 2 }, 200*time.Millisecond, tick)
 	require.LessOrEqual(t, st.MaxLimit(), 2)
 
 	close(release)
-	require.Eventually(t, func() bool { return len(st.Calls()) == 5 }, 5*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return len(st.Calls()) == 5 }, waitFor, tick)
 	for _, call := range st.Calls() {
 		require.Equal(t, StatusDone, call.status)
 	}
@@ -132,38 +160,39 @@ func TestFullBatchRepollsImmediately(t *testing.T) {
 	st.feed(6)
 	require.NoError(t, c.Start(context.Background()))
 
-	require.Eventually(t, func() bool { return executed.Load() == 6 }, 5*time.Second, 5*time.Millisecond)
-	require.Eventually(t, func() bool { return len(st.Calls()) == 6 }, 5*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return executed.Load() == 6 }, waitFor, tick)
+	require.Eventually(t, func() bool { return len(st.Calls()) == 6 }, waitFor, tick)
 }
 
 func TestPollerSurvivesClaimError(t *testing.T) {
 	st := newFakeStore()
 	st.failClaims(3, errors.New("db down"))
-	c := newPoolClient(t, st, noopHandler[testPayload](), KindConfig{})
+	c := newPoolClient(t, st, noop[testPayload], KindConfig{})
 	stopOnCleanup(t, c)
 	require.NoError(t, c.Start(context.Background()))
 
-	require.Eventually(t, func() bool { return st.Claims() >= 3 }, 5*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return st.Claims() >= 3 }, waitFor, tick)
 	st.feed(1)
-	require.Eventually(t, func() bool { return len(st.Calls()) == 1 }, 5*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return len(st.Calls()) == 1 }, waitFor, tick)
 	require.Equal(t, StatusDone, st.Calls()[0].status)
 	require.GreaterOrEqual(t, st.Claims(), 4)
 }
 
 func TestNoClaimAfterStop(t *testing.T) {
 	st := newFakeStore()
-	c := newPoolClient(t, st, noopHandler[testPayload](), KindConfig{})
+	c := newPoolClient(t, st, noop[testPayload], KindConfig{})
+	stopOnCleanup(t, c)
 	require.NoError(t, c.Start(context.Background()))
-	require.Eventually(t, func() bool { return st.Claims() >= 2 }, 5*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return st.Claims() >= 2 }, waitFor, tick)
 
 	require.NoError(t, c.Stop(context.Background()))
 	n := st.Claims()
-	require.Never(t, func() bool { return st.Claims() != n }, 100*time.Millisecond, 5*time.Millisecond)
+	require.Never(t, func() bool { return st.Claims() != n }, 100*time.Millisecond, tick)
 }
 
 func TestStuckHandlerReported(t *testing.T) {
 	st := newFakeStore()
-	obs := &stuckObserver{}
+	obs := &countObserver{}
 	release := make(chan struct{})
 	c := newPoolClient(t, st, func(context.Context, *Job[testPayload]) error {
 		<-release
@@ -171,16 +200,16 @@ func TestStuckHandlerReported(t *testing.T) {
 	}, KindConfig{Timeout: 20 * time.Millisecond},
 		WithObserver(obs), WithRescuer(RescuerConfig{Grace: 20 * time.Millisecond}))
 	stopOnCleanup(t, c)
-	var once sync.Once
-	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	unblock := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(unblock) // registered after stopOnCleanup, so it runs first
 	st.feed(1)
 	require.NoError(t, c.Start(context.Background()))
 
-	require.Eventually(t, func() bool { return obs.stuck.Load() == 1 }, 5*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return obs.stuck.Load() == 1 }, waitFor, tick)
 	require.Empty(t, st.Calls())
 
-	once.Do(func() { close(release) })
-	require.Eventually(t, func() bool { return len(st.Calls()) == 1 }, 5*time.Second, 5*time.Millisecond)
+	unblock()
+	require.Eventually(t, func() bool { return len(st.Calls()) == 1 }, waitFor, tick)
 	require.Equal(t, StatusDone, st.Calls()[0].status)
 	require.EqualValues(t, 1, obs.stuck.Load())
 }
@@ -200,26 +229,24 @@ func TestClaimInFlightAtStopIsExecuted(t *testing.T) {
 		<-release
 		return ctx.Err()
 	}
-	c := newPoolClient(t, st, noopHandler[testPayload](), KindConfig{})
+	c := newPoolClient(t, st, noop[testPayload], KindConfig{})
+	stopOnCleanup(t, c)
+	unblock := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(unblock)
 	require.NoError(t, c.Start(context.Background()))
-	<-inClaim
+	recv(t, inClaim)
 
 	stopErr := make(chan error, 1)
 	go func() { stopErr <- c.Stop(context.Background()) }()
 	select {
 	case <-c.bgCtx.Done():
-	case <-time.After(5 * time.Second):
+	case <-time.After(waitFor):
 		t.Fatal("Stop did not begin")
 	}
 	st.feed(1)
-	close(release)
+	unblock()
 
-	select {
-	case err := <-stopErr:
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("Stop did not return")
-	}
+	require.NoError(t, recv(t, stopErr))
 	calls := st.Calls()
 	require.Len(t, calls, 1)
 	require.Equal(t, StatusDone, calls[0].status)
@@ -234,15 +261,18 @@ func TestConcurrentStopWaitsForFirst(t *testing.T) {
 		<-release
 		return nil
 	}, KindConfig{})
+	stopOnCleanup(t, c)
+	unblock := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(unblock)
 	st.feed(1)
 	require.NoError(t, c.Start(context.Background()))
-	<-started
+	recv(t, started)
 
 	first := make(chan error, 1)
 	go func() { first <- c.Stop(context.Background()) }()
 	select {
 	case <-c.bgCtx.Done():
-	case <-time.After(5 * time.Second):
+	case <-time.After(waitFor):
 		t.Fatal("Stop did not begin")
 	}
 
@@ -252,18 +282,13 @@ func TestConcurrentStopWaitsForFirst(t *testing.T) {
 
 	second := make(chan error, 1)
 	go func() { second <- c.Stop(context.Background()) }()
-	require.Never(t, func() bool { return len(second) > 0 }, 100*time.Millisecond, 5*time.Millisecond)
+	require.Never(t, func() bool { return len(second) > 0 }, 100*time.Millisecond, tick)
 	require.Empty(t, first)
 
-	close(release)
-	select {
-	case err := <-second:
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("second Stop did not return")
-	}
+	unblock()
+	require.NoError(t, recv(t, second))
 	require.Len(t, st.Calls(), 1)
-	require.NoError(t, <-first)
+	require.NoError(t, recv(t, first))
 }
 
 // retryableErr is a transient error: pgconn.SafeToRetry reports true for it.
@@ -276,81 +301,153 @@ type thirdPayload struct{}
 
 func (thirdPayload) Kind() Kind { return 4 }
 
-// finishObserver counts JobFinished calls.
-type finishObserver struct {
-	NopObserver
-	finished atomic.Int64
-}
-
-func (o *finishObserver) JobFinished(string, Status, time.Duration) { o.finished.Add(1) }
-
-func TestStatusWriteRetriesTransient(t *testing.T) {
-	st := newFakeStore()
-	st.scriptWrites(writeResult{err: retryableErr{}}, writeResult{err: retryableErr{}})
-	obs := &finishObserver{}
-	var runs atomic.Int64
-	c := newPoolClient(t, st, func(context.Context, *Job[testPayload]) error {
-		runs.Add(1)
-		return nil
-	}, KindConfig{}, WithObserver(obs))
-	stopOnCleanup(t, c)
-	st.feed(1)
-	require.NoError(t, c.Start(context.Background()))
-
-	require.Eventually(t, func() bool { return obs.finished.Load() == 1 }, 5*time.Second, 5*time.Millisecond)
-	require.Len(t, st.Calls(), 3)
-	require.Never(t, func() bool { return runs.Load() > 1 || obs.finished.Load() > 1 }, 200*time.Millisecond, 5*time.Millisecond)
-}
-
-func TestStatusWriteStopsOnLostLease(t *testing.T) {
-	st := newFakeStore()
-	st.scriptWrites(writeResult{ok: false})
-	obs := &finishObserver{}
-	c := newPoolClient(t, st, noopHandler[testPayload](), KindConfig{}, WithObserver(obs))
-	stopOnCleanup(t, c)
-	st.feed(1)
-	require.NoError(t, c.Start(context.Background()))
-
-	require.Eventually(t, func() bool { return len(st.Calls()) == 1 }, 5*time.Second, 5*time.Millisecond)
-	require.Never(t, func() bool { return len(st.Calls()) > 1 || obs.finished.Load() > 0 }, 300*time.Millisecond, 5*time.Millisecond)
-}
-
-func TestStatusWriteNoRetryPermanent(t *testing.T) {
-	st := newFakeStore()
-	st.scriptWrites(writeResult{err: &pgconn.PgError{Code: "23505"}})
-	var buf syncBuffer
-	c := newPoolClient(t, st, noopHandler[testPayload](), KindConfig{}, WithLogger(slog.New(slog.NewTextHandler(&buf, nil))))
-	stopOnCleanup(t, c)
-	st.feed(1)
-	require.NoError(t, c.Start(context.Background()))
-
-	require.Eventually(t, func() bool { return strings.Contains(buf.String(), "write job status") }, 5*time.Second, 5*time.Millisecond)
-	require.Never(t, func() bool { return len(st.Calls()) > 1 }, 300*time.Millisecond, 5*time.Millisecond)
-	require.Len(t, st.Calls(), 1)
-}
-
-func TestStartWarnsSmallPool(t *testing.T) {
-	var buf syncBuffer
-	c := newPoolClient(t, newFakeStore(), noopHandler[testPayload](), KindConfig{}, WithLogger(slog.New(slog.NewTextHandler(&buf, nil))))
-	require.NoError(t, Register(c, noopHandler[otherPayload](), KindConfig{Name: "b"}))
-	require.NoError(t, Register(c, noopHandler[thirdPayload](), KindConfig{Name: "c"}))
-	c.maxConns = 2
-	stopOnCleanup(t, c)
-	require.NoError(t, c.Start(context.Background()))
-
-	require.Contains(t, buf.String(), "level=WARN")
-	require.Contains(t, buf.String(), "pool")
-}
-
-func TestStartNoPoolWarningWhenUnknownOrLarge(t *testing.T) {
-	for _, maxConns := range []int32{0, 5} {
-		var buf syncBuffer
-		c := newPoolClient(t, newFakeStore(), noopHandler[testPayload](), KindConfig{}, WithLogger(slog.New(slog.NewTextHandler(&buf, nil))))
-		c.maxConns = maxConns
+func TestStatusWrite(t *testing.T) {
+	t.Run("retries transient", func(t *testing.T) {
+		st := newFakeStore()
+		st.scriptWrites(writeResult{err: retryableErr{}}, writeResult{err: retryableErr{}})
+		obs := &countObserver{}
+		var runs atomic.Int64
+		c := newPoolClient(t, st, func(context.Context, *Job[testPayload]) error {
+			runs.Add(1)
+			return nil
+		}, KindConfig{}, WithObserver(obs))
+		stopOnCleanup(t, c)
+		st.feed(1)
 		require.NoError(t, c.Start(context.Background()))
-		require.NotContains(t, buf.String(), "level=WARN")
-		require.NoError(t, c.Stop(context.Background()))
+
+		require.Eventually(t, func() bool { return obs.finished.Load() == 1 }, waitFor, tick)
+		stop(t, c)
+		require.Len(t, st.Calls(), 3)
+		require.EqualValues(t, 1, runs.Load())
+		require.EqualValues(t, 1, obs.finished.Load())
+	})
+
+	t.Run("stops on lost lease", func(t *testing.T) {
+		st := newFakeStore()
+		st.scriptWrites(writeResult{ok: false})
+		obs := &countObserver{}
+		var buf syncBuffer
+		c := newPoolClient(t, st, noop[testPayload], KindConfig{},
+			WithObserver(obs), WithLogger(slog.New(slog.NewTextHandler(&buf, nil))))
+		stopOnCleanup(t, c)
+		st.feed(1)
+		require.NoError(t, c.Start(context.Background()))
+
+		require.Eventually(t, func() bool { return strings.Contains(buf.String(), "job lost lease") }, waitFor, tick)
+		stop(t, c)
+		require.Contains(t, buf.String(), `level=WARN msg="notasap: job lost lease"`)
+		require.Len(t, st.Calls(), 1)
+		require.Zero(t, obs.finished.Load())
+	})
+
+	t.Run("no retry on permanent error", func(t *testing.T) {
+		st := newFakeStore()
+		st.scriptWrites(writeResult{err: &pgconn.PgError{Code: "23505"}})
+		var buf syncBuffer
+		c := newPoolClient(t, st, noop[testPayload], KindConfig{}, WithLogger(slog.New(slog.NewTextHandler(&buf, nil))))
+		stopOnCleanup(t, c)
+		st.feed(1)
+		require.NoError(t, c.Start(context.Background()))
+
+		require.Eventually(t, func() bool { return strings.Contains(buf.String(), "write job status") }, waitFor, tick)
+		stop(t, c)
+		require.Len(t, st.Calls(), 1)
+	})
+
+	t.Run("gives up after budget", func(t *testing.T) {
+		old := dbCallTimeout
+		dbCallTimeout = 200 * time.Millisecond
+		t.Cleanup(func() { dbCallTimeout = old }) // runs after the client's Stop
+
+		st := newFakeStore()
+		st.scriptWrites(slices.Repeat([]writeResult{{err: retryableErr{}}}, 50)...)
+		obs := &countObserver{}
+		var buf syncBuffer
+		c := newPoolClient(t, st, noop[testPayload], KindConfig{},
+			WithObserver(obs), WithLogger(slog.New(slog.NewTextHandler(&buf, nil))))
+		stopOnCleanup(t, c)
+		st.feed(1)
+		require.NoError(t, c.Start(context.Background()))
+
+		require.Eventually(t, func() bool { return strings.Contains(buf.String(), "write job status") }, waitFor, tick)
+		stop(t, c)
+		require.Contains(t, buf.String(), `level=WARN msg="notasap: write job status"`)
+		// Retried with backoff 50ms, 100ms, ... until the 200ms budget ran out.
+		require.Greater(t, len(st.Calls()), 1)
+		require.Less(t, len(st.Calls()), 50)
+		require.Zero(t, obs.finished.Load())
+	})
+}
+
+func TestStartPoolWarning(t *testing.T) {
+	t.Run("warns on small pool", func(t *testing.T) {
+		var buf syncBuffer
+		c := newPoolClient(t, newFakeStore(), noop[testPayload], KindConfig{}, WithLogger(slog.New(slog.NewTextHandler(&buf, nil))))
+		require.NoError(t, Register(c, noop[otherPayload], KindConfig{Name: "b"}))
+		require.NoError(t, Register(c, noop[thirdPayload], KindConfig{Name: "c"}))
+		c.maxConns = 2
+		stopOnCleanup(t, c)
+		require.NoError(t, c.Start(context.Background()))
+
+		require.Contains(t, buf.String(), "level=WARN")
+		require.Contains(t, buf.String(), "max_conns=2")
+	})
+
+	t.Run("silent when unknown or large", func(t *testing.T) {
+		for _, maxConns := range []int32{0, 5} {
+			t.Run(fmt.Sprint(maxConns), func(t *testing.T) {
+				var buf syncBuffer
+				c := newPoolClient(t, newFakeStore(), noop[testPayload], KindConfig{}, WithLogger(slog.New(slog.NewTextHandler(&buf, nil))))
+				c.maxConns = maxConns
+				stopOnCleanup(t, c)
+				require.NoError(t, c.Start(context.Background()))
+				require.NotContains(t, buf.String(), "level=WARN")
+			})
+		}
+	})
+}
+
+func TestJanitorLoopStartsUnlessDisabled(t *testing.T) {
+	t.Run("enabled", func(t *testing.T) {
+		st := newFakeStore()
+		c := newPoolClient(t, st, noop[testPayload], KindConfig{})
+		stopOnCleanup(t, c)
+		require.NoError(t, c.Start(context.Background()))
+		require.Eventually(t, func() bool { return st.Deletes() > 0 }, waitFor, tick)
+	})
+	t.Run("disabled", func(t *testing.T) {
+		st := newFakeStore()
+		c := newPoolClient(t, st, noop[testPayload], KindConfig{}, WithJanitor(JanitorConfig{Disabled: true}))
+		stopOnCleanup(t, c)
+		require.NoError(t, c.Start(context.Background()))
+		// Let the other loops make progress before checking the janitor's.
+		require.Eventually(t, func() bool { return st.Rescues() > 0 && st.Claims() >= 2 }, waitFor, tick)
+		stop(t, c)
+		require.Zero(t, st.Deletes())
+	})
+}
+
+func TestStopCancelsJanitorPass(t *testing.T) {
+	st := newFakeStore()
+	entered := make(chan struct{}, 1)
+	st.deleteHook = func(ctx context.Context) error {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return ctx.Err()
 	}
+	c := newPoolClient(t, st, noop[testPayload], KindConfig{}, WithJanitor(JanitorConfig{BatchSize: 1}))
+	stopOnCleanup(t, c)
+	require.NoError(t, c.Start(context.Background()))
+	recv(t, entered)
+
+	// Stop returns only if it cancels the blocked delete.
+	stopped := make(chan error, 1)
+	go func() { stopped <- c.Stop(context.Background()) }()
+	require.NoError(t, recv(t, stopped))
+	require.Equal(t, 1, st.Deletes())
 }
 
 // syncBuffer is a bytes.Buffer safe for concurrent use by loggers.

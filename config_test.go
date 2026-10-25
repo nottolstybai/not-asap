@@ -67,7 +67,9 @@ func TestMergeKindConfig(t *testing.T) {
 
 	c, err := newClient(nil, nil)
 	require.NoError(t, err)
-	got := mergeKindConfig(c.defaults, KindConfig{Name: "x", Workers: 7})
+	got := mergeKindConfig(c.defaults, KindConfig{Name: "x"})
+	require.Equal(t, 5, got.Workers)
+	got = mergeKindConfig(c.defaults, KindConfig{Name: "x", Workers: 7})
 	require.Equal(t, 7, got.Workers)
 	require.Equal(t, 3, got.MaxAttempts)
 	require.Equal(t, time.Minute, got.Timeout)

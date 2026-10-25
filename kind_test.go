@@ -7,6 +7,7 @@ import (
 )
 
 func TestStatusString(t *testing.T) {
+	t.Parallel()
 	cases := map[Status]string{
 		StatusPending:   "pending",
 		StatusRunning:   "running",
@@ -15,7 +16,10 @@ func TestStatusString(t *testing.T) {
 		StatusCancelled: "cancelled",
 	}
 	for s, want := range cases {
-		require.Equal(t, want, s.String())
+		t.Run(want, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, want, s.String())
+		})
 	}
 	require.Equal(t, "status(9)", Status(9).String())
 }

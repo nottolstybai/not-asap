@@ -28,9 +28,7 @@ type ptrPayload struct{}
 
 func (*ptrPayload) Kind() Kind { return 3 }
 
-func noopHandler[T Payload]() Handler[T] {
-	return func(context.Context, *Job[T]) error { return nil }
-}
+func noop[T Payload](context.Context, *Job[T]) error { return nil }
 
 func newTestClient(t *testing.T, opts ...Option) *Client {
 	t.Helper()
@@ -40,52 +38,62 @@ func newTestClient(t *testing.T, opts ...Option) *Client {
 }
 
 func TestRegisterValidation(t *testing.T) {
+	t.Parallel()
 	t.Run("nil handler", func(t *testing.T) {
+		t.Parallel()
 		err := Register[testPayload](newTestClient(t), nil, KindConfig{Name: "a"})
 		require.ErrorContains(t, err, "handler is nil")
 	})
 	t.Run("pointer type", func(t *testing.T) {
-		err := Register(newTestClient(t), noopHandler[*ptrPayload](), KindConfig{Name: "a"})
+		t.Parallel()
+		err := Register(newTestClient(t), noop[*ptrPayload], KindConfig{Name: "a"})
 		require.ErrorContains(t, err, "non-pointer")
 	})
 	t.Run("kind not positive", func(t *testing.T) {
-		err := Register(newTestClient(t), noopHandler[zeroKindPayload](), KindConfig{Name: "a"})
+		t.Parallel()
+		err := Register(newTestClient(t), noop[zeroKindPayload], KindConfig{Name: "a"})
 		require.ErrorContains(t, err, "must be positive")
 	})
 	t.Run("duplicate kind", func(t *testing.T) {
+		t.Parallel()
 		c := newTestClient(t)
-		require.NoError(t, Register(c, noopHandler[testPayload](), KindConfig{Name: "first"}))
-		err := Register(c, noopHandler[testPayload](), KindConfig{Name: "second"})
+		require.NoError(t, Register(c, noop[testPayload], KindConfig{Name: "first"}))
+		err := Register(c, noop[testPayload], KindConfig{Name: "second"})
 		require.ErrorContains(t, err, "already registered")
 		require.ErrorContains(t, err, "first")
 	})
 	t.Run("duplicate name", func(t *testing.T) {
+		t.Parallel()
 		c := newTestClient(t)
-		require.NoError(t, Register(c, noopHandler[testPayload](), KindConfig{Name: "same"}))
-		err := Register(c, noopHandler[otherPayload](), KindConfig{Name: "same"})
+		require.NoError(t, Register(c, noop[testPayload], KindConfig{Name: "same"}))
+		err := Register(c, noop[otherPayload], KindConfig{Name: "same"})
 		require.ErrorContains(t, err, "already used")
 		_, ok := c.entry(2)
 		require.False(t, ok)
 	})
 	t.Run("invalid config", func(t *testing.T) {
-		err := Register(newTestClient(t), noopHandler[testPayload](), KindConfig{})
+		t.Parallel()
+		err := Register(newTestClient(t), noop[testPayload], KindConfig{})
 		require.ErrorContains(t, err, "Name is empty")
 	})
 	t.Run("started", func(t *testing.T) {
+		t.Parallel()
 		c := newTestClient(t)
 		c.state = stateStarted
-		err := Register(c, noopHandler[testPayload](), KindConfig{Name: "a"})
+		err := Register(c, noop[testPayload], KindConfig{Name: "a"})
 		require.ErrorIs(t, err, ErrAlreadyStarted)
 	})
 	t.Run("stopped", func(t *testing.T) {
+		t.Parallel()
 		c := newTestClient(t)
 		c.state = stateStopped
-		err := Register(c, noopHandler[testPayload](), KindConfig{Name: "a"})
+		err := Register(c, noop[testPayload], KindConfig{Name: "a"})
 		require.ErrorIs(t, err, ErrStopped)
 	})
 }
 
 func TestRegisterRunDecodesPayload(t *testing.T) {
+	t.Parallel()
 	c := newTestClient(t)
 	want := errors.New("boom")
 	var got *Job[testPayload]
@@ -96,13 +104,12 @@ func TestRegisterRunDecodesPayload(t *testing.T) {
 
 	e, ok := c.entry(1)
 	require.True(t, ok)
-	require.Equal(t, 5, e.cfg.Workers)
 
 	decodeErr, handlerErr := e.run(context.Background(), store.ClaimedJob{
 		ID: 7, Kind: 1, Payload: []byte(`{"n":42}`), Attempt: 2, MaxAttempts: 3,
 	})
 	require.NoError(t, decodeErr)
-	require.Equal(t, want, handlerErr)
+	require.ErrorIs(t, handlerErr, want)
 	require.NotNil(t, got)
 	require.EqualValues(t, 7, got.ID)
 	require.Equal(t, Kind(1), got.Kind)
@@ -112,6 +119,7 @@ func TestRegisterRunDecodesPayload(t *testing.T) {
 }
 
 func TestRegisterRunDecodeError(t *testing.T) {
+	t.Parallel()
 	c := newTestClient(t)
 	called := false
 	require.NoError(t, Register(c, func(context.Context, *Job[testPayload]) error {

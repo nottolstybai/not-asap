@@ -2,6 +2,7 @@ package prom_test
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"testing"
 	"time"
@@ -35,7 +36,7 @@ func (s *PromSuite) TestMetricsAfterProcessing() {
 	m, err := prom.New(reg)
 	s.Require().NoError(err)
 
-	c, err := notasap.New(s.Pool, notasap.WithObserver(m))
+	c, err := notasap.New(s.Pool, notasap.WithObserver(m), notasap.WithLogger(slog.New(slog.DiscardHandler)))
 	s.Require().NoError(err)
 	s.Require().NoError(notasap.Register(c,
 		func(context.Context, *notasap.Job[payloadA]) error { return nil },
@@ -43,39 +44,24 @@ func (s *PromSuite) TestMetricsAfterProcessing() {
 
 	ctx := context.Background()
 	s.Require().NoError(c.Start(ctx))
-	s.T().Cleanup(func() { _ = c.Stop(context.Background()) })
+	stop := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		s.NoError(c.Stop(ctx))
+	}
+	s.T().Cleanup(stop)
 
 	_, err = c.Schedule(ctx, payloadA{})
 	s.Require().NoError(err)
 
-	s.Require().Eventually(func() bool {
-		return seriesValue(reg, "notasap_jobs_finished_total", "a", "done") == 1
-	}, 10*time.Second, 20*time.Millisecond)
+	s.WaitFor(func() bool {
+		v, _ := lookup(reg, "notasap_jobs_finished_total", "a", "done")
+		return v == 1
+	}, "job not finished")
+	// Stop drains the handler including its observer calls, so the
+	// histogram observed after the counter is complete too.
+	stop()
 
 	s.EqualValues(1, value(s.T(), reg, "notasap_jobs_scheduled_total", "a"))
 	s.Equal(1, histCount(s.T(), reg, "notasap_job_duration_seconds", "outcome", "done"))
-}
-
-// seriesValue is a non-fatal variant of value for use inside Eventually.
-func seriesValue(reg *prometheus.Registry, name string, vals ...string) float64 {
-	mfs, _ := reg.Gather()
-	for _, mf := range mfs {
-		if mf.GetName() != name {
-			continue
-		}
-	series:
-		for _, mt := range mf.GetMetric() {
-			ls := mt.GetLabel()
-			if len(ls) != len(vals) {
-				continue
-			}
-			for i, l := range ls {
-				if l.GetValue() != vals[i] {
-					continue series
-				}
-			}
-			return mt.GetCounter().GetValue()
-		}
-	}
-	return 0
 }

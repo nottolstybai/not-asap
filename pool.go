@@ -13,8 +13,8 @@ import (
 
 // dbCallTimeout bounds claiming jobs and writing a job's status after its
 // handler returns, retries included. Neither inherits the handler or shutdown
-// contexts.
-const dbCallTimeout = 10 * time.Second
+// contexts. It is a variable only so tests can shorten it.
+var dbCallTimeout = 10 * time.Second
 
 // statusWriteBackoff is the delay before the first retry of a status write; it
 // doubles after each attempt.

@@ -11,7 +11,7 @@ import (
 )
 
 type CancelSuite struct {
-	pgtest.Suite
+	clientSuite
 }
 
 func TestCancelSuite(t *testing.T) {
@@ -19,9 +19,7 @@ func TestCancelSuite(t *testing.T) {
 }
 
 func (s *CancelSuite) TestCancel() {
-	c, err := notasap.New(s.Pool)
-	s.Require().NoError(err)
-	s.Require().NoError(notasap.Register(c, noop[payloadA], notasap.KindConfig{Name: "a"}))
+	c := s.newClient([]kindReg{reg(noop[payloadA], notasap.KindConfig{Name: "a"})})
 
 	tests := []struct {
 		name       string
@@ -37,17 +35,15 @@ func (s *CancelSuite) TestCancel() {
 	}
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
-			id, err := c.Schedule(context.Background(), payloadA{})
-			s.Require().NoError(err)
-			s.Exec("UPDATE notasap_jobs SET status = $2 WHERE id = $1", id, int16(tt.status))
+			id := s.InsertJob(pgtest.WithKind(kindA), pgtest.WithStatus(tt.status))
 
-			err = c.Cancel(context.Background(), id)
+			err := c.Cancel(context.Background(), id)
 			if tt.wantErr == nil {
 				s.Require().NoError(err)
 			} else {
 				s.Require().ErrorIs(err, tt.wantErr)
 			}
-			s.Equal(int16(tt.wantStatus), s.Job(id).Status)
+			s.Equal(tt.wantStatus, s.status(id))
 		})
 	}
 

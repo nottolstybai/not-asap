@@ -13,6 +13,7 @@ import (
 )
 
 func TestNewErrors(t *testing.T) {
+	t.Parallel()
 	_, err := prom.New(nil)
 	require.Error(t, err)
 
@@ -29,6 +30,7 @@ func TestNewErrors(t *testing.T) {
 }
 
 func TestNewFailureLeavesRegistryClean(t *testing.T) {
+	t.Parallel()
 	reg := prometheus.NewRegistry()
 	blocker := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "notasap_janitor_deleted_total", Help: "x"}, []string{"status"})
 	require.NoError(t, reg.Register(blocker))
@@ -46,6 +48,7 @@ func TestNewFailureLeavesRegistryClean(t *testing.T) {
 }
 
 func TestObserverMethods(t *testing.T) {
+	t.Parallel()
 	reg := prometheus.NewRegistry()
 	m, err := prom.New(reg)
 	require.NoError(t, err)
@@ -75,6 +78,7 @@ func TestObserverMethods(t *testing.T) {
 }
 
 func TestCustomBuckets(t *testing.T) {
+	t.Parallel()
 	reg := prometheus.NewRegistry()
 	m, err := prom.New(reg, prom.WithJobDurationBuckets([]float64{1, 2}), prom.WithPollDurationBuckets([]float64{3}))
 	require.NoError(t, err)
@@ -123,12 +127,13 @@ func bounds(t *testing.T, reg *prometheus.Registry, name string) []float64 {
 	return nil
 }
 
-// value returns the counter/gauge series whose label values equal vals in
+// lookup returns the counter/gauge series whose label values equal vals in
 // label-name order (labels sorted alphabetically, as Gather returns them).
-func value(t *testing.T, reg *prometheus.Registry, name string, vals ...string) float64 {
-	t.Helper()
+func lookup(reg *prometheus.Registry, name string, vals ...string) (float64, bool) {
 	mfs, err := reg.Gather()
-	require.NoError(t, err)
+	if err != nil {
+		return 0, false
+	}
 	for _, mf := range mfs {
 		if mf.GetName() != name {
 			continue
@@ -145,22 +150,33 @@ func value(t *testing.T, reg *prometheus.Registry, name string, vals ...string) 
 				}
 			}
 			if mt.Counter != nil {
-				return mt.GetCounter().GetValue()
+				return mt.GetCounter().GetValue(), true
 			}
-			return mt.GetGauge().GetValue()
+			return mt.GetGauge().GetValue(), true
 		}
 	}
-	t.Fatalf("no series %s%v", name, vals)
-	return 0
+	return 0, false
+}
+
+// value is lookup that fails the test when the series is missing.
+func value(t *testing.T, reg *prometheus.Registry, name string, vals ...string) float64 {
+	t.Helper()
+	v, ok := lookup(reg, name, vals...)
+	if !ok {
+		t.Fatalf("no series %s%v", name, vals)
+	}
+	return v
 }
 
 func TestInvalidBuckets(t *testing.T) {
+	t.Parallel()
 	for name, b := range map[string][]float64{
 		"decreasing": {2, 1},
 		"equal":      {1, 1},
 		"nan":        {math.NaN()},
 	} {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			_, err := prom.New(prometheus.NewRegistry(), prom.WithJobDurationBuckets(b))
 			require.Error(t, err)
 			_, err = prom.New(prometheus.NewRegistry(), prom.WithPollDurationBuckets(b))

@@ -2,8 +2,6 @@ package migrations_test
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"os"
 	"strings"
 	"testing"
@@ -26,28 +24,20 @@ func TestMigrationsSuite(t *testing.T) {
 	suite.Run(t, new(MigrationsSuite))
 }
 
-func randSchema(prefix string) string {
-	b := make([]byte, 6)
-	_, _ = rand.Read(b)
-	return prefix + "_" + hex.EncodeToString(b)
-}
-
-// gooseSection returns the text of the goose file between the given marker and the other one.
-func gooseSection(s *MigrationsSuite, marker string) string {
+// gooseSections returns the Up and Down halves of the goose migration.
+func gooseSections(s *MigrationsSuite) (up, down string) {
 	raw, err := migrations.Goose.ReadFile("goose/00001_notasap_jobs.sql")
 	s.Require().NoError(err)
 	text := string(raw)
-	up := strings.Index(text, "-- +goose Up")
-	down := strings.Index(text, "-- +goose Down")
-	s.Require().True(up >= 0 && down > up)
-	if marker == "up" {
-		return text[up+len("-- +goose Up") : down]
-	}
-	return text[down+len("-- +goose Down"):]
+	upAt := strings.Index(text, "-- +goose Up")
+	downAt := strings.Index(text, "-- +goose Down")
+	s.Require().True(upAt >= 0 && downAt > upAt)
+	return text[upAt+len("-- +goose Up") : downAt], text[downAt+len("-- +goose Down"):]
 }
 
+// newSchema creates a schema named after the suite's random schema name.
 func (s *MigrationsSuite) newSchema(prefix string) string {
-	name := randSchema(prefix)
+	name := s.Schema + "_" + prefix
 	s.Exec("CREATE SCHEMA " + name)
 	s.T().Cleanup(func() { s.Exec("DROP SCHEMA IF EXISTS " + name + " CASCADE") })
 	return name
@@ -93,7 +83,8 @@ func (s *MigrationsSuite) apply(schema, sql string) {
 func (s *MigrationsSuite) TestGooseAndGolangMigrateProduceSameSchema() {
 	g, m := s.newSchema("g"), s.newSchema("m")
 
-	s.apply(g, gooseSection(s, "up"))
+	gooseUp, _ := gooseSections(s)
+	s.apply(g, gooseUp)
 	mig, err := migrations.GolangMigrate.ReadFile("golang-migrate/000001_notasap_jobs.up.sql")
 	s.Require().NoError(err)
 	s.apply(m, string(mig))
@@ -114,8 +105,9 @@ func (s *MigrationsSuite) TestDownDropsTable() {
 	down, err := migrations.GolangMigrate.ReadFile("golang-migrate/000001_notasap_jobs.down.sql")
 	s.Require().NoError(err)
 
-	s.apply(g, gooseSection(s, "up"))
-	s.apply(g, gooseSection(s, "down"))
+	gooseUp, gooseDown := gooseSections(s)
+	s.apply(g, gooseUp)
+	s.apply(g, gooseDown)
 	s.apply(m, string(up))
 	s.apply(m, string(down))
 

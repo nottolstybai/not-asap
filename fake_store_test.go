@@ -24,11 +24,16 @@ type fakeStore struct {
 	// claimHook, if set before Start, runs at the start of every Claim; a
 	// non-nil error is returned from Claim.
 	claimHook func(ctx context.Context) error
+	// deleteHook, if set before Start, runs at the start of every
+	// DeleteFinished; a non-nil error is returned from it.
+	deleteHook func(ctx context.Context) error
 
 	mu         sync.Mutex
 	claimErr   error
 	claimFails int // number of upcoming Claim calls that return claimErr
 	claims     int
+	rescues    int
+	deletes    int
 	maxLimit   int
 	calls      []finishCall
 	writes     []writeResult // scripted results of upcoming Finish/Reschedule calls
@@ -83,6 +88,18 @@ func (f *fakeStore) Claims() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.claims
+}
+
+func (f *fakeStore) Rescues() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rescues
+}
+
+func (f *fakeStore) Deletes() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.deletes
 }
 
 func (f *fakeStore) MaxLimit() int {
@@ -149,10 +166,21 @@ func (f *fakeStore) Cancel(context.Context, int64) (store.CancelOutcome, error) 
 }
 
 func (f *fakeStore) Rescue(context.Context, int, func(store.StuckJob) store.RescueDecision) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rescues++
 	return 0, nil
 }
 
-func (f *fakeStore) DeleteFinished(context.Context, int16, time.Duration, int) (int64, error) {
+func (f *fakeStore) DeleteFinished(ctx context.Context, _ int16, _ time.Duration, _ int) (int64, error) {
+	f.mu.Lock()
+	f.deletes++
+	f.mu.Unlock()
+	if f.deleteHook != nil {
+		if err := f.deleteHook(ctx); err != nil {
+			return 0, err
+		}
+	}
 	return 0, nil
 }
 
