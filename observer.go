@@ -24,9 +24,10 @@ type Observer interface {
 	// JobStarted is called before a handler runs. Every JobStarted is
 	// followed by one JobEnded, so the pair tracks busy worker slots.
 	JobStarted(kind string)
-	// JobEnded is called once a handler returned and its result is queued
-	// for writing, whatever the outcome, so it may come before JobFinished
-	// or JobRetried.
+	// JobEnded is called once a handler returned and its result is handed
+	// over for writing, whatever the outcome, so it may come before
+	// JobFinished or JobRetried. While the result queue is full the handoff
+	// waits, and so does JobEnded.
 	JobEnded(kind string)
 	// JobFinished is called once a job's final status (done, failed or
 	// cancelled) is written, took being the handler run time. It is not

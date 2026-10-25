@@ -12,6 +12,12 @@ import (
 // maxCompleteBatch caps the rows of one status write.
 const maxCompleteBatch = 1000
 
+// maxQueued caps the results waiting for a write: enough for a few batches
+// behind the one in flight, so a slow database blocks handlers in add (they
+// keep their slots, and claiming slows down) instead of queueing without
+// bound.
+const maxQueued = 4 * maxCompleteBatch
+
 // completion is a handler's result waiting to be written, with what is
 // needed to report it.
 type completion struct {
@@ -30,23 +36,34 @@ type completer struct {
 	kick chan struct{} // signalled when queue grows or on close; cap 1
 	done chan struct{} // closed when loop returns
 
-	mu     sync.Mutex
+	mu sync.Mutex
+	// space is signalled when the queue shrinks or on close.
+	space  *sync.Cond
 	queue  []completion
 	closed bool
 }
 
 func newCompleter(c *Client) *completer {
-	return &completer{
+	w := &completer{
 		c:    c,
 		kick: make(chan struct{}, 1),
 		done: make(chan struct{}),
 	}
+	w.space = sync.NewCond(&w.mu)
+
+	return w
 }
 
-// add queues r for writing. After close it writes r itself, so a handler
-// that outlives Stop still saves its result.
+// add queues r for writing, waiting while maxQueued results are queued; the
+// wait ends with the write in flight, which is bounded by dbCallTimeout.
+// After close it writes r itself, so a handler that outlives Stop still
+// saves its result.
 func (w *completer) add(r completion) {
 	w.mu.Lock()
+	for len(w.queue) >= maxQueued && !w.closed {
+		w.space.Wait()
+	}
+
 	if w.closed {
 		w.mu.Unlock()
 		w.write([]completion{r})
@@ -64,6 +81,7 @@ func (w *completer) close() {
 	w.mu.Lock()
 	w.closed = true
 	w.mu.Unlock()
+	w.space.Broadcast()
 	w.signal()
 }
 
@@ -101,6 +119,10 @@ func (w *completer) take() ([]completion, bool) {
 	w.queue = w.queue[n:]
 	if len(w.queue) == 0 {
 		w.queue = nil
+	}
+
+	if n > 0 {
+		w.space.Broadcast()
 	}
 
 	return batch, w.closed

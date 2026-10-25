@@ -405,8 +405,9 @@ The lock ends with the `DELETE` statement, so this works through PgBouncer in tr
 
 In each replica the pollers, the rescuer and the janitor use up to kinds + 2 connections at once.
 Job results are saved in batches by one writer: a result is written at once if no write is in flight,
-otherwise it joins the next write (up to 1000 jobs in one statement). That writer holds one more connection,
-so plan for kinds + 3, each held for milliseconds. Your handlers' queries come on top of that.
+otherwise it joins the next write (up to 1000 jobs in one statement). If 4000 results are already
+waiting, a finished handler keeps its worker slot until there is room, so claiming slows down with the
+database. The writer holds one more connection, so plan for kinds + 3, each held for milliseconds. Your handlers' queries come on top of that.
 A status write that gets no connection within 10 s, retries included, is lost for every job in the batch
 (`write job status` in the log), and those jobs run again after `Timeout + Grace`.
 

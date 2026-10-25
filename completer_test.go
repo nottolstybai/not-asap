@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -42,10 +44,9 @@ func startCompleter(t *testing.T, st *fakeStore, opts ...Option) (*completer, fu
 // returned channel receives once it is in flight.
 func blockFirstWrite(st *fakeStore, release <-chan struct{}) <-chan struct{} {
 	entered := make(chan struct{})
-	first := true
+	var started atomic.Bool
 	st.completeHook = func(context.Context) {
-		if first {
-			first = false
+		if started.CompareAndSwap(false, true) {
 			close(entered)
 			<-release
 		}
@@ -148,6 +149,32 @@ func TestCompleter(t *testing.T) {
 		})
 	})
 
+	t.Run("close unblocks a waiting add", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			st := newFakeStore()
+			release := make(chan struct{})
+			entered := blockFirstWrite(st, release)
+			w, add := startCompleter(t, st)
+			add(1, 1)
+			<-entered
+			add(2, maxQueued)
+			added := make(chan struct{})
+			go func() {
+				add(maxQueued+2, 1)
+				close(added)
+			}()
+			synctest.Wait()
+			require.Empty(t, added)
+
+			w.close()
+			<-added // written directly
+			close(release)
+			<-w.done
+			require.Equal(t, []int{1, 1, maxCompleteBatch, maxCompleteBatch, maxCompleteBatch, maxCompleteBatch}, st.Batches())
+		})
+	})
+
 	t.Run("writes directly after close", func(t *testing.T) {
 		t.Parallel()
 		synctest.Test(t, func(t *testing.T) {
@@ -188,4 +215,48 @@ func TestStopWaitsForQueuedResults(t *testing.T) {
 	require.EqualValues(t, 5, obs.finished.Load())
 	n := len(st.Batches())
 	require.Never(t, func() bool { return len(st.Batches()) > n }, 50*time.Millisecond, tick)
+}
+
+func TestFullQueueKeepsSlot(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		st := newFakeStore()
+		release := make(chan struct{})
+		entered := blockFirstWrite(st, release)
+		obs := &countObserver{}
+		c := newPoolClient(t, st, noop[testPayload], KindConfig{Workers: 1}, WithObserver(obs))
+		require.NoError(t, c.Start(context.Background()))
+		defer stopInBubble(t, c)
+		unblock := sync.OnceFunc(func() { close(release) })
+		defer unblock() // runs before stopInBubble
+		queue := func(id int64) {
+			c.completer.add(completion{
+				ref: store.Ref{
+					ID:    id,
+					Lease: 1,
+				},
+				kind:   "a",
+				a:      action{status: StatusDone},
+				logger: c.logger,
+			})
+		}
+		// One result in the blocked write, maxQueued behind it.
+		queue(-1)
+		<-entered
+		for id := range int64(maxQueued) {
+			queue(-2 - id)
+		}
+
+		st.feed(1)
+		time.Sleep(time.Second) // past PollInterval: the job is claimed and run
+		synctest.Wait()
+		require.Zero(t, obs.ended.Load())
+		require.Len(t, c.pools[1].slots, 1)
+
+		unblock()
+		synctest.Wait()
+		require.EqualValues(t, 1, obs.ended.Load())
+		require.Empty(t, c.pools[1].slots)
+		require.Len(t, st.Calls(), maxQueued+2)
+	})
 }
