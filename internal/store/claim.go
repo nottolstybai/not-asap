@@ -1,8 +1,10 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -21,14 +23,15 @@ FROM (
 WHERE j.id = c.id
 RETURNING j.id, j.kind, j.payload, j.attempt, j.max_attempts, j.lease, j.created_at`
 
-const finishSQL = `UPDATE notasap_jobs
-SET status = $3, error = $4, deadline = NULL, updated_at = NOW()
-WHERE id = $1 AND lease = $2 AND status = 2 /* running */`
-
-const rescheduleSQL = `UPDATE notasap_jobs
-SET status = 1 /* pending */, run_at = NOW() + make_interval(secs => $3), error = $4, deadline = NULL,
-    attempt = CASE WHEN $5 THEN attempt - 1 ELSE attempt END, updated_at = NOW()
-WHERE id = $1 AND lease = $2 AND status = 2 /* running */`
+const completeSQL = `UPDATE notasap_jobs j
+SET status = u.status,
+    run_at = CASE WHEN u.status = 1 /* pending */ THEN NOW() + make_interval(secs => u.delay) ELSE j.run_at END,
+    error = u.error, deadline = NULL,
+    attempt = CASE WHEN u.refund THEN j.attempt - 1 ELSE j.attempt END, updated_at = NOW()
+FROM unnest($1::bigint[], $2::bigint[], $3::smallint[], $4::text[], $5::float8[], $6::bool[])
+    AS u(id, lease, status, error, delay, refund)
+WHERE j.id = u.id AND j.lease = u.lease AND j.status = 2 /* running */
+RETURNING j.id, j.lease`
 
 // ClaimedJob is a job row taken for execution.
 type ClaimedJob struct {
@@ -62,26 +65,47 @@ func (s *Store) Claim(ctx context.Context, kind int16, limit int, lease time.Dur
 	return jobs, nil
 }
 
-// Finish moves a running job to a final status. It reports false if the lease
-// no longer matches (the job was rescued or already finished). An empty errMsg
-// stores NULL.
-func (s *Store) Finish(ctx context.Context, ref Ref, status int16, errMsg string) (bool, error) {
-	tag, err := s.pool.Exec(ctx, finishSQL, ref.ID, ref.Lease, status, nullable(errMsg))
-	if err != nil {
-		return false, fmt.Errorf("pool.Exec: %w", err)
-	}
-
-	return tag.RowsAffected() == 1, nil
+// Completion is the next state of one claimed job.
+type Completion struct {
+	Ref
+	// Status is final, or StatusPending to run again after Delay.
+	Status int16
+	Delay  time.Duration
+	// Error is stored as NULL when empty.
+	Error string
+	// Refund gives back the attempt consumed by the claim; only for
+	// StatusPending.
+	Refund bool
 }
 
-// Reschedule returns a running job to pending to run after delay. With refund
-// the attempt consumed by the claim is given back. It reports false if the
-// lease no longer matches. An empty errMsg stores NULL.
-func (s *Store) Reschedule(ctx context.Context, ref Ref, delay time.Duration, errMsg string, refund bool) (bool, error) {
-	tag, err := s.pool.Exec(ctx, rescheduleSQL, ref.ID, ref.Lease, delay.Seconds(), nullable(errMsg), refund)
-	if err != nil {
-		return false, fmt.Errorf("pool.Exec: %w", err)
+// Complete writes all completions in one statement and returns the refs of
+// the rows written. A missing ref means its lease no longer matches (the job
+// was rescued or already finished). Rows are updated in id order so that
+// concurrent batches do not deadlock.
+func (s *Store) Complete(ctx context.Context, cs []Completion) ([]Ref, error) {
+	cs = slices.SortedFunc(slices.Values(cs), func(a, b Completion) int {
+		return cmp.Or(cmp.Compare(a.ID, b.ID), cmp.Compare(a.Lease, b.Lease))
+	})
+	ids := make([]int64, len(cs))
+	leases := make([]int64, len(cs))
+	statuses := make([]int16, len(cs))
+	errs := make([]*string, len(cs))
+	delays := make([]float64, len(cs))
+	refunds := make([]bool, len(cs))
+	for i, c := range cs {
+		ids[i], leases[i], statuses[i] = c.ID, c.Lease, c.Status
+		errs[i], delays[i], refunds[i] = nullable(c.Error), c.Delay.Seconds(), c.Refund
 	}
 
-	return tag.RowsAffected() == 1, nil
+	rows, err := s.pool.Query(ctx, completeSQL, ids, leases, statuses, errs, delays, refunds)
+	if err != nil {
+		return nil, fmt.Errorf("pool.Query: %w", err)
+	}
+
+	written, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Ref])
+	if err != nil {
+		return nil, fmt.Errorf("pgx.CollectRows: %w", err)
+	}
+
+	return written, nil
 }

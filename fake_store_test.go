@@ -9,7 +9,7 @@ import (
 	"github.com/nottolstybai/not-asap/internal/store"
 )
 
-// finishCall is a recorded Finish or Reschedule call.
+// finishCall is one row of a recorded Complete call.
 type finishCall struct {
 	ref    store.Ref
 	status Status
@@ -28,6 +28,9 @@ type fakeStore struct {
 	// deleteHook, if set before Start, runs at the start of every
 	// DeleteFinished; a non-nil error is returned from it.
 	deleteHook func(ctx context.Context) error
+	// completeHook, if set before Start, runs at the start of every
+	// Complete.
+	completeHook func(ctx context.Context)
 
 	mu         sync.Mutex
 	claimErr   error
@@ -38,10 +41,12 @@ type fakeStore struct {
 	maxLimit   int
 	limits     []int // limit of every Claim call, in order
 	calls      []finishCall
-	writes     []writeResult // scripted results of upcoming Finish/Reschedule calls
+	batches    []int         // rows of every Complete call, in order
+	writes     []writeResult // scripted results of upcoming Complete calls
 }
 
-// writeResult is a scripted result of a status write.
+// writeResult is a scripted result of a Complete call; ok == false means
+// no row was written.
 type writeResult struct {
 	ok  bool
 	err error
@@ -73,7 +78,7 @@ func (f *fakeStore) failClaims(n int, err error) {
 	f.claimFails, f.claimErr = n, err
 }
 
-// scriptWrites makes the next Finish/Reschedule calls return rs in order;
+// scriptWrites makes the next Complete calls return rs in order;
 // later calls succeed.
 func (f *fakeStore) scriptWrites(rs ...writeResult) {
 	f.mu.Lock()
@@ -128,6 +133,13 @@ func (f *fakeStore) Calls() []finishCall {
 }
 
 // Insert reports every job as inserted; it does not queue them for Claim.
+// Batches returns the number of rows of every Complete call.
+func (f *fakeStore) Batches() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.batches)
+}
+
 func (f *fakeStore) Insert(_ context.Context, _ store.DB, params []store.InsertParams) ([]store.InsertResult, error) {
 	res := make([]store.InsertResult, len(params))
 	for i := range res {
@@ -169,28 +181,29 @@ func (f *fakeStore) Claim(ctx context.Context, _ int16, limit int, _ time.Durati
 	return jobs, nil
 }
 
-func (f *fakeStore) Finish(_ context.Context, ref store.Ref, status int16, errMsg string) (bool, error) {
+func (f *fakeStore) Complete(ctx context.Context, cs []store.Completion) ([]store.Ref, error) {
+	if f.completeHook != nil {
+		f.completeHook(ctx)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, finishCall{
-		ref:    ref,
-		status: Status(status),
-		errMsg: errMsg,
-	})
-	return f.nextWrite()
-}
-
-func (f *fakeStore) Reschedule(_ context.Context, ref store.Ref, delay time.Duration, errMsg string, refund bool) (bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.calls = append(f.calls, finishCall{
-		ref:    ref,
-		status: StatusPending,
-		errMsg: errMsg,
-		delay:  delay,
-		refund: refund,
-	})
-	return f.nextWrite()
+	f.batches = append(f.batches, len(cs))
+	refs := make([]store.Ref, len(cs))
+	for i, cp := range cs {
+		f.calls = append(f.calls, finishCall{
+			ref:    cp.Ref,
+			status: Status(cp.Status),
+			errMsg: cp.Error,
+			delay:  cp.Delay,
+			refund: cp.Refund,
+		})
+		refs[i] = cp.Ref
+	}
+	ok, err := f.nextWrite()
+	if err != nil || !ok {
+		return nil, err
+	}
+	return refs, nil
 }
 
 func (f *fakeStore) Cancel(context.Context, int64) (store.CancelOutcome, error) {

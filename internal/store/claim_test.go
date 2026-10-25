@@ -113,99 +113,133 @@ func (s *claimSuite) claimOne() store.ClaimedJob {
 	return jobs[0]
 }
 
-func (s *claimSuite) TestStore_Finish() {
+func (s *claimSuite) TestStore_Complete() {
 	s.Run("fenced by lease and status", func() {
 		j := s.claimOne()
-
-		ok, err := s.st.Finish(s.ctx, store.Ref{
+		ref := store.Ref{
+			ID:    j.ID,
+			Lease: j.Lease,
+		}
+		stale := store.Ref{
 			ID:    j.ID,
 			Lease: j.Lease + 1,
-		}, store.StatusDone, "")
+		}
+
+		written, err := s.st.Complete(s.ctx, []store.Completion{{
+			Ref:    stale,
+			Status: store.StatusDone,
+		}})
 		s.Require().NoError(err)
-		s.False(ok)
+		s.Empty(written)
 		row := s.GetJob(j.ID)
 		s.Equal(store.StatusRunning, row.Status)
 		s.NotNil(row.Deadline)
 
-		ok, err = s.st.Finish(s.ctx, store.Ref{
-			ID:    j.ID,
-			Lease: j.Lease,
-		}, store.StatusDone, "")
+		written, err = s.st.Complete(s.ctx, []store.Completion{{
+			Ref:    ref,
+			Status: store.StatusDone,
+		}})
 		s.Require().NoError(err)
-		s.True(ok)
+		s.Equal([]store.Ref{ref}, written)
 		row = s.GetJob(j.ID)
 		s.Equal(store.StatusDone, row.Status)
 		s.Nil(row.Deadline)
 		s.Nil(row.Error)
 
-		ok, err = s.st.Finish(s.ctx, store.Ref{
-			ID:    j.ID,
-			Lease: j.Lease,
-		}, store.StatusFailed, "x")
+		// Already finished: the job is no longer running.
+		written, err = s.st.Complete(s.ctx, []store.Completion{{
+			Ref:    ref,
+			Status: store.StatusFailed,
+			Error:  "x",
+		}})
 		s.Require().NoError(err)
-		s.False(ok)
+		s.Empty(written)
+		s.Equal(store.StatusDone, s.GetJob(j.ID).Status)
 	})
 
-	s.Run("stores error", func() {
-		j := s.claimOne()
-		ok, err := s.st.Finish(s.ctx, store.Ref{
-			ID:    j.ID,
-			Lease: j.Lease,
-		}, store.StatusFailed, "bad")
+	s.Run("mixed batch", func() {
+		failed, retried, refunded, plain, lost := s.claimOne(), s.claimOne(), s.claimOne(), s.claimOne(), s.claimOne()
+		ref := func(j store.ClaimedJob) store.Ref {
+			return store.Ref{
+				ID:    j.ID,
+				Lease: j.Lease,
+			}
+		}
+		runAt := s.GetJob(failed.ID).RunAt
+
+		// Input order is not id order: Complete sorts it.
+		written, err := s.st.Complete(s.ctx, []store.Completion{
+			{
+				Ref:    ref(plain),
+				Status: store.StatusPending,
+			},
+			{
+				Ref: store.Ref{
+					ID:    lost.ID,
+					Lease: lost.Lease + 1,
+				},
+				Status: store.StatusDone,
+			},
+			{
+				Ref:    ref(failed),
+				Status: store.StatusFailed,
+				Error:  "bad",
+			},
+			{
+				Ref:    ref(refunded),
+				Status: store.StatusPending,
+				Delay:  time.Minute,
+				Error:  "again",
+				Refund: true,
+			},
+			{
+				Ref:    ref(retried),
+				Status: store.StatusPending,
+				Delay:  time.Hour,
+				Error:  "retry",
+			},
+		})
 		s.Require().NoError(err)
-		s.True(ok)
-		row := s.GetJob(j.ID)
+		s.ElementsMatch([]store.Ref{ref(failed), ref(retried), ref(refunded), ref(plain)}, written)
+
+		now := s.DBNow()
+		row := s.GetJob(failed.ID)
+		s.Equal(store.StatusFailed, row.Status)
+		s.Equal(1, row.Attempt)
+		s.Equal(runAt, row.RunAt)
+		s.Nil(row.Deadline)
 		s.Require().NotNil(row.Error)
 		s.Equal("bad", *row.Error)
-	})
-}
 
-func (s *claimSuite) TestStore_Reschedule() {
-	s.Run("refund", func() {
-		j := s.claimOne()
-		ok, err := s.st.Reschedule(s.ctx, store.Ref{
-			ID:    j.ID,
-			Lease: j.Lease,
-		}, time.Minute, "again", true)
-		s.Require().NoError(err)
-		s.True(ok)
-		row := s.GetJob(j.ID)
-		s.Equal(0, row.Attempt)
+		row = s.GetJob(retried.ID)
 		s.Equal(store.StatusPending, row.Status)
+		s.Equal(1, row.Attempt)
 		s.Nil(row.Deadline)
-		s.WithinDuration(s.DBNow().Add(time.Minute), row.RunAt, 5*time.Second)
+		s.WithinDuration(now.Add(time.Hour), row.RunAt, 5*time.Second)
+		s.Require().NotNil(row.Error)
+		s.Equal("retry", *row.Error)
+
+		row = s.GetJob(refunded.ID)
+		s.Equal(store.StatusPending, row.Status)
+		s.Equal(0, row.Attempt)
+		s.WithinDuration(now.Add(time.Minute), row.RunAt, 5*time.Second)
 		s.Require().NotNil(row.Error)
 		s.Equal("again", *row.Error)
-	})
-	s.Run("no refund", func() {
-		j := s.claimOne()
-		ok, err := s.st.Reschedule(s.ctx, store.Ref{
-			ID:    j.ID,
-			Lease: j.Lease,
-		}, 0, "", false)
-		s.Require().NoError(err)
-		s.True(ok)
-		row := s.GetJob(j.ID)
-		s.Equal(1, row.Attempt)
+
+		row = s.GetJob(plain.ID)
 		s.Equal(store.StatusPending, row.Status)
+		s.Equal(1, row.Attempt)
+		s.WithinDuration(now, row.RunAt, 5*time.Second)
 		s.Nil(row.Error)
 
-		// Already rescheduled: the job is no longer running.
-		ok, err = s.st.Reschedule(s.ctx, store.Ref{
-			ID:    j.ID,
-			Lease: j.Lease,
-		}, 0, "", false)
-		s.Require().NoError(err)
-		s.False(ok)
+		row = s.GetJob(lost.ID)
+		s.Equal(store.StatusRunning, row.Status)
+		s.NotNil(row.Deadline)
 	})
-	s.Run("stale lease", func() {
-		j := s.claimOne()
-		ok, err := s.st.Reschedule(s.ctx, store.Ref{
-			ID:    j.ID,
-			Lease: j.Lease + 1,
-		}, 0, "", false)
+
+	s.Run("empty", func() {
+		written, err := s.st.Complete(s.ctx, nil)
 		s.Require().NoError(err)
-		s.False(ok)
-		s.Equal(store.StatusRunning, s.GetJob(j.ID).Status)
+		s.Empty(written)
 	})
 }

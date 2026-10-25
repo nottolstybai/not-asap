@@ -331,13 +331,14 @@ err := client.Stop(ctx)  // graceful shutdown
 
 1. Stops claiming new jobs and stops the background loops.
    A claim already in flight finishes first (up to 10 s), and its jobs are run.
-2. Waits for running handlers until `ctx` is done.
-3. If `ctx` expires, cancels the handlers, waits `StopGrace` for them to save their result,
-   and returns `ctx.Err()`. Interrupted jobs go back to `pending` without losing an attempt.
+2. Waits for running handlers until `ctx` is done, then for the writes of their results.
+   When `Stop` returns `nil`, every result is saved.
+3. If `ctx` expires, cancels the handlers, waits `StopGrace` for them to return and their results
+   to be saved, and returns `ctx.Err()`. Interrupted jobs go back to `pending` without losing an attempt.
 
 A second concurrent `Stop` waits for the first one, so `defer pool.Close()` is safe.
-If `Stop` returns `ctx.Err()`, handlers that were still running keep saving their result after it returns;
-a handler that has returned may retry that write for up to 10 s. Keep the pool open that long, or the write
+If `Stop` returns `ctx.Err()`, handlers that were still running save their result after it returns,
+and a result write already in flight may retry for up to 10 s. Keep the pool open that long, or the write
 fails and the rescuer recovers the job.
 
 ## Reliability
@@ -402,10 +403,12 @@ The lock ends with the `DELETE` statement, so this works through PgBouncer in tr
 
 ### Connection pool
 
-In each replica the pollers, the rescuer and the janitor use up to kinds + 2 connections at once,
-and every job that is saving its result needs one more, so plan for about kinds + 3, each held for
-milliseconds. Your handlers' queries come on top of that. A status write that gets no connection within 10 s,
-retries included, is lost (`write job status` in the log), and the job runs again after `Timeout + Grace`.
+In each replica the pollers, the rescuer and the janitor use up to kinds + 2 connections at once.
+Job results are saved in batches by one writer: a result is written at once if no write is in flight,
+otherwise it joins the next write (up to 1000 jobs in one statement). That writer holds one more connection,
+so plan for kinds + 3, each held for milliseconds. Your handlers' queries come on top of that.
+A status write that gets no connection within 10 s, retries included, is lost for every job in the batch
+(`write job status` in the log), and those jobs run again after `Timeout + Grace`.
 
 - Give notasap its own `pgxpool` with `MaxConns` of at least kinds + 3, or size the shared pool for kinds + 3 plus your handlers.
 - `Start` logs a warning when `MaxConns` is below kinds + 2.

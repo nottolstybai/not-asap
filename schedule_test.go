@@ -264,12 +264,15 @@ func (s *scheduleSuite) TestClient_Schedule_Idempotency() {
 		// The worker's status write must not wait for tx.
 		finishCtx, cancel := context.WithTimeout(s.ctx, time.Second)
 		defer cancel()
-		ok, err := store.New(s.Pool).Finish(finishCtx, store.Ref{
-			ID:    id,
-			Lease: 1,
-		}, store.StatusDone, "")
+		written, err := store.New(s.Pool).Complete(finishCtx, []store.Completion{{
+			Ref: store.Ref{
+				ID:    id,
+				Lease: 1,
+			},
+			Status: store.StatusDone,
+		}})
 		s.Require().NoError(err)
-		s.True(ok)
+		s.Len(written, 1)
 	})
 	s.Run("replace rolled back", func() {
 		id, err := c.Schedule(s.ctx, payloadA{Msg: "old"}, WithIdempotencyKey("k"))

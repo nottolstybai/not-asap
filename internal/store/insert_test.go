@@ -110,15 +110,18 @@ func (s *insertSuite) TestStore_Insert_ReplaceClaimedMeanwhile() {
 		s.Require().NoError(err)
 		s.Equal([]store.InsertResult{{ID: id, Outcome: store.Running}}, res)
 
-		// The running row is not left locked: the worker's Finish completes.
+		// The running row is not left locked: the worker's status write completes.
 		finishCtx, cancel := context.WithTimeout(s.ctx, time.Second)
 		defer cancel()
-		ok, err := s.st.Finish(finishCtx, store.Ref{
-			ID:    id,
-			Lease: lease,
-		}, store.StatusDone, "")
+		written, err := s.st.Complete(finishCtx, []store.Completion{{
+			Ref: store.Ref{
+				ID:    id,
+				Lease: lease,
+			},
+			Status: store.StatusDone,
+		}})
 		s.Require().NoError(err)
-		s.True(ok)
+		s.Len(written, 1)
 	})
 	s.Run("in caller tx", func() {
 		claimTx, id, lease := claim()
@@ -137,22 +140,25 @@ func (s *insertSuite) TestStore_Insert_ReplaceClaimedMeanwhile() {
 		s.Require().NoError(insErr)
 		s.Equal([]store.InsertResult{{ID: id, Outcome: store.Running}}, res)
 
-		// The conflict check locked the running row: Finish waits for tx.
+		// The conflict check locked the running row: the status write waits for tx.
 		var (
-			ok     bool
-			finErr error
+			written []store.Ref
+			finErr  error
 		)
 		wg.Go(func() {
-			ok, finErr = s.st.Finish(s.ctx, store.Ref{
-				ID:    id,
-				Lease: lease,
-			}, store.StatusDone, "")
+			written, finErr = s.st.Complete(s.ctx, []store.Completion{{
+				Ref: store.Ref{
+					ID:    id,
+					Lease: lease,
+				},
+				Status: store.StatusDone,
+			}})
 		})
 		s.WaitBlockedBy(s.BackendPID(tx))
 		s.Require().NoError(tx.Commit(s.ctx))
 		wg.Wait()
 		s.Require().NoError(finErr)
-		s.True(ok)
+		s.Len(written, 1)
 		s.JSONEq(`{}`, string(s.GetJob(id).Payload))
 	})
 }
