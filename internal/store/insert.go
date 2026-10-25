@@ -52,6 +52,14 @@ UNION ALL
 SELECT id, 4 FROM notasap_jobs
 WHERE kind = $1 AND idempotency_key = $5 AND status = 2 /* running */ AND NOT EXISTS (SELECT 1 FROM up)`
 
+// insertKeylessSQL inserts jobs without idempotency key, which cannot
+// conflict, in one statement, in array order.
+const insertKeylessSQL = `INSERT INTO notasap_jobs (kind, status, payload, max_attempts, run_at, idempotency_key)
+SELECT k, 1 /* pending */, p, m, NOW() + make_interval(secs => d), NULL
+FROM unnest($1::smallint[], $2::jsonb[], $3::int[], $4::float8[]) WITH ORDINALITY AS t(k, p, m, d, ord)
+ORDER BY ord
+RETURNING id`
+
 const lookupSQL = `SELECT id, status FROM notasap_jobs WHERE kind = $1 AND idempotency_key = $2`
 
 // InsertParams describes one job to insert.
@@ -87,21 +95,28 @@ type InsertResult struct {
 }
 
 // Insert inserts params in one batch and resolves idempotency key conflicts.
-// Results are in the order of params; statements are sent in (kind, key)
-// order so that concurrent calls with overlapping keys do not deadlock.
-// Duplicate and running keys usually resolve in the first round. Each round
-// trip is a single batch, so outside a transaction a round is atomic, but
-// rounds after the first (key conflict lookups and re-inserts) commit
-// separately: callers needing the whole call to be atomic must pass a
+// Results are in the order of params. Jobs without key are inserted first by
+// one statement, ordered by kind, then params order; keyed statements follow
+// in (kind, key) order so that concurrent calls with overlapping keys do not
+// deadlock. Duplicate and running keys usually resolve in the first round.
+// Each round trip is a single batch, so outside a transaction a round is
+// atomic, but rounds after the first (key conflict lookups and re-inserts)
+// commit separately: callers needing the whole call to be atomic must pass a
 // transaction. db is the pool or the caller's transaction; Insert does not
 // use the Store's own pool.
 func (s *Store) Insert(ctx context.Context, db DB, params []InsertParams) ([]InsertResult, error) {
 	results := make([]InsertResult, len(params))
-	todo := make([]int, len(params))
-	for i := range params {
-		todo[i] = i
+	var keyless, todo []int
+	for i, p := range params {
+		if p.Key == nil {
+			keyless = append(keyless, i)
+			continue
+		}
+
+		todo = append(todo, i)
 	}
 
+	slices.SortStableFunc(keyless, func(a, b int) int { return cmp.Compare(params[a].Kind, params[b].Kind) })
 	// Taking keys in one (kind, key) order prevents deadlocks between
 	// concurrent batches with overlapping keys. Later rounds keep the order
 	// as they are built by iterating todo.
@@ -111,23 +126,15 @@ func (s *Store) Insert(ctx context.Context, db DB, params []InsertParams) ([]Ins
 			return c
 		}
 
-		switch {
-		case pa.Key == nil && pb.Key == nil:
-			return 0
-		case pa.Key == nil:
-			return -1
-		case pb.Key == nil:
-			return 1
-		}
-
 		return strings.Compare(*pa.Key, *pb.Key)
 	})
 	for range maxInsertRounds {
-		conflicts, err := insertRound(ctx, db, params, todo, results)
+		conflicts, err := insertRound(ctx, db, params, keyless, todo, results)
 		if err != nil {
 			return nil, fmt.Errorf("insertRound: %w", err)
 		}
 
+		keyless = nil
 		if len(conflicts) == 0 {
 			return results, nil
 		}
@@ -145,11 +152,29 @@ func (s *Store) Insert(ctx context.Context, db DB, params []InsertParams) ([]Ins
 	return nil, fmt.Errorf("idempotency key conflict unresolved after %d rounds", maxInsertRounds)
 }
 
-// insertRound inserts params[todo] and returns the indexes whose statement
-// returned no row: the conflicting row was committed after the statement
-// snapshot or deleted meanwhile.
-func insertRound(ctx context.Context, db DB, params []InsertParams, todo []int, results []InsertResult) ([]int, error) {
+// insertRound inserts params[keyless] with one statement and params[todo],
+// which have keys, with one statement each, and returns the indexes of todo
+// whose statement returned no row: the conflicting row was committed after
+// the statement snapshot or deleted meanwhile.
+func insertRound(ctx context.Context, db DB, params []InsertParams, keyless, todo []int, results []InsertResult) ([]int, error) {
 	b := &pgx.Batch{}
+	if len(keyless) > 0 {
+		var (
+			kinds    = make([]int16, len(keyless))
+			payloads = make([][]byte, len(keyless))
+			attempts = make([]int, len(keyless))
+			delays   = make([]float64, len(keyless))
+		)
+		for j, i := range keyless {
+			kinds[j] = params[i].Kind
+			payloads[j] = params[i].Payload
+			attempts[j] = params[i].MaxAttempts
+			delays[j] = params[i].Delay.Seconds()
+		}
+
+		b.Queue(insertKeylessSQL, kinds, payloads, attempts, delays)
+	}
+
 	for _, i := range todo {
 		p := params[i]
 		sql := insertNothingSQL
@@ -161,6 +186,13 @@ func insertRound(ctx context.Context, db DB, params []InsertParams, todo []int, 
 	}
 
 	br := db.SendBatch(ctx, b)
+	if len(keyless) > 0 {
+		if err := scanKeyless(br, keyless, results); err != nil {
+			_ = br.Close()
+			return nil, fmt.Errorf("scanKeyless: %w", err)
+		}
+	}
+
 	var conflicts []int
 	for _, i := range todo {
 		var (
@@ -169,11 +201,6 @@ func insertRound(ctx context.Context, db DB, params []InsertParams, todo []int, 
 		)
 		err := br.QueryRow().Scan(&id, &outcome)
 		if errors.Is(err, pgx.ErrNoRows) {
-			if params[i].Key == nil {
-				_ = br.Close()
-				return nil, errors.New("no row returned for a job without idempotency key")
-			}
-
 			conflicts = append(conflicts, i)
 			continue
 		}
@@ -194,6 +221,37 @@ func insertRound(ctx context.Context, db DB, params []InsertParams, todo []int, 
 	}
 
 	return conflicts, nil
+}
+
+// scanKeyless reads the ids returned by insertKeylessSQL into results of
+// keyless. RETURNING order is not guaranteed, so the ids are sorted: identity
+// values come from a sequence whose nextval increases within a session, and
+// the statement inserts the rows in ORDER BY ord, so the k-th smallest id
+// belongs to the k-th item of keyless.
+func scanKeyless(br pgx.BatchResults, keyless []int, results []InsertResult) error {
+	rows, err := br.Query()
+	if err != nil {
+		return fmt.Errorf("br.Query: %w", err)
+	}
+
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return fmt.Errorf("pgx.CollectRows: %w", err)
+	}
+
+	if len(ids) != len(keyless) {
+		return fmt.Errorf("%d ids returned for %d jobs without idempotency key", len(ids), len(keyless))
+	}
+
+	slices.Sort(ids)
+	for j, i := range keyless {
+		results[i] = InsertResult{
+			ID:      ids[j],
+			Outcome: Inserted,
+		}
+	}
+
+	return nil
 }
 
 // lookupRound reads the existing rows for conflicting params and returns the

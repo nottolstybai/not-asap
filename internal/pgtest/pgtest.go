@@ -82,7 +82,7 @@ func newPool(ctx context.Context, schema string) (*pgxpool.Pool, error) {
 }
 
 // NewPool opens an extra pool whose search_path is schema. It is closed on test cleanup.
-func NewPool(t *testing.T, schema string) *pgxpool.Pool {
+func NewPool(t testing.TB, schema string) *pgxpool.Pool {
 	t.Helper()
 	pool, err := newPool(context.Background(), schema)
 	if err != nil {
@@ -94,8 +94,13 @@ func NewPool(t *testing.T, schema string) *pgxpool.Pool {
 
 // NewSchema creates and migrates one more schema, returns its name and a pool
 // whose search_path is that schema. The schema is dropped on test cleanup.
-func NewSchema(t *testing.T) (string, *pgxpool.Pool) {
+// Without a database it skips t.
+func NewSchema(t testing.TB) (string, *pgxpool.Pool) {
 	t.Helper()
+	if !hasDSN() {
+		t.Skip("no database (short mode)")
+	}
+
 	ctx := context.Background()
 	schema := "nt_" + randHex(6)
 	admin, err := newPool(ctx, "")

@@ -111,10 +111,10 @@ func (c *Client) ScheduleTx(ctx context.Context, tx pgx.Tx, p Payload, opts ...S
 
 // ScheduleBatch inserts all items atomically. Results are in item order;
 // per-item idempotency conflicts are reported in them, and any other error
-// fails the whole batch and nothing is written. Rows are inserted ordered by
-// kind, then key (keyless items first, in item order; keys compared
-// byte-wise), so jobs of one batch that are due at the same time are claimed
-// in that order, not in item order. A batch without idempotency keys takes
+// fails the whole batch and nothing is written. Rows of one kind are inserted
+// keyless items first, in item order, then keyed items ordered by key
+// (compared byte-wise), so jobs of one batch that are due at the same time
+// are claimed in that order, not in item order. A batch without idempotency keys takes
 // one round trip; one with keys runs in its own transaction, as resolving
 // conflicts may take up to three insert and lookup rounds.
 func (c *Client) ScheduleBatch(ctx context.Context, items ...BatchItem) ([]BatchResult, error) {
