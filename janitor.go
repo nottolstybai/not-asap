@@ -24,7 +24,9 @@ func (c *Client) janitorLoop() {
 }
 
 // clean deletes, status by status, jobs past their retention in batches
-// until one comes back short or the client stops.
+// until one comes back short or the client stops. A replica that loses the
+// store's janitor advisory lock gets 0 rows, which counts as a short batch: it
+// moves on to the next status and tries again on the next tick.
 func (c *Client) clean(ctx context.Context) {
 	for _, status := range janitorStatuses {
 		retention := c.janitor.Retention[status]

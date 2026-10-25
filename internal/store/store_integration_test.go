@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/nottolstybai/not-asap/internal/pgtest"
@@ -337,6 +338,56 @@ func (s *StoreSuite) TestDeleteFinished() {
 	s.True(s.Exists(fresh))
 	s.True(s.Exists(failed))
 	s.True(s.Exists(pending))
+}
+
+// holdJanitorLock takes the janitor advisory lock of pool's schema in a tx
+// that is rolled back on cleanup, unless the returned func is called first.
+func (s *StoreSuite) holdJanitorLock(pool *pgxpool.Pool) (release func()) {
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	s.Require().NoError(err)
+	released := false
+	release = func() {
+		if !released {
+			released = true
+			s.NoError(tx.Rollback(ctx))
+		}
+	}
+	s.T().Cleanup(release)
+	_, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock('notasap_jobs'::regclass::oid::int, 1)`)
+	s.Require().NoError(err)
+	return release
+}
+
+func (s *StoreSuite) TestDeleteFinishedSkipsWhileLocked() {
+	id := s.InsertJob(pgtest.Finished(store.StatusDone, 3*time.Hour))
+	release := s.holdJanitorLock(s.Pool)
+
+	ctx := context.Background()
+	n, err := s.st.DeleteFinished(ctx, store.StatusDone, time.Hour, 10)
+	s.Require().NoError(err)
+	s.Zero(n)
+	s.True(s.Exists(id))
+
+	release()
+	n, err = s.st.DeleteFinished(ctx, store.StatusDone, time.Hour, 10)
+	s.Require().NoError(err)
+	s.EqualValues(1, n)
+	s.False(s.Exists(id))
+}
+
+func (s *StoreSuite) TestDeleteFinishedIndependentSchemas() {
+	_, otherPool := pgtest.NewSchema(s.T())
+	otherSt := store.New(otherPool)
+	ctx := context.Background()
+	_, err := otherPool.Exec(ctx, `INSERT INTO notasap_jobs (kind, status, payload, max_attempts, run_at, updated_at)
+VALUES (1, $1, '{}', 3, NOW(), NOW() - interval '3 hours')`, store.StatusDone)
+	s.Require().NoError(err)
+	s.holdJanitorLock(s.Pool)
+
+	n, err := otherSt.DeleteFinished(ctx, store.StatusDone, time.Hour, 10)
+	s.Require().NoError(err)
+	s.EqualValues(1, n)
 }
 
 func (s *StoreSuite) TestInsertOutcomesInParamsOrder() {

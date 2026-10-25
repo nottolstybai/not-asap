@@ -91,6 +91,36 @@ func NewPool(t *testing.T, schema string) *pgxpool.Pool {
 	return pool
 }
 
+// NewSchema creates and migrates one more schema, returns its name and a pool
+// whose search_path is that schema. The schema is dropped on test cleanup.
+func NewSchema(t *testing.T) (string, *pgxpool.Pool) {
+	t.Helper()
+	ctx := context.Background()
+	schema := "nt_" + randHex(6)
+	admin, err := newPool(ctx, "")
+	if err != nil {
+		t.Fatalf("pgtest: open admin pool: %v", err)
+	}
+	t.Cleanup(admin.Close)
+	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+		t.Fatalf("pgtest: create schema: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := admin.Exec(context.Background(), "DROP SCHEMA IF EXISTS "+schema+" CASCADE"); err != nil {
+			t.Errorf("pgtest: drop schema: %v", err)
+		}
+	})
+	pool := NewPool(t, schema)
+	up, err := migrations.GolangMigrate.ReadFile("golang-migrate/000001_notasap_jobs.up.sql")
+	if err != nil {
+		t.Fatalf("pgtest: read migration: %v", err)
+	}
+	if _, err := pool.Exec(ctx, string(up)); err != nil {
+		t.Fatalf("pgtest: migrate: %v", err)
+	}
+	return schema, pool
+}
+
 // JobRow mirrors a notasap_jobs row.
 type JobRow struct {
 	ID          int64
