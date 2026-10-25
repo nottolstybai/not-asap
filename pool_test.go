@@ -28,13 +28,14 @@ const (
 	tick    = 5 * time.Millisecond
 )
 
-// countObserver counts JobStuck and JobFinished calls.
+// countObserver counts JobStuck, JobEnded and JobFinished calls.
 type countObserver struct {
 	NopObserver
-	stuck, finished atomic.Int64
+	stuck, ended, finished atomic.Int64
 }
 
 func (o *countObserver) JobStuck(string)                           { o.stuck.Add(1) }
+func (o *countObserver) JobEnded(string)                           { o.ended.Add(1) }
 func (o *countObserver) JobFinished(string, Status, time.Duration) { o.finished.Add(1) }
 
 // recv waits for a value on ch or fails the test after waitFor.

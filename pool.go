@@ -160,7 +160,8 @@ func (p *kindPool) sleep(timer *time.Timer, d time.Duration) bool {
 }
 
 // execute runs the handler for a claimed job, waits for it even past its
-// timeout, records the outcome and frees the slot.
+// timeout, hands the outcome to the completer and frees the slot. The row
+// stays running until the completer writes it, so it cannot be claimed again.
 func (p *kindPool) execute(row store.ClaimedJob) {
 	c, cfg := p.c, p.entry.cfg
 	defer func() {
@@ -188,8 +189,16 @@ func (p *kindPool) execute(row store.ClaimedJob) {
 	res.cause = context.Cause(ctx)
 	took := time.Since(start)
 
-	a := decide(res, row.Attempt, row.MaxAttempts, cfg.Backoff, logger)
-	p.record(row, a, took, logger)
+	c.completer.add(completion{
+		ref: store.Ref{
+			ID:    row.ID,
+			Lease: row.Lease,
+		},
+		kind:   cfg.Name,
+		a:      decide(res, row.Attempt, row.MaxAttempts, cfg.Backoff, logger),
+		took:   took,
+		logger: logger,
+	})
 }
 
 // run calls the handler, turning a panic into a failed result.
@@ -205,71 +214,4 @@ func (p *kindPool) run(ctx context.Context, row store.ClaimedJob, logger *slog.L
 	}()
 
 	return p.entry.run(ctx, row)
-}
-
-// record writes the job's next state and reports it.
-func (p *kindPool) record(row store.ClaimedJob, a action, took time.Duration, logger *slog.Logger) {
-	c, name := p.c, p.entry.cfg.Name
-	ctx, cancel := context.WithTimeout(context.Background(), c.dbCallTimeout)
-	defer cancel()
-
-	ref := store.Ref{
-		ID:    row.ID,
-		Lease: row.Lease,
-	}
-	write := func() (bool, error) {
-		if a.status == StatusPending {
-			return c.st.Reschedule(ctx, ref, a.delay, a.errMsg, a.refund)
-		}
-
-		return c.st.Finish(ctx, ref, int16(a.status), a.errMsg)
-	}
-	// Transient failures are retried with doubling backoff, all within the
-	// single dbCallTimeout budget of ctx.
-	ok, err := write()
-	// unknown is set once an attempt timed out: it may have committed, so a
-	// later ok == false does not prove a lost lease.
-	unknown := false
-	for delay := statusWriteBackoff; err != nil && isTransient(err); delay *= 2 {
-		select {
-		case <-time.After(delay):
-		case <-ctx.Done():
-		}
-
-		if ctx.Err() != nil {
-			break
-		}
-
-		unknown = unknown || timedOut(err)
-		ok, err = write()
-	}
-
-	switch {
-	case err != nil:
-		logger.Warn("notasap: write job status", "status", a.status, "error", err)
-		return
-	case !ok && unknown:
-		// The retry cannot tell a committed earlier attempt from a lost
-		// lease. The observer is not called, as for a lost lease.
-		logger.Info("notasap: status write outcome unknown after retry", "status", a.status)
-		return
-	case !ok:
-		logger.Warn("notasap: job lost lease", "status", a.status)
-		return
-	}
-
-	switch a.status {
-	case StatusPending:
-		c.observer.JobRetried(name, a.reason, took)
-		logger.Info("notasap: job retried", "reason", a.reason, "delay", a.delay, "error", a.errMsg)
-	case StatusDone:
-		c.observer.JobFinished(name, a.status, took)
-		logger.Debug("notasap: job done", "took", took)
-	case StatusCancelled:
-		c.observer.JobFinished(name, a.status, took)
-		logger.Info("notasap: job cancelled", "error", a.errMsg)
-	default:
-		c.observer.JobFinished(name, a.status, took)
-		logger.Error("notasap: job failed", "reason", a.reason, "error", a.errMsg)
-	}
 }

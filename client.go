@@ -18,8 +18,7 @@ import (
 type jobStore interface {
 	Insert(ctx context.Context, db store.DB, params []store.InsertParams) ([]store.InsertResult, error)
 	Claim(ctx context.Context, kind int16, limit int, lease time.Duration) ([]store.ClaimedJob, error)
-	Finish(ctx context.Context, ref store.Ref, status int16, errMsg string) (bool, error)
-	Reschedule(ctx context.Context, ref store.Ref, delay time.Duration, errMsg string, refund bool) (bool, error)
+	Complete(ctx context.Context, cs []store.Completion) ([]store.Ref, error)
 	Cancel(ctx context.Context, id int64) (store.CancelOutcome, error)
 	Rescue(ctx context.Context, limit int, decide func(store.StuckJob) store.RescueDecision) (int, error)
 	DeleteFinished(ctx context.Context, status int16, olderThan time.Duration, limit int) (int64, error)
@@ -49,8 +48,8 @@ type Client struct {
 	names   map[string]Kind
 	// maxConns is the pool's MaxConns; 0 means unknown.
 	maxConns int32
-	// dbCallTimeout bounds claiming jobs and writing a job's status after its
-	// handler returns, retries included. Neither inherits the handler or
+	// dbCallTimeout bounds claiming jobs and writing a batch of job statuses,
+	// retries included. Neither inherits the handler or
 	// shutdown contexts. It is a field only so tests can shorten it.
 	dbCallTimeout time.Duration
 
@@ -63,9 +62,11 @@ type Client struct {
 	runCtx    context.Context
 	cancelRun context.CancelCauseFunc
 	// pools holds the poller of every kind; Schedule wakes them through it.
-	pools  map[Kind]*kindPool
-	bgWG   sync.WaitGroup // pollers and maintenance loops
-	jobsWG sync.WaitGroup // running handlers
+	pools map[Kind]*kindPool
+	// completer writes the results of finished handlers.
+	completer *completer
+	bgWG      sync.WaitGroup // pollers and maintenance loops
+	jobsWG    sync.WaitGroup // running handlers
 }
 
 // New creates a Client over pool. It validates all options and returns the
@@ -137,6 +138,8 @@ func (c *Client) Start(ctx context.Context) error {
 	c.bgCtx, c.cancelBg = context.WithCancel(context.Background())
 	c.runCtx, c.cancelRun = context.WithCancelCause(context.Background())
 	c.state = stateStarted
+	c.completer = newCompleter(c)
+	go c.completer.loop()
 
 	names := make([]string, 0, len(c.kinds))
 	c.pools = make(map[Kind]*kindPool, len(c.kinds))
@@ -174,15 +177,18 @@ func (c *Client) startMaintenance() {
 	}
 }
 
-// Stop stops polling and maintenance and waits for running handlers until ctx
-// is done. Then it cancels handler contexts, waits up to the stop grace for
-// them to record their status and returns ctx.Err(). Handlers that ignore
-// their context may still be running after Stop returns, and a handler that
-// has returned may still retry its status write for up to 10s (dbCallTimeout);
-// keep the pool open that long, or the write fails and the rescuer recovers
-// the job. When Stop returns nil, all status writes are done. Stop on a
-// Client that was never started returns nil. A later Stop waits until the first one returns, then returns nil, or
-// returns ctx.Err() if ctx is done first.
+// Stop stops polling and maintenance and waits until ctx is done for running
+// handlers and then for the writes of their results. If ctx is done first,
+// it cancels handler contexts, waits up to the stop grace for handlers to
+// return and their results to be written, and returns ctx.Err(); it returns
+// nil only if all handlers had returned and all results are written by then.
+// Handlers that ignore their context may still be running after Stop
+// returns, and a result write still in flight may retry for up to 10s
+// (dbCallTimeout); keep the pool open that long, or the write fails and the
+// rescuer recovers the job. When Stop returns nil, all status writes are
+// done. Stop on a Client that was never started returns nil. A later Stop
+// waits until the first one returns, then returns nil, or returns ctx.Err()
+// if ctx is done first.
 func (c *Client) Stop(ctx context.Context) error {
 	c.mu.Lock()
 	prev := c.state
@@ -225,13 +231,34 @@ func (c *Client) Stop(ctx context.Context) error {
 	var err error
 	select {
 	case <-drained: // drained wins, even if ctx is done too
+		c.completer.close()
+		select {
+		case <-c.completer.done:
+		case <-ctx.Done():
+			grace := time.NewTimer(c.stopGrace)
+			defer grace.Stop()
+			select {
+			case <-c.completer.done:
+			case <-grace.C:
+				err = ctx.Err()
+				c.logger.Warn("notasap: status writes still running after stop grace")
+			}
+		}
 	default:
+		// One grace covers both the handlers and the writes of their results.
 		err = ctx.Err()
 		grace := time.NewTimer(c.stopGrace)
 		defer grace.Stop()
 		select {
 		case <-drained:
+			c.completer.close()
+			select {
+			case <-c.completer.done:
+			case <-grace.C:
+				c.logger.Warn("notasap: status writes still running after stop grace")
+			}
 		case <-grace.C:
+			c.completer.close()
 			c.logger.Warn("notasap: handlers still running after stop grace")
 		}
 	}
