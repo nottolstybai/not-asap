@@ -19,7 +19,9 @@ type finishCall struct {
 }
 
 // fakeStore is an in-memory jobStore for pool tests. Jobs fed into pending
-// are returned by Claim; status writes are recorded and always succeed.
+// are returned by Claim; status writes are recorded and succeed unless
+// scripted otherwise. CompleteOne reports no row written unless scripted
+// otherwise: rows reach it only when Complete did not write them.
 type fakeStore struct {
 	pending chan store.ClaimedJob
 	// claimHook, if set before Start, runs at the start of every Claim; a
@@ -43,13 +45,17 @@ type fakeStore struct {
 	calls      []finishCall
 	batches    []int         // rows of every Complete call, in order
 	writes     []writeResult // scripted results of upcoming Complete calls
+	ones       []store.Ref   // ref of every CompleteOne call, in order
+	oneWrites  []writeResult // scripted results of upcoming CompleteOne calls
 }
 
-// writeResult is a scripted result of a Complete call; ok == false means
-// no row was written.
+// writeResult is a scripted result of a Complete or CompleteOne call;
+// ok == false means no row was written, missing lists the ids Complete
+// does not write when ok.
 type writeResult struct {
-	ok  bool
-	err error
+	ok      bool
+	err     error
+	missing []int64
 }
 
 var _ jobStore = (*fakeStore)(nil)
@@ -86,14 +92,29 @@ func (f *fakeStore) scriptWrites(rs ...writeResult) {
 	f.writes = rs
 }
 
-// nextWrite pops the next scripted result; f.mu must be held.
-func (f *fakeStore) nextWrite() (bool, error) {
+// scriptOnes makes the next CompleteOne calls return rs in order; later
+// calls write no row.
+func (f *fakeStore) scriptOnes(rs ...writeResult) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.oneWrites = rs
+}
+
+// nextWrite pops the next scripted result of Complete; f.mu must be held.
+func (f *fakeStore) nextWrite() writeResult {
 	if len(f.writes) == 0 {
-		return true, nil
+		return writeResult{ok: true}
 	}
 	r := f.writes[0]
 	f.writes = f.writes[1:]
-	return r.ok, r.err
+	return r
+}
+
+// Ones returns the ref of every CompleteOne call.
+func (f *fakeStore) Ones() []store.Ref {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.ones)
 }
 
 func (f *fakeStore) Claims() int {
@@ -132,7 +153,6 @@ func (f *fakeStore) Calls() []finishCall {
 	return append([]finishCall(nil), f.calls...)
 }
 
-// Insert reports every job as inserted; it does not queue them for Claim.
 // Batches returns the number of rows of every Complete call.
 func (f *fakeStore) Batches() []int {
 	f.mu.Lock()
@@ -140,6 +160,7 @@ func (f *fakeStore) Batches() []int {
 	return slices.Clone(f.batches)
 }
 
+// Insert reports every job as inserted; it does not queue them for Claim.
 func (f *fakeStore) Insert(_ context.Context, _ store.DB, params []store.InsertParams) ([]store.InsertResult, error) {
 	res := make([]store.InsertResult, len(params))
 	for i := range res {
@@ -188,8 +209,9 @@ func (f *fakeStore) Complete(ctx context.Context, cs []store.Completion) ([]stor
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.batches = append(f.batches, len(cs))
-	refs := make([]store.Ref, len(cs))
-	for i, cp := range cs {
+	r := f.nextWrite()
+	var refs []store.Ref
+	for _, cp := range cs {
 		f.calls = append(f.calls, finishCall{
 			ref:    cp.Ref,
 			status: Status(cp.Status),
@@ -197,13 +219,26 @@ func (f *fakeStore) Complete(ctx context.Context, cs []store.Completion) ([]stor
 			delay:  cp.Delay,
 			refund: cp.Refund,
 		})
-		refs[i] = cp.Ref
+		if !slices.Contains(r.missing, cp.ID) {
+			refs = append(refs, cp.Ref)
+		}
 	}
-	ok, err := f.nextWrite()
-	if err != nil || !ok {
-		return nil, err
+	if r.err != nil || !r.ok {
+		return nil, r.err
 	}
 	return refs, nil
+}
+
+func (f *fakeStore) CompleteOne(_ context.Context, c store.Completion) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ones = append(f.ones, c.Ref)
+	if len(f.oneWrites) == 0 {
+		return false, nil
+	}
+	r := f.oneWrites[0]
+	f.oneWrites = f.oneWrites[1:]
+	return r.ok, r.err
 }
 
 func (f *fakeStore) Cancel(context.Context, int64) (store.CancelOutcome, error) {

@@ -19,6 +19,7 @@ type jobStore interface {
 	Insert(ctx context.Context, db store.DB, params []store.InsertParams) ([]store.InsertResult, error)
 	Claim(ctx context.Context, kind int16, limit int, lease time.Duration) ([]store.ClaimedJob, error)
 	Complete(ctx context.Context, cs []store.Completion) ([]store.Ref, error)
+	CompleteOne(ctx context.Context, c store.Completion) (bool, error)
 	Cancel(ctx context.Context, id int64) (store.CancelOutcome, error)
 	Rescue(ctx context.Context, limit int, decide func(store.StuckJob) store.RescueDecision) (int, error)
 	DeleteFinished(ctx context.Context, status int16, olderThan time.Duration, limit int) (int64, error)

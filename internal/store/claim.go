@@ -1,10 +1,8 @@
 package store
 
 import (
-	"cmp"
 	"context"
 	"fmt"
-	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -23,15 +21,35 @@ FROM (
 WHERE j.id = c.id
 RETURNING j.id, j.kind, j.payload, j.attempt, j.max_attempts, j.lease, j.created_at`
 
-const completeSQL = `UPDATE notasap_jobs j
+// completeSQL locks the rows to write in id order, so that concurrent batches
+// do not deadlock, and skips rows locked by another transaction, so that one
+// such row does not hold up the whole batch.
+const completeSQL = `WITH u AS (
+    SELECT id, lease, status, error, delay, refund
+    FROM unnest($1::bigint[], $2::bigint[], $3::smallint[], $4::text[], $5::float8[], $6::bool[])
+        AS u(id, lease, status, error, delay, refund)
+), l AS MATERIALIZED (
+    SELECT j.id FROM notasap_jobs j JOIN u ON j.id = u.id AND j.lease = u.lease
+    WHERE j.status = 2 /* running */
+    ORDER BY j.id
+    FOR UPDATE OF j SKIP LOCKED
+)
+UPDATE notasap_jobs j
 SET status = u.status,
     run_at = CASE WHEN u.status = 1 /* pending */ THEN NOW() + make_interval(secs => u.delay) ELSE j.run_at END,
     error = u.error, deadline = NULL,
     attempt = CASE WHEN u.refund THEN j.attempt - 1 ELSE j.attempt END, updated_at = NOW()
-FROM unnest($1::bigint[], $2::bigint[], $3::smallint[], $4::text[], $5::float8[], $6::bool[])
-    AS u(id, lease, status, error, delay, refund)
-WHERE j.id = u.id AND j.lease = u.lease AND j.status = 2 /* running */
+FROM u JOIN l USING (id)
+WHERE j.id = u.id AND j.lease = u.lease
 RETURNING j.id, j.lease`
+
+// completeOneSQL is completeSQL for one row, waiting for its lock.
+const completeOneSQL = `UPDATE notasap_jobs
+SET status = $3,
+    run_at = CASE WHEN $3::smallint = 1 /* pending */ THEN NOW() + make_interval(secs => $5) ELSE run_at END,
+    error = $4, deadline = NULL,
+    attempt = CASE WHEN $6 THEN attempt - 1 ELSE attempt END, updated_at = NOW()
+WHERE id = $1 AND lease = $2 AND status = 2 /* running */`
 
 // ClaimedJob is a job row taken for execution.
 type ClaimedJob struct {
@@ -79,13 +97,11 @@ type Completion struct {
 }
 
 // Complete writes all completions in one statement and returns the refs of
-// the rows written. A missing ref means its lease no longer matches (the job
-// was rescued or already finished). Rows are updated in id order so that
-// concurrent batches do not deadlock.
+// the rows written. Rows are locked in id order, so concurrent batches do not
+// deadlock. A ref is missing when its lease no longer matches (the job was
+// rescued or already finished) or its row is locked by another transaction;
+// CompleteOne tells the two apart.
 func (s *Store) Complete(ctx context.Context, cs []Completion) ([]Ref, error) {
-	cs = slices.SortedFunc(slices.Values(cs), func(a, b Completion) int {
-		return cmp.Or(cmp.Compare(a.ID, b.ID), cmp.Compare(a.Lease, b.Lease))
-	})
 	ids := make([]int64, len(cs))
 	leases := make([]int64, len(cs))
 	statuses := make([]int16, len(cs))
@@ -108,4 +124,15 @@ func (s *Store) Complete(ctx context.Context, cs []Completion) ([]Ref, error) {
 	}
 
 	return written, nil
+}
+
+// CompleteOne writes c like Complete, but waits for a row lock held by
+// another transaction. It reports false if the lease no longer matches.
+func (s *Store) CompleteOne(ctx context.Context, c Completion) (bool, error) {
+	tag, err := s.pool.Exec(ctx, completeOneSQL, c.ID, c.Lease, c.Status, nullable(c.Error), c.Delay.Seconds(), c.Refund)
+	if err != nil {
+		return false, fmt.Errorf("pool.Exec: %w", err)
+	}
+
+	return tag.RowsAffected() == 1, nil
 }

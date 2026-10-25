@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,6 +12,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/require"
 
 	"github.com/nottolstybai/not-asap/internal/store"
@@ -57,7 +59,7 @@ func blockFirstWrite(st *fakeStore, release <-chan struct{}) <-chan struct{} {
 
 func TestCompleter(t *testing.T) {
 	t.Parallel()
-	t.Run("coalesces results during a write", func(t *testing.T) {
+	t.Run("coalesces", func(t *testing.T) {
 		t.Parallel()
 		synctest.Test(t, func(t *testing.T) {
 			st := newFakeStore()
@@ -75,7 +77,7 @@ func TestCompleter(t *testing.T) {
 		})
 	})
 
-	t.Run("caps a batch", func(t *testing.T) {
+	t.Run("caps batch", func(t *testing.T) {
 		t.Parallel()
 		synctest.Test(t, func(t *testing.T) {
 			st := newFakeStore()
@@ -93,7 +95,7 @@ func TestCompleter(t *testing.T) {
 		})
 	})
 
-	t.Run("retries transient as a batch", func(t *testing.T) {
+	t.Run("retries transient", func(t *testing.T) {
 		t.Parallel()
 		synctest.Test(t, func(t *testing.T) {
 			st := newFakeStore()
@@ -116,7 +118,7 @@ func TestCompleter(t *testing.T) {
 		})
 	})
 
-	t.Run("outcome unknown for the whole batch", func(t *testing.T) {
+	t.Run("outcome unknown", func(t *testing.T) {
 		t.Parallel()
 		synctest.Test(t, func(t *testing.T) {
 			st := newFakeStore()
@@ -149,7 +151,7 @@ func TestCompleter(t *testing.T) {
 		})
 	})
 
-	t.Run("close unblocks a waiting add", func(t *testing.T) {
+	t.Run("close unblocks add", func(t *testing.T) {
 		t.Parallel()
 		synctest.Test(t, func(t *testing.T) {
 			st := newFakeStore()
@@ -175,7 +177,7 @@ func TestCompleter(t *testing.T) {
 		})
 	})
 
-	t.Run("writes directly after close", func(t *testing.T) {
+	t.Run("direct after close", func(t *testing.T) {
 		t.Parallel()
 		synctest.Test(t, func(t *testing.T) {
 			st := newFakeStore()
@@ -186,6 +188,124 @@ func TestCompleter(t *testing.T) {
 			add(1, 2)
 			// No loop is left, so each result is its own write.
 			require.Equal(t, []int{1, 1}, st.Batches())
+		})
+	})
+}
+
+// logClient returns a client over st that logs to buf at Debug and a
+// completer of it; results are queued with the client's logger.
+func logClient(t *testing.T, st *fakeStore, buf *syncBuffer, opts ...Option) (*Client, *completer) {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	c := newPoolClient(t, st, noop[testPayload], KindConfig{}, append(opts, WithLogger(logger))...)
+
+	return c, newCompleter(c)
+}
+
+// queue adds a done result for each id to w without starting its loop, so
+// they are written as one batch.
+func queue(c *Client, w *completer, ids ...int64) {
+	for _, id := range ids {
+		w.add(completion{
+			ref: store.Ref{
+				ID:    id,
+				Lease: 1,
+			},
+			kind:   "a",
+			a:      action{status: StatusDone},
+			logger: c.logger.With("job_id", id),
+		})
+	}
+}
+
+func TestCompleterRows(t *testing.T) {
+	t.Parallel()
+	t.Run("poison row", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			st := newFakeStore()
+			poison := &pgconn.PgError{Code: "22021"}
+			st.scriptWrites(writeResult{err: poison}, writeResult{ok: true}, writeResult{err: poison}, writeResult{ok: true})
+			obs := &countObserver{}
+			var buf syncBuffer
+			c, w := logClient(t, st, &buf, WithObserver(obs))
+			queue(c, w, 1, 2, 3)
+
+			go w.loop()
+			w.close()
+			<-w.done
+			require.Equal(t, []int{3, 1, 1, 1}, st.Batches())
+			require.EqualValues(t, 2, obs.finished.Load())
+			require.Equal(t, 1, strings.Count(buf.String(), `level=WARN msg="notasap: write job statuses, writing them one by one" jobs=3`))
+			require.Equal(t, 1, strings.Count(buf.String(), `level=WARN msg="notasap: write job status" job_id=2`))
+			require.Equal(t, 1, strings.Count(buf.String(), "level=WARN msg=\"notasap: write job status\""))
+		})
+	})
+
+	t.Run("slow path", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			st := newFakeStore()
+			st.scriptWrites(writeResult{
+				ok:      true,
+				missing: []int64{2, 3},
+			})
+			st.scriptOnes(writeResult{ok: true})
+			obs := &countObserver{}
+			var buf syncBuffer
+			c, w := logClient(t, st, &buf, WithObserver(obs))
+			queue(c, w, 1, 2, 3)
+
+			go w.loop()
+			w.close()
+			<-w.done
+			require.Equal(t, []int{3}, st.Batches())
+			require.Equal(t, []store.Ref{{ID: 2, Lease: 1}, {ID: 3, Lease: 1}}, st.Ones())
+			require.EqualValues(t, 2, obs.finished.Load())
+			require.Equal(t, 1, strings.Count(buf.String(), "job lost lease"))
+			require.Contains(t, buf.String(), `level=WARN msg="notasap: job lost lease" job_id=3`)
+		})
+	})
+
+	t.Run("slow path after timeout", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			st := newFakeStore()
+			st.scriptWrites(writeResult{err: fmt.Errorf("complete: %w", context.DeadlineExceeded)}, writeResult{
+				ok:      true,
+				missing: []int64{2},
+			})
+			obs := &countObserver{}
+			var buf syncBuffer
+			c, w := logClient(t, st, &buf, WithObserver(obs))
+			queue(c, w, 1, 2)
+
+			go w.loop()
+			w.close()
+			<-w.done
+			require.Equal(t, []store.Ref{{ID: 2, Lease: 1}}, st.Ones())
+			require.EqualValues(t, 1, obs.finished.Load())
+			require.Contains(t, buf.String(), `level=INFO msg="notasap: status write outcome unknown after retry" job_id=2`)
+			require.NotContains(t, buf.String(), "job lost lease")
+		})
+	})
+
+	t.Run("failed batch log", func(t *testing.T) {
+		t.Parallel()
+		synctest.Test(t, func(t *testing.T) {
+			st := newFakeStore()
+			st.scriptWrites(slices.Repeat([]writeResult{{err: retryableErr{}}}, 50)...)
+			var buf syncBuffer
+			c, w := logClient(t, st, &buf)
+			queue(c, w, 1, 2, 3)
+
+			go w.loop()
+			w.close()
+			<-w.done
+			require.Equal(t, 1, strings.Count(buf.String(), "level=WARN"))
+			require.Contains(t, buf.String(), `level=WARN msg="notasap: write job statuses" jobs=3`)
+			require.Equal(t, 3, strings.Count(buf.String(), `level=DEBUG msg="notasap: write job status"`))
+			require.Empty(t, st.Ones())
 		})
 	})
 }
@@ -258,5 +378,32 @@ func TestFullQueueKeepsSlot(t *testing.T) {
 		require.EqualValues(t, 1, obs.ended.Load())
 		require.Empty(t, c.pools[1].slots)
 		require.Len(t, st.Calls(), maxQueued+2)
+	})
+}
+
+func TestStopWritesWithinGrace(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		st := newFakeStore()
+		st.completeHook = func(context.Context) { time.Sleep(time.Second) }
+		h := func(ctx context.Context, _ *Job[testPayload]) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		c := newPoolClient(t, st, h, KindConfig{Workers: 3}, WithStopGrace(5*time.Second))
+		st.feed(3)
+		require.NoError(t, c.Start(context.Background()))
+		time.Sleep(time.Second) // past PollInterval: the jobs are claimed and run
+		synctest.Wait()
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		require.ErrorIs(t, c.Stop(ctx), context.DeadlineExceeded)
+		calls := st.Calls()
+		require.Len(t, calls, 3)
+		for _, call := range calls {
+			require.Equal(t, StatusPending, call.status)
+			require.True(t, call.refund)
+		}
 	})
 }
