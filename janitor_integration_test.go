@@ -60,7 +60,10 @@ func (s *JanitorSuite) TestCleanNow() {
 }
 
 func (s *JanitorSuite) TestLoop() {
-	s.Run("disabled", func() {
+	// Smoke test only: Stop cancels the loops, so a janitor that ignored
+	// Disabled could still miss its first pass. TestJanitorLoopStartsUnlessDisabled
+	// (unit) is the real check.
+	s.Run("disabled smoke", func() {
 		s.InsertJobs(2, pgtest.Finished(store.StatusDone, 25*time.Hour))
 
 		c := s.startClient(nil, notasap.WithJanitor(notasap.JanitorConfig{Disabled: true}))

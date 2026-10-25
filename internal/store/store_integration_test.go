@@ -54,11 +54,12 @@ func (s *StoreSuite) TestClaim() {
 			`SELECT indexdef FROM pg_indexes WHERE schemaname = $1 AND indexname = 'notasap_jobs_claim_idx'`,
 			s.Schema).Scan(&indexDef))
 		s.Exec("DROP INDEX notasap_jobs_claim_idx")
-		s.T().Cleanup(func() { s.Exec(indexDef) })
+		s.ExecOnCleanup(indexDef)
 		// run_at order differs from id order: latest has the lowest id, the two
 		// ties share one NOW() and so an exact run_at.
 		latest := s.pending(1, -time.Second)
 		ties := s.InsertJobs(2, pgtest.WithRunIn(-3*time.Second))
+		slices.Sort(ties) // RETURNING order is not guaranteed
 		tieLow, tieHigh := ties[0], ties[1]
 		mid := s.pending(1, -2*time.Second)
 		s.pending(2, -10*time.Second)
@@ -227,7 +228,7 @@ func (s *StoreSuite) TestCheckSchemaMissing() {
 
 	schema := "nt_empty_" + s.Schema
 	s.Exec("CREATE SCHEMA " + schema)
-	s.T().Cleanup(func() { s.Exec("DROP SCHEMA " + schema + " CASCADE") })
+	s.ExecOnCleanup("DROP SCHEMA " + schema + " CASCADE")
 	pool := pgtest.NewPool(s.T(), schema)
 
 	err := store.New(pool).CheckSchema(context.Background())

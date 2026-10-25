@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 
 	notasap "github.com/nottolstybai/not-asap"
@@ -44,10 +45,11 @@ func (s *PromSuite) TestMetricsAfterProcessing() {
 
 	ctx := context.Background()
 	s.Require().NoError(c.Start(ctx))
+	t := s.T() // the cleanup reports on this T
 	stop := func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		s.NoError(c.Stop(ctx))
+		assert.NoError(t, c.Stop(ctx))
 	}
 	s.T().Cleanup(stop)
 

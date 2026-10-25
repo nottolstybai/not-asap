@@ -408,20 +408,27 @@ func TestStartPoolWarning(t *testing.T) {
 }
 
 func TestJanitorLoopStartsUnlessDisabled(t *testing.T) {
+	// Both maintenance loops tick every millisecond. The rescuer blocks on
+	// its ticker between passes, leaving the scheduler idle, so a janitor
+	// loop that was started runs long before the rescuer completes 20 passes.
+	fast := []Option{
+		WithRescuer(RescuerConfig{Interval: time.Millisecond}),
+		WithJanitor(JanitorConfig{Interval: time.Millisecond}),
+	}
 	t.Run("enabled", func(t *testing.T) {
 		st := newFakeStore()
-		c := newPoolClient(t, st, noop[testPayload], KindConfig{})
+		c := newPoolClient(t, st, noop[testPayload], KindConfig{}, fast...)
 		stopOnCleanup(t, c)
 		require.NoError(t, c.Start(context.Background()))
-		require.Eventually(t, func() bool { return st.Deletes() > 0 }, waitFor, tick)
+		recv(t, st.deleted)
 	})
 	t.Run("disabled", func(t *testing.T) {
 		st := newFakeStore()
-		c := newPoolClient(t, st, noop[testPayload], KindConfig{}, WithJanitor(JanitorConfig{Disabled: true}))
+		c := newPoolClient(t, st, noop[testPayload], KindConfig{},
+			append(fast, WithJanitor(JanitorConfig{Disabled: true}))...)
 		stopOnCleanup(t, c)
 		require.NoError(t, c.Start(context.Background()))
-		// Let the other loops make progress before checking the janitor's.
-		require.Eventually(t, func() bool { return st.Rescues() > 0 && st.Claims() >= 2 }, waitFor, tick)
+		require.Eventually(t, func() bool { return st.Rescues() >= 20 && st.Claims() >= 1 }, waitFor, tick)
 		stop(t, c)
 		require.Zero(t, st.Deletes())
 	})

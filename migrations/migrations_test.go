@@ -39,7 +39,7 @@ func gooseSections(s *MigrationsSuite) (up, down string) {
 func (s *MigrationsSuite) newSchema(prefix string) string {
 	name := s.Schema + "_" + prefix
 	s.Exec("CREATE SCHEMA " + name)
-	s.T().Cleanup(func() { s.Exec("DROP SCHEMA IF EXISTS " + name + " CASCADE") })
+	s.ExecOnCleanup("DROP SCHEMA IF EXISTS " + name + " CASCADE")
 	return name
 }
 

@@ -87,6 +87,37 @@ func (s *RescuerSuite) TestRescueNow() {
 // rescues with RescueNow. The Start pass only sees rows already past their
 // deadline, so at worst it performs that same rescue: the subtests wait for
 // the rescued status rather than reading it right after RescueNow.
+// TestBackgroundRescue covers the real path end to end: a claim's lease is
+// Timeout + Grace, the handler outlives it, and the background loop (not
+// RescueNow) returns the job to pending.
+func (s *RescuerSuite) TestBackgroundRescue() {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	c := s.startClient([]kindReg{reg(func(context.Context, *notasap.Job[payloadA]) error {
+		started <- struct{}{}
+		<-release // ignores its context
+		return nil
+	}, notasap.KindConfig{
+		Name: "a", Workers: 1, Timeout: 50 * time.Millisecond, MaxAttempts: 3,
+		Backoff: notasap.Constant(time.Hour),
+	})}, notasap.WithRescuer(notasap.RescuerConfig{Interval: 20 * time.Millisecond, Grace: 50 * time.Millisecond}))
+	unblock := sync.OnceFunc(func() { close(release) })
+	s.T().Cleanup(unblock) // registered after startClient, so it runs before the client's Stop
+	id := s.schedule(c, payloadA{})
+	recv(s.T(), started)
+
+	s.waitStatus(id, notasap.StatusPending)
+	unblock()
+	s.stop(c) // drains the stale handler and its fenced write
+	row := s.Job(id)
+	s.Equal(notasap.StatusPending, notasap.Status(row.Status))
+	s.Require().NotNil(row.Error)
+	s.Equal(store.RescuedError, *row.Error)
+	s.Equal(1, row.Attempt)
+	s.Equal(1, c.obs.Count("rescued/a"))
+	s.Equal(0, c.obs.Count("finished/done"))
+}
+
 func (s *RescuerSuite) TestStaleWorker() {
 	s.Run("write fenced after rescue", func() {
 		started := make(chan struct{}, 1)

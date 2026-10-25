@@ -187,11 +187,17 @@ func (s *WorkerSuite) TestKindIsolation() {
 			started <- struct{}{}
 			<-release
 			return nil
-		}, notasap.KindConfig{Name: "a", Workers: 1}),
+		}, notasap.KindConfig{Name: "a", Workers: 1, Timeout: 10 * time.Minute}),
 		reg(noop[payloadB], notasap.KindConfig{Name: "b"}),
-	})
+	}, notasap.WithRescuer(notasap.RescuerConfig{Grace: 5 * time.Minute}))
 	blocked := s.schedule(c, payloadA{})
 	recv(s.T(), started)
+
+	// The claim's lease is Timeout + Grace, measured on the DB clock.
+	var leaseLeft float64
+	s.Require().NoError(s.Pool.QueryRow(context.Background(),
+		`SELECT EXTRACT(EPOCH FROM deadline - NOW())::float8 FROM notasap_jobs WHERE id = $1`, blocked).Scan(&leaseLeft))
+	s.InDelta((15 * time.Minute).Seconds(), leaseLeft, 2)
 
 	ids := make([]int64, 5)
 	for i := range ids {
@@ -294,7 +300,7 @@ func (s *WorkerSuite) TestStop() {
 func (s *WorkerSuite) TestStartFailsWithoutTable() {
 	schema := "empty_" + strings.ToLower(strings.ReplaceAll(s.Schema, "nt_", ""))
 	s.Exec("CREATE SCHEMA " + schema)
-	s.T().Cleanup(func() { s.Exec("DROP SCHEMA " + schema + " CASCADE") })
+	s.ExecOnCleanup("DROP SCHEMA " + schema + " CASCADE")
 
 	c, err := notasap.New(pgtest.NewPool(s.T(), schema), notasap.WithLogger(slog.New(slog.DiscardHandler)))
 	s.Require().NoError(err)

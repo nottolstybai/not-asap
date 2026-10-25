@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/stretchr/testify/assert"
 
 	notasap "github.com/nottolstybai/not-asap"
 	"github.com/nottolstybai/not-asap/internal/pgtest"
@@ -126,10 +127,13 @@ func (s *clientSuite) startClientOn(pool *pgxpool.Pool, kinds []kindReg, opts ..
 	s.T().Helper()
 	c := s.newClientOn(pool, kinds, opts...)
 	s.Require().NoError(c.Start(context.Background()))
-	s.T().Cleanup(func() {
+	// Cleanups run after s.T() may have moved on (e.g. inside s.Run), so
+	// report on the T that registered it.
+	t := s.T()
+	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		s.NoError(c.Stop(ctx))
+		assert.NoError(t, c.Stop(ctx))
 	})
 	return c
 }

@@ -159,6 +159,17 @@ func (s *Suite) SetupSubTest() {
 	s.Exec("TRUNCATE notasap_jobs")
 }
 
+// ExecOnCleanup runs sql on the suite pool when the current test ends and
+// reports a failure on that test's T, not on whatever s.T() is by then.
+func (s *Suite) ExecOnCleanup(sql string) {
+	t := s.T()
+	t.Cleanup(func() {
+		if _, err := s.Pool.Exec(context.Background(), sql); err != nil {
+			t.Errorf("pgtest: cleanup %q: %v", sql, err)
+		}
+	})
+}
+
 // Exec runs SQL on the suite pool and requires success.
 func (s *Suite) Exec(sql string, args ...any) {
 	s.T().Helper()
