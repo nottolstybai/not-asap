@@ -20,6 +20,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+          check-latest: true
 
       - name: gofmt
         run: |
@@ -68,6 +69,10 @@ jobs:
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # A newer run supersedes an older one, so stale coverage is never published last.
+    concurrency:
+      group: coverage-badge
+      cancel-in-progress: true
     permissions:
       contents: write
     steps:
