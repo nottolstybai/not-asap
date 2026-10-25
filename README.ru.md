@@ -12,6 +12,7 @@
 <p align="center">
   <a href="https://pkg.go.dev/github.com/nottolstybai/not-asap"><img alt="Go Reference" src="https://pkg.go.dev/badge/github.com/nottolstybai/not-asap.svg"></a>
   <a href="https://github.com/nottolstybai/not-asap/actions/workflows/test.yml"><img alt="test" src="https://github.com/nottolstybai/not-asap/actions/workflows/test.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/nottolstybai/not-asap/actions/workflows/test.yml"><img alt="coverage" src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/nottolstybai/not-asap/badges/coverage.json"></a>
   <img alt="Go 1.26+" src="https://img.shields.io/badge/go-1.26%2B-00ADD8?logo=go&logoColor=white">
   <img alt="PostgreSQL 14+" src="https://img.shields.io/badge/postgres-14%2B-4169E1?logo=postgresql&logoColor=white">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green"></a>

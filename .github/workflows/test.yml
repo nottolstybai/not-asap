@@ -12,6 +12,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      coverage: ${{ steps.summary.outputs.coverage }}
     steps:
       - uses: actions/checkout@v5
 
@@ -40,8 +42,10 @@ jobs:
           go test -race -count=1 -coverpkg="$pkgs" -coverprofile=coverage.out ./...
 
       - name: coverage summary
+        id: summary
         run: |
           total=$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}')
+          echo "coverage=$total" >> "$GITHUB_OUTPUT"
           {
             echo "### Coverage: $total"
             echo
@@ -57,3 +61,30 @@ jobs:
         with:
           name: coverage
           path: coverage.out
+
+  # Publishes coverage.json for the shields.io endpoint badge in README to the
+  # badges branch, which always holds a single commit.
+  badge:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: publish coverage.json
+        env:
+          COVERAGE: ${{ needs.test.outputs.coverage }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pct=${COVERAGE%\%}
+          color=$(awk -v p="$pct" 'BEGIN {
+            if (p >= 90) print "brightgreen"; else if (p >= 75) print "green";
+            else if (p >= 60) print "yellow"; else print "red" }')
+          mkdir badges && cd badges
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s","color":"%s"}\n' "$COVERAGE" "$color" > coverage.json
+          git init -q -b badges
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add coverage.json
+          git commit -q -m "coverage $COVERAGE"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" badges
