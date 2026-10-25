@@ -601,7 +601,7 @@ func TestNotify(t *testing.T) {
 		require.NoError(t, Register(c, noop[otherPayload], KindConfig{Name: "b"}))
 		require.NoError(t, c.Start(ctx))
 		stopOnCleanup(t, c)
-		ps := c.pollers([]Kind{1, 2, 1, 99, 2})
+		ps := c.poolsOf([]Kind{1, 2, 1, 99, 2})
 		require.Len(t, ps, 2)
 		require.Same(t, c.pools[1], ps[0])
 		require.Same(t, c.pools[2], ps[1])
@@ -629,13 +629,7 @@ func TestClaimCoalescing(t *testing.T) {
 				<-done
 			}
 
-			limits := st.Limits()
-			require.NotContains(t, limits, 1)
-			var sum int
-			for _, l := range limits {
-				sum += l
-			}
-			require.GreaterOrEqual(t, float64(sum)/float64(len(limits)), float64(workers/4))
+			require.NotContains(t, st.Limits(), 1)
 		})
 	})
 

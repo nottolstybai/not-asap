@@ -34,7 +34,7 @@ func isTransient(err error) bool {
 // kindPool polls and runs the jobs of one Kind with at most Workers handlers.
 type kindPool struct {
 	c     *Client
-	e     *kindEntry
+	entry *kindEntry
 	slots chan struct{} // one token per running handler; cap is Workers
 	wake  chan struct{} // signalled when a slot frees; cap 1
 	// notify is signalled when this client schedules a ready job of the
@@ -48,7 +48,7 @@ type kindPool struct {
 // batch or a claim error it waits PollInterval or until the client schedules
 // a ready job of the kind.
 func (p *kindPool) loop() {
-	c, cfg := p.c, p.e.cfg
+	c, cfg := p.c, p.entry.cfg
 	lease := cfg.Timeout + c.rescuer.Grace
 	timer := time.NewTimer(cfg.PollInterval)
 	timer.Stop()
@@ -65,7 +65,7 @@ func (p *kindPool) loop() {
 		// and then drained by Stop.
 		start := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), dbCallTimeout)
-		rows, err := c.st.Claim(ctx, int16(p.e.kind), free, lease)
+		rows, err := c.st.Claim(ctx, int16(p.entry.kind), free, lease)
 		cancel()
 		c.observer.Polled(cfg.Name, time.Since(start))
 		if err != nil {
@@ -148,7 +148,7 @@ func (p *kindPool) sleep(timer *time.Timer, d time.Duration) bool {
 // execute runs the handler for a claimed job, waits for it even past its
 // timeout, records the outcome and frees the slot.
 func (p *kindPool) execute(row store.ClaimedJob) {
-	c, cfg := p.c, p.e.cfg
+	c, cfg := p.c, p.entry.cfg
 	defer func() {
 		c.observer.JobEnded(cfg.Name)
 		<-p.slots
@@ -186,12 +186,12 @@ func (p *kindPool) run(ctx context.Context, row store.ClaimedJob, logger *slog.L
 			res = execResult{panicked: true, panicValue: v}
 		}
 	}()
-	return p.e.run(ctx, row)
+	return p.entry.run(ctx, row)
 }
 
 // record writes the job's next state and reports it.
 func (p *kindPool) record(row store.ClaimedJob, a action, took time.Duration, logger *slog.Logger) {
-	c, name := p.c, p.e.cfg.Name
+	c, name := p.c, p.entry.cfg.Name
 	ctx, cancel := context.WithTimeout(context.Background(), dbCallTimeout)
 	defer cancel()
 
@@ -222,9 +222,8 @@ func (p *kindPool) record(row store.ClaimedJob, a action, took time.Duration, lo
 		logger.Warn("notasap: write job status", "status", a.status, "error", err)
 		return
 	case !ok && retried:
-		// A failed attempt may have committed before its error, so the retry
-		// finds the lease gone either way. The observer is not called, as for
-		// a lost lease.
+		// The retry cannot tell a committed earlier attempt from a lost
+		// lease. The observer is not called, as for a lost lease.
 		logger.Info("notasap: status write outcome unknown after retry", "status", a.status)
 		return
 	case !ok:

@@ -104,18 +104,19 @@ func (c *Client) ScheduleTx(ctx context.Context, tx pgx.Tx, p Payload, opts ...S
 // fails the whole batch and nothing is written. Rows are inserted ordered by
 // kind, then key (keyless items first, in item order; keys compared
 // byte-wise), so jobs of one batch that are due at the same time are claimed
-// in that order, not in item order. A batch without idempotency keys takes one round
-// trip; one with keys runs in its own transaction, as resolving conflicts
-// may take up to three insert and lookup rounds.
+// in that order, not in item order. A batch without idempotency keys takes
+// one round trip; one with keys runs in its own transaction, as resolving
+// conflicts may take up to three insert and lookup rounds.
 func (c *Client) ScheduleBatch(ctx context.Context, items ...BatchItem) ([]BatchResult, error) {
 	return c.scheduleBatch(ctx, c.db, items, true)
 }
 
 // ScheduleBatchTx is ScheduleBatch within tx. On a database error tx is
 // aborted; validation errors send no SQL and leave tx usable. Items are
-// inserted in (kind, key) order, keys compared byte-wise, but keys scheduled by other calls in the
-// same tx must follow a consistent (kind, key) order across the application,
-// or Postgres may abort tx with a deadlock (SQLSTATE 40P01); retry tx on 40P01.
+// inserted in (kind, key) order, keys compared byte-wise, but keys scheduled
+// by other calls in the same tx must follow a consistent (kind, key) order
+// across the application, or Postgres may abort tx with a deadlock (SQLSTATE
+// 40P01); retry tx on 40P01.
 func (c *Client) ScheduleBatchTx(ctx context.Context, tx pgx.Tx, items ...BatchItem) ([]BatchResult, error) {
 	if tx == nil {
 		return nil, errors.New("notasap: ScheduleBatchTx: tx is nil")
@@ -190,7 +191,7 @@ func (c *Client) scheduleBatch(ctx context.Context, db store.DB, items []BatchIt
 // notify wakes the idle pollers of kinds without blocking. Before Start it
 // does nothing; after Stop nobody receives the signal.
 func (c *Client) notify(kinds []Kind) {
-	for _, p := range c.pollers(kinds) {
+	for _, p := range c.poolsOf(kinds) {
 		select {
 		case p.notify <- struct{}{}:
 		default:
@@ -198,8 +199,8 @@ func (c *Client) notify(kinds []Kind) {
 	}
 }
 
-// pollers returns the pools of kinds, each once; none before Start.
-func (c *Client) pollers(kinds []Kind) []*kindPool {
+// poolsOf returns the pools of kinds, each once; none before Start.
+func (c *Client) poolsOf(kinds []Kind) []*kindPool {
 	if len(kinds) == 0 {
 		return nil
 	}
@@ -215,6 +216,8 @@ func (c *Client) pollers(kinds []Kind) []*kindPool {
 }
 
 // insertParams validates it and returns its insert parameters and kind name.
+// Its errors use the "notasap: Schedule:" prefix for all four Schedule
+// methods on purpose: they share this validation.
 func (c *Client) insertParams(it BatchItem) (store.InsertParams, string, error) {
 	if it.payload == nil {
 		return store.InsertParams{}, "", errors.New("notasap: Schedule: payload is nil")

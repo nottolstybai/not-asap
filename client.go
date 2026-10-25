@@ -127,7 +127,7 @@ func (c *Client) Start(ctx context.Context) error {
 	for k, e := range c.kinds {
 		p := &kindPool{
 			c:      c,
-			e:      e,
+			entry:  e,
 			slots:  make(chan struct{}, e.cfg.Workers),
 			wake:   make(chan struct{}, 1),
 			notify: make(chan struct{}, 1),
