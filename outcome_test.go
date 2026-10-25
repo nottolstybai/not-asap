@@ -129,6 +129,10 @@ func TestTruncateError(t *testing.T) {
 		t.Parallel()
 		require.Equal(t, "short", truncateError("short"))
 	})
+	t.Run("invalid utf-8 and nul", func(t *testing.T) {
+		t.Parallel()
+		require.Equal(t, "a\uFFFDb\uFFFDc", truncateError("a\xffb\x00\xfe\xfdc"))
+	})
 }
 
 func TestDelayOfRecoversPanic(t *testing.T) {

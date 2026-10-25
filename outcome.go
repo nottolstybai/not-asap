@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -120,8 +121,11 @@ func delayOf(b Backoff, attempt int, logger *slog.Logger) (d time.Duration) {
 	return max(b(attempt), 0)
 }
 
-// truncateError cuts s to at most maxErrorLen bytes on a rune boundary.
+// truncateError makes s storable as text, replacing invalid UTF-8 with U+FFFD
+// and dropping NUL bytes, which Postgres rejects, and cuts it to at most
+// maxErrorLen bytes on a rune boundary.
 func truncateError(s string) string {
+	s = strings.ReplaceAll(strings.ToValidUTF8(s, "\uFFFD"), "\x00", "")
 	if len(s) <= maxErrorLen {
 		return s
 	}
