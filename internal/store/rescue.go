@@ -28,7 +28,7 @@ type StuckJob struct {
 	ID          int64
 	Kind        int16
 	Attempt     int
-	MaxAttempts int
+	MaxAttempts int `db:"max_attempts"`
 }
 
 // RescueDecision says what to do with a StuckJob: fail it, or return it to
@@ -49,12 +49,7 @@ func (s *Store) Rescue(ctx context.Context, limit int, decide func(StuckJob) Res
 			return fmt.Errorf("tx.Query: %w", err)
 		}
 
-		jobs, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (StuckJob, error) {
-			var j StuckJob
-			err := row.Scan(&j.ID, &j.Kind, &j.Attempt, &j.MaxAttempts)
-
-			return j, err
-		})
+		jobs, err := pgx.CollectRows(rows, pgx.RowToStructByName[StuckJob])
 		if err != nil {
 			return fmt.Errorf("pgx.CollectRows: %w", err)
 		}

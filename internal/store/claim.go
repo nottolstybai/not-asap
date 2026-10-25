@@ -36,9 +36,9 @@ type ClaimedJob struct {
 	Kind        int16
 	Payload     []byte
 	Attempt     int
-	MaxAttempts int
+	MaxAttempts int `db:"max_attempts"`
 	Lease       int64
-	CreatedAt   time.Time
+	CreatedAt   time.Time `db:"created_at"`
 }
 
 // Ref identifies one claim of a job: Lease fences out stale owners.
@@ -54,12 +54,7 @@ func (s *Store) Claim(ctx context.Context, kind int16, limit int, lease time.Dur
 		return nil, fmt.Errorf("pool.Query: %w", err)
 	}
 
-	jobs, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (ClaimedJob, error) {
-		var j ClaimedJob
-		err := row.Scan(&j.ID, &j.Kind, &j.Payload, &j.Attempt, &j.MaxAttempts, &j.Lease, &j.CreatedAt)
-
-		return j, err
-	})
+	jobs, err := pgx.CollectRows(rows, pgx.RowToStructByName[ClaimedJob])
 	if err != nil {
 		return nil, fmt.Errorf("pgx.CollectRows: %w", err)
 	}

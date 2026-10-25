@@ -182,6 +182,9 @@ func (c *Client) scheduleBatch(ctx context.Context, db store.DB, items []BatchIt
 	var err error
 	if ownTx && len(params) > 1 && slices.ContainsFunc(params, func(p store.InsertParams) bool { return p.Key != nil }) {
 		err = pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error { return insert(tx) })
+		if err != nil {
+			err = fmt.Errorf("pgx.BeginFunc: %w", err)
+		}
 	} else {
 		err = insert(db)
 	}
