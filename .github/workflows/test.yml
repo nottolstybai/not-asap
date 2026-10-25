@@ -1,0 +1,59 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Not gofmt-ed:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # Integration tests start postgres:16-alpine via testcontainers.
+      # Coverage counts every library package, including lines reached only
+      # from other packages' tests; the example and the test harness are left out.
+      - name: go test
+        run: |
+          pkgs=$(go list ./... | grep -v -e /examples/ -e /internal/pgtest | paste -sd, -)
+          go test -race -count=1 -coverpkg="$pkgs" -coverprofile=coverage.out ./...
+
+      - name: coverage summary
+        run: |
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}')
+          {
+            echo "### Coverage: $total"
+            echo
+            echo "<details><summary>By function</summary>"
+            echo
+            echo '```'
+            go tool cover -func=coverage.out
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
