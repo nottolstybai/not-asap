@@ -168,7 +168,7 @@ func TestOutcome(t *testing.T) {
 	suite.Run(t, new(outcomeSuite))
 }
 
-func (s *outcomeSuite) Test_decide() {
+func (s *outcomeSuite) Test_kindPool_execute() {
 	s.Run("done", func() {
 		c := s.startClient([]kindReg{reg(noop[payloadA], KindConfig{Name: "a"})})
 		id := s.schedule(c, payloadA{N: 1})

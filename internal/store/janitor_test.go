@@ -7,6 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/samber/lo"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/nottolstybai/not-asap/internal/pgtest"
@@ -70,14 +71,17 @@ func (s *janitorSuite) TestStore_DeleteFinished() {
 func (s *janitorSuite) holdJanitorLock(pool *pgxpool.Pool) (release func()) {
 	tx, err := pool.Begin(s.ctx)
 	s.Require().NoError(err)
+	// release may run on cleanup, after s.T() has moved on and s.ctx is
+	// cancelled: report on the T that took the lock.
+	t := s.T()
 	released := false
 	release = func() {
 		if !released {
 			released = true
-			s.NoError(tx.Rollback(context.WithoutCancel(s.ctx))) // may run on cleanup, after s.ctx is cancelled
+			assert.NoError(t, tx.Rollback(context.WithoutCancel(s.ctx)))
 		}
 	}
-	s.T().Cleanup(release)
+	t.Cleanup(release)
 	_, err = tx.Exec(s.ctx, `SELECT pg_advisory_xact_lock('notasap_jobs'::regclass::oid::int, 1)`)
 	s.Require().NoError(err)
 	return release

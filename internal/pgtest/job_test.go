@@ -154,7 +154,7 @@ func (s *jobSuite) TestSuite_WaitFor() {
 	s.GreaterOrEqual(n.Load(), int32(3))
 }
 
-func (s *jobSuite) TestWaitStatus() {
+func (s *jobSuite) Test_WaitStatus() {
 	id := s.Fixture.Job(s.ctx).ID
 	done := make(chan error, 1)
 	go func() {

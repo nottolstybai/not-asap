@@ -71,7 +71,13 @@ func (s *insertSuite) TestStore_Insert_OutcomesInParamsOrder() {
 
 func (s *insertSuite) TestStore_Insert_ReplaceClaimedMeanwhile() {
 	key := "k"
-	params := []store.InsertParams{{Kind: 1, Payload: []byte(`{"new":true}`), MaxAttempts: 3, Key: &key, Replace: true}}
+	params := []store.InsertParams{{
+		Kind:        1,
+		Payload:     []byte(`{"new":true}`),
+		MaxAttempts: 3,
+		Key:         &key,
+		Replace:     true,
+	}}
 
 	// claim marks the pending row of key running in a transaction left open,
 	// like a worker's claim between the insert's snapshot and its conflict
