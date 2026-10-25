@@ -26,9 +26,6 @@ type completion struct {
 	a      action
 	took   time.Duration
 	logger *slog.Logger
-	// unknown is set once a write attempt timed out: it may have committed,
-	// so a row missing from a later attempt does not prove a lost lease.
-	unknown bool
 }
 
 func (r completion) param() store.Completion {
@@ -43,34 +40,24 @@ func (r completion) param() store.Completion {
 
 // completer writes job results in batches (group commit): a result arriving
 // while no write is in flight is written at once; results arriving during a
-// write go together into the next one. A batch skips rows locked by another
-// transaction; those, and rows whose lease looks lost, go to the slow path,
-// which writes them one at a time, waiting for locks, in its own goroutine,
-// so the batch writer never waits for another transaction.
+// write go together into the next one.
 type completer struct {
-	c        *Client
-	kick     chan struct{} // signalled when queue grows or on close; cap 1
-	slowKick chan struct{} // signalled when slow grows or loop ends; cap 1
-	done     chan struct{} // closed when loop and the slow path return
+	c    *Client
+	kick chan struct{} // signalled when queue grows or on close; cap 1
+	done chan struct{} // closed when loop returns
 
 	mu sync.Mutex
 	// space is signalled when the queue shrinks or on close.
 	space  *sync.Cond
 	queue  []completion
 	closed bool
-	// slow holds the results the batch writer did not write.
-	slow []completion
-	// batchDone is set when loop is about to return: slow gets no more
-	// results.
-	batchDone bool
 }
 
 func newCompleter(c *Client) *completer {
 	w := &completer{
-		c:        c,
-		kick:     make(chan struct{}, 1),
-		slowKick: make(chan struct{}, 1),
-		done:     make(chan struct{}),
+		c:    c,
+		kick: make(chan struct{}, 1),
+		done: make(chan struct{}),
 	}
 	w.space = sync.NewCond(&w.mu)
 
@@ -89,9 +76,7 @@ func (w *completer) add(r completion) {
 
 	if w.closed {
 		w.mu.Unlock()
-		for _, s := range w.write([]completion{r}) {
-			w.writeSlow(s)
-		}
+		w.write([]completion{r})
 
 		return
 	}
@@ -101,8 +86,8 @@ func (w *completer) add(r completion) {
 	signal(w.kick)
 }
 
-// close makes loop return once the queue is written and the slow path once
-// it is written too; later results are written by add directly.
+// close makes loop return once the queue is written; later results are
+// written by add directly.
 func (w *completer) close() {
 	w.mu.Lock()
 	w.closed = true
@@ -118,35 +103,22 @@ func signal(ch chan struct{}) {
 	}
 }
 
-// loop writes queued results until close and an empty queue, then waits for
-// the slow path.
+// loop writes queued results until close and an empty queue.
 func (w *completer) loop() {
-	slowDone := make(chan struct{})
-	go func() {
-		defer close(slowDone)
-		w.slowLoop()
-	}()
-
+	defer close(w.done)
 	for {
 		batch, closed := w.take()
 		if len(batch) > 0 {
-			w.toSlow(w.write(batch))
+			w.write(batch)
 			continue
 		}
 
 		if closed {
-			break
+			return
 		}
 
 		<-w.kick
 	}
-
-	w.mu.Lock()
-	w.batchDone = true
-	w.mu.Unlock()
-	signal(w.slowKick)
-	<-slowDone
-	close(w.done)
 }
 
 // take removes up to maxCompleteBatch results from the queue.
@@ -167,48 +139,11 @@ func (w *completer) take() ([]completion, bool) {
 	return batch, w.closed
 }
 
-// toSlow hands rs to the slow path.
-func (w *completer) toSlow(rs []completion) {
-	if len(rs) == 0 {
-		return
-	}
-
-	w.mu.Lock()
-	w.slow = append(w.slow, rs...)
-	w.mu.Unlock()
-	signal(w.slowKick)
-}
-
-// slowLoop writes the results handed to the slow path, one at a time, until
-// loop has ended and none is left.
-func (w *completer) slowLoop() {
-	for {
-		w.mu.Lock()
-		if len(w.slow) == 0 {
-			last := w.batchDone
-			w.slow = nil
-			w.mu.Unlock()
-			if last {
-				return
-			}
-
-			<-w.slowKick
-			continue
-		}
-
-		r := w.slow[0]
-		w.slow = w.slow[1:]
-		w.mu.Unlock()
-		w.writeSlow(r)
-	}
-}
-
-// write saves batch in one statement and reports the jobs written; it returns
-// the results it did not write, for the slow path. Transient failures are
-// retried with doubling backoff, all within one dbCallTimeout. After any other
-// failure the rows are written one by one, so one bad row does not fail the
-// others.
-func (w *completer) write(batch []completion) []completion {
+// write saves batch in one statement and reports each job. Transient
+// failures are retried with doubling backoff, all within one dbCallTimeout.
+// A job missing from the written rows lost its lease, or has an unknown
+// outcome if an attempt timed out.
+func (w *completer) write(batch []completion) {
 	c := w.c
 	ctx, cancel := context.WithTimeout(context.Background(), c.dbCallTimeout)
 	defer cancel()
@@ -224,87 +159,29 @@ func (w *completer) write(batch []completion) []completion {
 		written, err = c.st.Complete(ctx, params)
 		return err
 	})
-	switch {
-	case err == nil:
-		return w.settle(batch, written, unknown)
-	case len(batch) == 1:
-		batch[0].logger.Warn("notasap: write job status", "status", batch[0].a.status, "error", err)
-		return nil
-	case !isTransient(err):
-		c.logger.Warn("notasap: write job statuses, writing them one by one", "jobs", len(batch), "error", err)
-		return w.writeRows(ctx, batch, params, unknown)
+	if err != nil {
+		if len(batch) == 1 {
+			batch[0].logger.Warn("notasap: write job status", "status", batch[0].a.status, "error", err)
+			return
+		}
+
+		c.logger.Warn("notasap: write job statuses", "jobs", len(batch), "error", err)
+		for _, r := range batch {
+			r.logger.Debug("notasap: write job status", "status", r.a.status, "error", err)
+		}
+
+		return
 	}
 
-	c.logger.Warn("notasap: write job statuses", "jobs", len(batch), "error", err)
-	for _, r := range batch {
-		r.logger.Debug("notasap: write job status", "status", r.a.status, "error", err)
-	}
-
-	return nil
-}
-
-// settle reports the jobs of batch found in written and returns the others.
-func (w *completer) settle(batch []completion, written []store.Ref, unknown bool) []completion {
 	ok := make(map[store.Ref]struct{}, len(written))
 	for _, ref := range written {
 		ok[ref] = struct{}{}
 	}
 
-	var rest []completion
 	for _, r := range batch {
-		if _, found := ok[r.ref]; found {
-			w.c.report(r, true, false)
-			continue
-		}
-
-		r.unknown = r.unknown || unknown
-		rest = append(rest, r)
+		_, found := ok[r.ref]
+		c.report(r, found, unknown)
 	}
-
-	return rest
-}
-
-// writeRows writes batch one row per statement and returns the results it did
-// not write, for the slow path; failed rows are logged.
-func (w *completer) writeRows(ctx context.Context, batch []completion, params []store.Completion, unknown bool) []completion {
-	var rest []completion
-	for i, r := range batch {
-		var written []store.Ref
-		rowUnknown, err := retry(ctx, func() error {
-			var err error
-			written, err = w.c.st.Complete(ctx, params[i:i+1])
-			return err
-		})
-		if err != nil {
-			r.logger.Warn("notasap: write job status", "status", r.a.status, "error", err)
-			continue
-		}
-
-		rest = append(rest, w.settle([]completion{r}, written, unknown || rowUnknown)...)
-	}
-
-	return rest
-}
-
-// writeSlow writes r waiting for its row lock and reports it; no row written
-// means a lost lease, or an unknown outcome if an attempt timed out.
-func (w *completer) writeSlow(r completion) {
-	c := w.c
-	ctx, cancel := context.WithTimeout(context.Background(), c.dbCallTimeout)
-	defer cancel()
-
-	var written bool
-	unknown, err := retry(ctx, func() error {
-		var err error
-		written, err = c.st.CompleteOne(ctx, r.param())
-		return err
-	})
-	if err != nil {
-		r.logger.Warn("notasap: write job status", "status", r.a.status, "error", err)
-		return
-	}
-
-	c.report(r, written, r.unknown || unknown)
 }
 
 // retry calls f until it succeeds, fails with an error that is not

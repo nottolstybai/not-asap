@@ -142,23 +142,23 @@ func (s *insertSuite) TestStore_Insert_ReplaceClaimedMeanwhile() {
 
 		// The conflict check locked the running row: the status write waits for tx.
 		var (
-			ok     bool
-			finErr error
+			written []store.Ref
+			finErr  error
 		)
 		wg.Go(func() {
-			ok, finErr = s.st.CompleteOne(s.ctx, store.Completion{
+			written, finErr = s.st.Complete(s.ctx, []store.Completion{{
 				Ref: store.Ref{
 					ID:    id,
 					Lease: lease,
 				},
 				Status: store.StatusDone,
-			})
+			}})
 		})
 		s.WaitBlockedBy(s.BackendPID(tx))
 		s.Require().NoError(tx.Commit(s.ctx))
 		wg.Wait()
 		s.Require().NoError(finErr)
-		s.True(ok)
+		s.Len(written, 1)
 		s.JSONEq(`{}`, string(s.GetJob(id).Payload))
 	})
 }

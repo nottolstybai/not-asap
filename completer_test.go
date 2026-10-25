@@ -12,7 +12,6 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/require"
 
 	"github.com/nottolstybai/not-asap/internal/store"
@@ -218,39 +217,16 @@ func queue(c *Client, w *completer, ids ...int64) {
 	}
 }
 
-func TestCompleterRows(t *testing.T) {
+func TestCompleterLog(t *testing.T) {
 	t.Parallel()
-	t.Run("poison row", func(t *testing.T) {
-		t.Parallel()
-		synctest.Test(t, func(t *testing.T) {
-			st := newFakeStore()
-			poison := &pgconn.PgError{Code: "22021"}
-			st.scriptWrites(writeResult{err: poison}, writeResult{ok: true}, writeResult{err: poison}, writeResult{ok: true})
-			obs := &countObserver{}
-			var buf syncBuffer
-			c, w := logClient(t, st, &buf, WithObserver(obs))
-			queue(c, w, 1, 2, 3)
-
-			go w.loop()
-			w.close()
-			<-w.done
-			require.Equal(t, []int{3, 1, 1, 1}, st.Batches())
-			require.EqualValues(t, 2, obs.finished.Load())
-			require.Equal(t, 1, strings.Count(buf.String(), `level=WARN msg="notasap: write job statuses, writing them one by one" jobs=3`))
-			require.Equal(t, 1, strings.Count(buf.String(), `level=WARN msg="notasap: write job status" job_id=2`))
-			require.Equal(t, 1, strings.Count(buf.String(), "level=WARN msg=\"notasap: write job status\""))
-		})
-	})
-
-	t.Run("slow path", func(t *testing.T) {
+	t.Run("lost lease", func(t *testing.T) {
 		t.Parallel()
 		synctest.Test(t, func(t *testing.T) {
 			st := newFakeStore()
 			st.scriptWrites(writeResult{
 				ok:      true,
-				missing: []int64{2, 3},
+				missing: []int64{2},
 			})
-			st.scriptOnes(writeResult{ok: true})
 			obs := &countObserver{}
 			var buf syncBuffer
 			c, w := logClient(t, st, &buf, WithObserver(obs))
@@ -260,33 +236,9 @@ func TestCompleterRows(t *testing.T) {
 			w.close()
 			<-w.done
 			require.Equal(t, []int{3}, st.Batches())
-			require.Equal(t, []store.Ref{{ID: 2, Lease: 1}, {ID: 3, Lease: 1}}, st.Ones())
 			require.EqualValues(t, 2, obs.finished.Load())
 			require.Equal(t, 1, strings.Count(buf.String(), "job lost lease"))
-			require.Contains(t, buf.String(), `level=WARN msg="notasap: job lost lease" job_id=3`)
-		})
-	})
-
-	t.Run("slow path after timeout", func(t *testing.T) {
-		t.Parallel()
-		synctest.Test(t, func(t *testing.T) {
-			st := newFakeStore()
-			st.scriptWrites(writeResult{err: fmt.Errorf("complete: %w", context.DeadlineExceeded)}, writeResult{
-				ok:      true,
-				missing: []int64{2},
-			})
-			obs := &countObserver{}
-			var buf syncBuffer
-			c, w := logClient(t, st, &buf, WithObserver(obs))
-			queue(c, w, 1, 2)
-
-			go w.loop()
-			w.close()
-			<-w.done
-			require.Equal(t, []store.Ref{{ID: 2, Lease: 1}}, st.Ones())
-			require.EqualValues(t, 1, obs.finished.Load())
-			require.Contains(t, buf.String(), `level=INFO msg="notasap: status write outcome unknown after retry" job_id=2`)
-			require.NotContains(t, buf.String(), "job lost lease")
+			require.Contains(t, buf.String(), `level=WARN msg="notasap: job lost lease" job_id=2`)
 		})
 	})
 
@@ -305,7 +257,6 @@ func TestCompleterRows(t *testing.T) {
 			require.Equal(t, 1, strings.Count(buf.String(), "level=WARN"))
 			require.Contains(t, buf.String(), `level=WARN msg="notasap: write job statuses" jobs=3`)
 			require.Equal(t, 3, strings.Count(buf.String(), `level=DEBUG msg="notasap: write job status"`))
-			require.Empty(t, st.Ones())
 		})
 	})
 }

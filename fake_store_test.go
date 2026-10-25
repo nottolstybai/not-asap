@@ -20,8 +20,7 @@ type finishCall struct {
 
 // fakeStore is an in-memory jobStore for pool tests. Jobs fed into pending
 // are returned by Claim; status writes are recorded and succeed unless
-// scripted otherwise. CompleteOne reports no row written unless scripted
-// otherwise: rows reach it only when Complete did not write them.
+// scripted otherwise.
 type fakeStore struct {
 	pending chan store.ClaimedJob
 	// claimHook, if set before Start, runs at the start of every Claim; a
@@ -45,13 +44,10 @@ type fakeStore struct {
 	calls      []finishCall
 	batches    []int         // rows of every Complete call, in order
 	writes     []writeResult // scripted results of upcoming Complete calls
-	ones       []store.Ref   // ref of every CompleteOne call, in order
-	oneWrites  []writeResult // scripted results of upcoming CompleteOne calls
 }
 
-// writeResult is a scripted result of a Complete or CompleteOne call;
-// ok == false means no row was written, missing lists the ids Complete
-// does not write when ok.
+// writeResult is a scripted result of a Complete call; ok == false means no
+// row was written, missing lists the ids not written when ok.
 type writeResult struct {
 	ok      bool
 	err     error
@@ -92,14 +88,6 @@ func (f *fakeStore) scriptWrites(rs ...writeResult) {
 	f.writes = rs
 }
 
-// scriptOnes makes the next CompleteOne calls return rs in order; later
-// calls write no row.
-func (f *fakeStore) scriptOnes(rs ...writeResult) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.oneWrites = rs
-}
-
 // nextWrite pops the next scripted result of Complete; f.mu must be held.
 func (f *fakeStore) nextWrite() writeResult {
 	if len(f.writes) == 0 {
@@ -108,13 +96,6 @@ func (f *fakeStore) nextWrite() writeResult {
 	r := f.writes[0]
 	f.writes = f.writes[1:]
 	return r
-}
-
-// Ones returns the ref of every CompleteOne call.
-func (f *fakeStore) Ones() []store.Ref {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return slices.Clone(f.ones)
 }
 
 func (f *fakeStore) Claims() int {
@@ -227,18 +208,6 @@ func (f *fakeStore) Complete(ctx context.Context, cs []store.Completion) ([]stor
 		return nil, r.err
 	}
 	return refs, nil
-}
-
-func (f *fakeStore) CompleteOne(_ context.Context, c store.Completion) (bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.ones = append(f.ones, c.Ref)
-	if len(f.oneWrites) == 0 {
-		return false, nil
-	}
-	r := f.oneWrites[0]
-	f.oneWrites = f.oneWrites[1:]
-	return r.ok, r.err
 }
 
 func (f *fakeStore) Cancel(context.Context, int64) (store.CancelOutcome, error) {

@@ -96,11 +96,11 @@ func (c *Client) Schedule(ctx context.Context, p Payload, opts ...ScheduleOption
 // key wait for tx; one that finds a duplicate locks nothing. WithReplace on a
 // running job normally locks nothing either, but if a worker claims the job at
 // the same moment, ScheduleTx still returns ErrJobRunning and keeps the row
-// locked until tx ends, so the worker's status write waits for tx; keep such
-// transactions short. Several keyed
-// schedules in one tx must be issued in a consistent (kind, key) order across
-// the application, or Postgres may abort tx with a deadlock (SQLSTATE 40P01);
-// retry tx on 40P01.
+// locked until tx ends, so the client's result writes wait for tx; do not
+// use WithReplace in a large or long tx. Several keyed schedules in one tx
+// must be issued in a consistent (kind, key) order across the application,
+// or Postgres may abort tx with a deadlock (SQLSTATE 40P01); retry tx on
+// 40P01.
 func (c *Client) ScheduleTx(ctx context.Context, tx pgx.Tx, p Payload, opts ...ScheduleOption) (int64, error) {
 	if tx == nil {
 		return 0, errors.New("notasap: ScheduleTx: tx is nil")

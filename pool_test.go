@@ -450,19 +450,18 @@ func TestStartPoolWarning(t *testing.T) {
 		c := newPoolClient(t, newFakeStore(), noop[testPayload], KindConfig{}, WithLogger(slog.New(slog.NewTextHandler(&buf, nil))))
 		require.NoError(t, Register(c, noop[otherPayload], KindConfig{Name: "b"}))
 		require.NoError(t, Register(c, noop[thirdPayload], KindConfig{Name: "c"}))
-		c.maxConns = 2
+		c.maxConns = 5
 		stopOnCleanup(t, c)
 		require.NoError(t, c.Start(context.Background()))
 
 		require.Contains(t, buf.String(), "level=WARN")
-		require.Contains(t, buf.String(), "max_conns=2")
-		require.Contains(t, buf.String(), "MaxConns >= kinds + 2")
-		require.NotContains(t, buf.String(), "kinds + 4")
+		require.Contains(t, buf.String(), "max_conns=5")
+		require.Contains(t, buf.String(), "MaxConns >= kinds + 3")
 	})
 
 	t.Run("silent when unknown or large", func(t *testing.T) {
 		t.Parallel()
-		for _, maxConns := range []int32{0, 5} {
+		for _, maxConns := range []int32{0, 4} {
 			t.Run(fmt.Sprint(maxConns), func(t *testing.T) {
 				t.Parallel()
 				var buf syncBuffer
@@ -892,37 +891,4 @@ func (s *poolSuite) Test_kindPool_ScheduleWakesIdlePoller() {
 
 	pgtest.WaitStatus(&s.Suite, id, StatusDone)
 	s.Equal(2, c.obs.Count("polled/a"))
-}
-
-func (s *poolSuite) Test_kindPool_LockedRowDoesNotStallWrites() {
-	release := make(chan struct{})
-	c := s.startClient([]kindReg{reg(func(ctx context.Context, _ *Job[payloadA]) error {
-		select {
-		case <-release:
-		case <-ctx.Done():
-		}
-		return nil
-	}, KindConfig{
-		Name:    "a",
-		Workers: 3,
-	})})
-	ids := []int64{s.schedule(c, payloadA{}), s.schedule(c, payloadA{}), s.schedule(c, payloadA{})}
-	s.WaitFor(func() bool { return s.CountJobs(store.StatusRunning) == 3 }, "jobs not running")
-
-	tx, err := s.Pool.Begin(s.ctx)
-	s.Require().NoError(err)
-	defer func() { _ = tx.Rollback(s.ctx) }()
-	_, err = tx.Exec(s.ctx, "SELECT id FROM notasap_jobs WHERE id = $1 FOR UPDATE", ids[0])
-	s.Require().NoError(err)
-	close(release)
-
-	// The other rows are written while the locked one waits for tx.
-	pgtest.WaitStatus(&s.Suite, ids[1], StatusDone)
-	pgtest.WaitStatus(&s.Suite, ids[2], StatusDone)
-	s.WaitBlockedBy(s.BackendPID(tx))
-	s.Equal(StatusRunning, Status(s.GetJob(ids[0]).Status))
-
-	s.Require().NoError(tx.Commit(s.ctx))
-	pgtest.WaitStatus(&s.Suite, ids[0], StatusDone)
-	s.Equal(3, c.obs.Count("finished/done"))
 }

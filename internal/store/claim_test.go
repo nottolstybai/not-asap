@@ -2,7 +2,6 @@ package store_test
 
 import (
 	"cmp"
-	"context"
 	"slices"
 	"sync"
 	"testing"
@@ -267,85 +266,37 @@ func (s *claimSuite) TestStore_Complete() {
 		s.Nil(row.Error)
 	})
 
-	s.Run("skips locked", func() {
-		locked, free := s.claimOne(), s.claimOne()
-		ref := func(j store.ClaimedJob) store.Ref {
-			return store.Ref{
-				ID:    j.ID,
-				Lease: j.Lease,
-			}
+	s.Run("waits for locked", func() {
+		j := s.claimOne()
+		ref := store.Ref{
+			ID:    j.ID,
+			Lease: j.Lease,
 		}
 		tx, err := s.Pool.Begin(s.ctx)
 		s.Require().NoError(err)
 		defer func() { _ = tx.Rollback(s.ctx) }()
-		_, err = tx.Exec(s.ctx, "SELECT id FROM notasap_jobs WHERE id = $1 FOR UPDATE", locked.ID)
+		_, err = tx.Exec(s.ctx, "SELECT id FROM notasap_jobs WHERE id = $1 FOR UPDATE", j.ID)
 		s.Require().NoError(err)
 
-		cs := []store.Completion{
-			{
-				Ref:    ref(locked),
-				Status: store.StatusDone,
-			},
-			{
-				Ref:    ref(free),
-				Status: store.StatusDone,
-			},
-		}
-		ctx, cancel := context.WithTimeout(s.ctx, time.Second)
-		defer cancel()
-		written, err := s.st.Complete(ctx, cs)
-		s.Require().NoError(err)
-		s.Equal([]store.Ref{ref(free)}, written)
-		s.Equal(store.StatusRunning, s.GetJob(locked.ID).Status)
-
-		// CompleteOne waits for the lock and writes the row once tx ends.
 		var (
-			ok     bool
-			oneErr error
-			wg     sync.WaitGroup
+			written     []store.Ref
+			completeErr error
+			wg          sync.WaitGroup
 		)
-		wg.Go(func() { ok, oneErr = s.st.CompleteOne(s.ctx, cs[0]) })
+		wg.Go(func() {
+			written, completeErr = s.st.Complete(s.ctx, []store.Completion{{
+				Ref:    ref,
+				Status: store.StatusDone,
+			}})
+		})
 		s.WaitBlockedBy(s.BackendPID(tx))
-		s.Require().NoError(tx.Commit(s.ctx))
-		wg.Wait()
-		s.Require().NoError(oneErr)
-		s.True(ok)
-		s.Equal(store.StatusDone, s.GetJob(locked.ID).Status)
-	})
-
-	s.Run("one fenced by lease and status", func() {
-		j := s.claimOne()
-		c := store.Completion{
-			Ref: store.Ref{
-				ID:    j.ID,
-				Lease: j.Lease + 1,
-			},
-			Status: store.StatusPending,
-			Delay:  time.Hour,
-			Error:  "again",
-			Refund: true,
-		}
-
-		ok, err := s.st.CompleteOne(s.ctx, c)
-		s.Require().NoError(err)
-		s.False(ok)
 		s.Equal(store.StatusRunning, s.GetJob(j.ID).Status)
 
-		c.Lease = j.Lease
-		ok, err = s.st.CompleteOne(s.ctx, c)
-		s.Require().NoError(err)
-		s.True(ok)
-		row := s.GetJob(j.ID)
-		s.Equal(store.StatusPending, row.Status)
-		s.Equal(0, row.Attempt)
-		s.Nil(row.Deadline)
-		s.WithinDuration(s.DBNow().Add(time.Hour), row.RunAt, 5*time.Second)
-		s.Require().NotNil(row.Error)
-		s.Equal("again", *row.Error)
-
-		ok, err = s.st.CompleteOne(s.ctx, c)
-		s.Require().NoError(err)
-		s.False(ok)
+		s.Require().NoError(tx.Commit(s.ctx))
+		wg.Wait()
+		s.Require().NoError(completeErr)
+		s.Equal([]store.Ref{ref}, written)
+		s.Equal(store.StatusDone, s.GetJob(j.ID).Status)
 	})
 
 	s.Run("empty", func() {

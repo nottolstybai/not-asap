@@ -19,7 +19,6 @@ type jobStore interface {
 	Insert(ctx context.Context, db store.DB, params []store.InsertParams) ([]store.InsertResult, error)
 	Claim(ctx context.Context, kind int16, limit int, lease time.Duration) ([]store.ClaimedJob, error)
 	Complete(ctx context.Context, cs []store.Completion) ([]store.Ref, error)
-	CompleteOne(ctx context.Context, c store.Completion) (bool, error)
 	Cancel(ctx context.Context, id int64) (store.CancelOutcome, error)
 	Rescue(ctx context.Context, limit int, decide func(store.StuckJob) store.RescueDecision) (int, error)
 	DeleteFinished(ctx context.Context, status int16, olderThan time.Duration, limit int) (int64, error)
@@ -160,8 +159,8 @@ func (c *Client) Start(ctx context.Context) error {
 	c.startMaintenance()
 
 	slices.Sort(names)
-	if c.maxConns > 0 && c.maxConns < int32(len(names)+2) {
-		c.logger.Warn("notasap: connection pool is smaller than kinds + 2; status writes may starve, give notasap its own pool with MaxConns >= kinds + 2",
+	if c.maxConns > 0 && c.maxConns < int32(len(names)+3) {
+		c.logger.Warn("notasap: connection pool is smaller than kinds + 3; status writes may starve, give notasap its own pool with MaxConns >= kinds + 3",
 			"max_conns", c.maxConns, "kinds", len(names))
 	}
 
@@ -186,9 +185,8 @@ func (c *Client) startMaintenance() {
 // attempted by then; a write that failed is logged and its job is recovered
 // by the rescuer. When Stop returns ctx.Err(), writing may go on after it
 // returns: the queued results (up to 4000, several batches, each retried for
-// up to 10s, dbCallTimeout), rows waiting for a lock held by another
-// transaction, and the results of handlers still running, which they write
-// directly. Keep the pool open until then, or those writes fail and the
+// up to 10s, dbCallTimeout) and the results of handlers still running,
+// which they write directly. Keep the pool open until then, or those writes fail and the
 // rescuer recovers the jobs. Stop on a Client that was never started returns
 // nil. A later Stop waits until the first one returns, then returns nil, or
 // returns ctx.Err() if ctx is done first.
