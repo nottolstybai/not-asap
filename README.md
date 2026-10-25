@@ -261,7 +261,8 @@ if errors.Is(err, notasap.ErrDuplicate) {
 - `WithReplace` normally does not wait on or lock a row that is already `running`: it returns `ErrJobRunning`
   with the existing ID. If a worker claims the row at the same moment, `ScheduleTx` still returns
   `ErrJobRunning` but keeps the row locked until your transaction ends, and the worker waits for it to save
-  the job's result. Keep such transactions short.
+  the job's result, with the results of other jobs in the same batch. Keep such transactions short and small; see
+  [The table belongs to the library](#the-table-belongs-to-the-library).
 - Several keyed schedules in one transaction can deadlock with another transaction; see
   [Keyed jobs in one transaction](#keyed-jobs-in-one-transaction).
 
@@ -339,8 +340,8 @@ err := client.Stop(ctx)  // graceful shutdown
 
 A second concurrent `Stop` waits for the first one, so `defer pool.Close()` is safe.
 If `Stop` returns `ctx.Err()`, writes may go on after it returns: results still queued (up to 4000,
-that is several batches, each retried for up to 10 s), rows waiting for a lock held by another transaction,
-and the results of handlers that were still running, which they write themselves. Keep the pool open until
+that is several batches, each retried for up to 10 s) and the results of handlers that were still running,
+which they write themselves. Keep the pool open until
 then, or those writes fail and the rescuer recovers the jobs.
 
 ## Reliability
@@ -409,23 +410,40 @@ In each replica the pollers, the rescuer and the janitor use up to kinds + 2 con
 Job results are saved in batches by one writer: a result is written at once if no write is in flight,
 otherwise it joins the next write (up to 1000 jobs in one statement). If 4000 results are already
 waiting, a finished handler keeps its worker slot until there is room, so claiming slows down with the
-database. The writer holds one more connection and the second writer described below one more, so plan for kinds + 4,
-each held for milliseconds unless the second writer waits for a lock. Your handlers' queries come on top of that.
-A batch skips rows locked by another transaction; such rows, and rows whose lease looks lost, are written
-one at a time by a second writer that waits for the lock, so the batches go on meanwhile. Once `Stop` has
-closed the writers, each late handler writes its result itself, on a connection of its own.
-A status write that gets no connection within 10 s, retries included, is lost for every job in the batch
+database. The writer holds one more connection, so plan for kinds + 3 (pollers, rescuer, janitor and
+result writer), each held for milliseconds. Your handlers' queries come on top of that. Once `Stop` has
+closed the writer, each late handler writes its result itself, on a connection of its own.
+A status write that fails, or gets no connection within 10 s, retries included, is lost for every job in the batch
 (`write job statuses` in the log at Warn, each job at Debug), and those jobs run again after
-`Timeout + Grace`. A batch rejected for another reason, such as one bad row, is written again row by row,
-so only the bad row is lost (`write job status` at Warn).
+`Timeout + Grace`.
 
-- Give notasap its own `pgxpool` with `MaxConns` of at least kinds + 4, or size the shared pool for kinds + 4 plus your handlers
+- Give notasap its own `pgxpool` with `MaxConns` of at least kinds + 3, or size the shared pool for kinds + 3 plus your handlers
   (plus one per handler that may outlive `Stop`).
-- `Start` logs a warning when `MaxConns` is below kinds + 2.
+- `Start` logs a warning when `MaxConns` is below kinds + 3.
 - In a handler that holds a transaction, use `ScheduleTx`: `Schedule` and `Cancel` take a second connection,
   and many such handlers at once can exhaust the pool. Worse, if that transaction already locks the key or row
   (for example, it scheduled the same key), the handler waits on its own transaction in `Schedule` or `Cancel`,
   and Postgres cannot detect it. There is no `CancelTx`, so do not cancel a row your own transaction has locked.
+
+### The table belongs to the library
+
+notasap assumes that only it changes `notasap_jobs`. Allowed:
+
+- Plain `SELECT` (dashboards, debugging): it takes no row locks.
+- Foreign keys referencing `notasap_jobs`: they take `FOR KEY SHARE`, which does not conflict with the
+  library's updates.
+
+Not allowed:
+
+- Changing or locking job rows outside the library (`UPDATE`, `DELETE`, `SELECT ... FOR UPDATE` / `FOR SHARE`),
+  or long transactions touching the table. A locked `running` row makes result writes wait, and all results of
+  that client wait behind its batch; jobs may also be run again by the rescuer.
+- DDL other than migrations. Create indexes `CONCURRENTLY`, and set `lock_timeout` in migrations so that they
+  do not queue all queue traffic behind them.
+
+Ideally do not call `ScheduleTx` with `WithReplace` inside a large or long transaction: in the rare race where a
+worker claims the job at the same moment, the row stays locked until that transaction ends and result writes
+wait for it (see [Idempotency keys](#idempotency-keys)).
 
 ### Keyed jobs in one transaction
 
