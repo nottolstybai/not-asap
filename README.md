@@ -255,8 +255,8 @@ if errors.Is(err, notasap.ErrDuplicate) {
 - A batch of 2+ items with idempotency keys passed to `ScheduleBatch` runs in its own transaction, so it is all or nothing.
 - A keyed `ScheduleTx` that inserts or replaces a job holds the key until your transaction ends:
   a concurrent schedule of the same key waits for it. Finding a duplicate locks nothing.
-- `WithReplace` does not lock a `running` row: it returns `ErrJobRunning` with the existing ID,
-  and the worker saves the job's result without waiting for your transaction.
+- `WithReplace` does not wait on a row that is already `running`: it returns `ErrJobRunning` with the
+  existing ID, and the worker saves the job's result without waiting for your transaction.
 - Several keyed schedules in one transaction can deadlock with another transaction; see
   [Keyed jobs in one transaction](#keyed-jobs-in-one-transaction).
 
@@ -388,20 +388,23 @@ usually enough. Failed jobs are kept forever by default (`failed 0`), together w
 give them a retention too if failures are frequent.
 
 The janitor runs in every replica, but only one deletes at a time: each batch takes a transaction-level
-advisory try-lock keyed by the table, and a replica that does not get it waits for its next tick.
+advisory try-lock keyed by the table, and a replica that does not get it skips that status until its
+next tick and moves on to the next one.
 The lock ends with the `DELETE` statement, so this works through PgBouncer in transaction mode.
 
 ### Connection pool
 
 In each replica the pollers, the rescuer and the janitor use up to kinds + 2 connections at once,
 and every job that is saving its result needs one more, so plan for about kinds + 3, each held for
-milliseconds. Your handlers' queries come on top. A status write that gets no connection within 10 s,
+milliseconds. Your handlers' queries come on top of that. A status write that gets no connection within 10 s,
 retries included, is lost (`write job status` in the log), and the job runs again after `Timeout + Grace`.
 
 - Give notasap its own `pgxpool` with `MaxConns` of at least kinds + 3, or size the shared pool for kinds + 3 plus your handlers.
 - `Start` logs a warning when `MaxConns` is below kinds + 2.
 - In a handler that holds a transaction, use `ScheduleTx`: `Schedule` and `Cancel` take a second connection,
-  and many such handlers at once can exhaust the pool.
+  and many such handlers at once can exhaust the pool. Worse, if that transaction already locks the key or row
+  (for example, it scheduled the same key), the handler waits on its own transaction in `Schedule` or `Cancel`,
+  and Postgres cannot detect it. There is no `CancelTx`, so do not cancel a row your own transaction has locked.
 
 ### Keyed jobs in one transaction
 
@@ -415,7 +418,7 @@ by aborting one transaction with SQLSTATE `40P01`; retry the whole transaction o
 ### Payloads
 
 Keep payloads small: ids, not documents. The payload is read on every claim, and one larger than
-about 2 KB is stored out of line (TOAST) and costs an extra fetch each time.
+about 2 KB may be compressed or moved out of line (TOAST), which costs extra work each time.
 
 ## Observability
 
