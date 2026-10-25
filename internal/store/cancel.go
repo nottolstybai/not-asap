@@ -8,8 +8,8 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const cancelSQL = `UPDATE notasap_jobs SET status = 5, updated_at = NOW()
-WHERE id = $1 AND status = 1 RETURNING id`
+const cancelSQL = `UPDATE notasap_jobs SET status = 5 /* cancelled */, updated_at = NOW()
+WHERE id = $1 AND status = 1 /* pending */ RETURNING id`
 
 const statusSQL = `SELECT status FROM notasap_jobs WHERE id = $1`
 
@@ -45,7 +45,7 @@ func (s *Store) Cancel(ctx context.Context, id int64) (CancelOutcome, error) {
 		return CancelNotFound, nil
 	case err != nil:
 		return 0, fmt.Errorf("notasap: cancel: %w", err)
-	case status == statusRunning:
+	case status == StatusRunning:
 		return CancelRunning, nil
 	default:
 		return CancelFinished, nil

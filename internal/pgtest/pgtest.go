@@ -22,8 +22,8 @@ import (
 
 var dsn string
 
-// DSN returns the database DSN, or "" when no database is available.
-func DSN() string { return dsn }
+// hasDSN reports whether a database is available.
+func hasDSN() bool { return dsn != "" }
 
 // Run is meant to be called from TestMain: os.Exit(pgtest.Run(m)).
 // Under -short no database is started.
@@ -117,7 +117,7 @@ type Suite struct {
 }
 
 func (s *Suite) SetupSuite() {
-	if DSN() == "" {
+	if !hasDSN() {
 		s.T().Skip("no database (short mode)")
 	}
 	ctx := context.Background()
@@ -150,7 +150,7 @@ func (s *Suite) TearDownSuite() {
 }
 
 func (s *Suite) SetupTest() {
-	s.Exec("TRUNCATE notasap_jobs RESTART IDENTITY")
+	s.Exec("TRUNCATE notasap_jobs")
 }
 
 // Exec runs SQL on the suite pool and requires success.

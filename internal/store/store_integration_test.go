@@ -153,7 +153,7 @@ func (s *StoreSuite) TestRescheduleRefund() {
 	s.Require().NotNil(row.Error)
 	s.Equal("again", *row.Error)
 
-	s.Exec("TRUNCATE notasap_jobs RESTART IDENTITY")
+	s.Exec("TRUNCATE notasap_jobs")
 	j = s.claimOne()
 	ok, err = s.st.Reschedule(ctx, store.Ref{ID: j.ID, Lease: j.Lease}, 0, "", false)
 	s.Require().NoError(err)
@@ -186,7 +186,7 @@ func (s *StoreSuite) TestCancelOutcomes() {
 		s.Require().NoError(err)
 		s.Equal(tt.want, got)
 	}
-	got, err := s.st.Cancel(ctx, 99999)
+	got, err := s.st.Cancel(ctx, -1)
 	s.Require().NoError(err)
 	s.Equal(store.CancelNotFound, got)
 }
@@ -245,13 +245,13 @@ func (s *StoreSuite) TestRescue() {
 	s.Nil(row.Deadline)
 	s.WithinDuration(time.Now().Add(time.Hour), row.RunAt, 5*time.Second)
 	s.Require().NotNil(row.Error)
-	s.Equal("rescued: deadline exceeded", *row.Error)
+	s.Equal(store.RescuedError, *row.Error)
 
 	row = s.Job(fail)
 	s.Equal(int16(4), row.Status)
 	s.Nil(row.Deadline)
 	s.Require().NotNil(row.Error)
-	s.Equal("rescued: deadline exceeded", *row.Error)
+	s.Equal(store.RescuedError, *row.Error)
 
 	s.Equal(int16(2), s.Job(live).Status)
 	s.Equal(int16(1), s.Job(pending).Status)

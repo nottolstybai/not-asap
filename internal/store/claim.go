@@ -11,11 +11,11 @@ import (
 )
 
 const claimSQL = `UPDATE notasap_jobs j
-SET status = 2, attempt = j.attempt + 1, lease = j.lease + 1,
+SET status = 2 /* running */, attempt = j.attempt + 1, lease = j.lease + 1,
     deadline = NOW() + make_interval(secs => $3), updated_at = NOW()
 FROM (
     SELECT id FROM notasap_jobs
-    WHERE status = 1 AND kind = $1 AND run_at <= NOW()
+    WHERE status = 1 /* pending */ AND kind = $1 AND run_at <= NOW()
     ORDER BY run_at, id
     LIMIT $2
     FOR UPDATE SKIP LOCKED
@@ -25,12 +25,12 @@ RETURNING j.id, j.kind, j.payload, j.attempt, j.max_attempts, j.lease, j.created
 
 const finishSQL = `UPDATE notasap_jobs
 SET status = $3, error = $4, deadline = NULL, updated_at = NOW()
-WHERE id = $1 AND lease = $2 AND status = 2`
+WHERE id = $1 AND lease = $2 AND status = 2 /* running */`
 
 const rescheduleSQL = `UPDATE notasap_jobs
-SET status = 1, run_at = NOW() + make_interval(secs => $3), error = $4, deadline = NULL,
+SET status = 1 /* pending */, run_at = NOW() + make_interval(secs => $3), error = $4, deadline = NULL,
     attempt = CASE WHEN $5 THEN attempt - 1 ELSE attempt END, updated_at = NOW()
-WHERE id = $1 AND lease = $2 AND status = 2`
+WHERE id = $1 AND lease = $2 AND status = 2 /* running */`
 
 // Ref identifies one claim of a job: Lease fences out stale owners.
 type Ref struct {

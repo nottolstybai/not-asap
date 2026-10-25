@@ -9,18 +9,18 @@ import (
 )
 
 const rescueSelectSQL = `SELECT id, kind, attempt, max_attempts FROM notasap_jobs
-WHERE status = 2 AND deadline < NOW()
+WHERE status = 2 /* running */ AND deadline < NOW()
 ORDER BY deadline
 LIMIT $1
 FOR UPDATE SKIP LOCKED`
 
 const rescueFailSQL = `UPDATE notasap_jobs
-SET status = 4, error = 'rescued: deadline exceeded', deadline = NULL, updated_at = NOW()
+SET status = 4 /* failed */, error = $2, deadline = NULL, updated_at = NOW()
 WHERE id = $1`
 
 const rescueRetrySQL = `UPDATE notasap_jobs
-SET status = 1, run_at = NOW() + make_interval(secs => $2),
-    error = 'rescued: deadline exceeded', deadline = NULL, updated_at = NOW()
+SET status = 1 /* pending */, run_at = NOW() + make_interval(secs => $2),
+    error = $3, deadline = NULL, updated_at = NOW()
 WHERE id = $1`
 
 // StuckJob is a running job found past its deadline.
@@ -60,9 +60,9 @@ func (s *Store) Rescue(ctx context.Context, limit int, decide func(StuckJob) Res
 		b := &pgx.Batch{}
 		for _, j := range jobs {
 			if d := decide(j); d.Fail {
-				b.Queue(rescueFailSQL, j.ID)
+				b.Queue(rescueFailSQL, j.ID, RescuedError)
 			} else {
-				b.Queue(rescueRetrySQL, j.ID, d.Delay.Seconds())
+				b.Queue(rescueRetrySQL, j.ID, d.Delay.Seconds(), RescuedError)
 			}
 		}
 		if err := tx.SendBatch(ctx, b).Close(); err != nil {

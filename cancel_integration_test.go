@@ -52,6 +52,6 @@ func (s *CancelSuite) TestCancel() {
 	}
 
 	s.Run("not found", func() {
-		s.Require().ErrorIs(c.Cancel(context.Background(), 999), notasap.ErrNotFound)
+		s.Require().ErrorIs(c.Cancel(context.Background(), -1), notasap.ErrNotFound)
 	})
 }

@@ -20,8 +20,17 @@ type DB interface {
 	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
-// statusRunning is the running value of the status column.
-const statusRunning = 2
+// Job statuses as stored in the status column.
+const (
+	StatusPending   int16 = 1
+	StatusRunning   int16 = 2
+	StatusDone      int16 = 3
+	StatusFailed    int16 = 4
+	StatusCancelled int16 = 5
+)
+
+// RescuedError is the error stored on a job rescued after its deadline.
+const RescuedError = "rescued: deadline exceeded"
 
 // Store executes notasap queries against a pool.
 type Store struct {

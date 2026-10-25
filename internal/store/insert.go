@@ -18,7 +18,7 @@ import (
 const maxInsertRounds = 3
 
 const insertValuesSQL = `INSERT INTO notasap_jobs (kind, status, payload, max_attempts, run_at, idempotency_key)
-SELECT $1, 1, $2, $3, NOW() + make_interval(secs => $4), $5`
+SELECT $1, 1 /* pending */, $2, $3, NOW() + make_interval(secs => $4), $5`
 
 const onConflictSQL = `
 ON CONFLICT (kind, idempotency_key) WHERE idempotency_key IS NOT NULL `
@@ -38,16 +38,16 @@ WHERE kind = $1 AND idempotency_key = $5 AND NOT EXISTS (SELECT 1 FROM ins)`
 // and reports a running row as outcome 4 (Running). Running rows are filtered
 // out before the conflict check, so they are not locked.
 const insertReplaceSQL = `WITH up AS (` + insertValuesSQL + `
-  WHERE NOT EXISTS (SELECT 1 FROM notasap_jobs WHERE kind = $1 AND idempotency_key = $5 AND status = 2)` +
-	onConflictSQL + `DO UPDATE SET payload = EXCLUDED.payload, status = 1, attempt = 0,
+  WHERE NOT EXISTS (SELECT 1 FROM notasap_jobs WHERE kind = $1 AND idempotency_key = $5 AND status = 2 /* running */)` +
+	onConflictSQL + `DO UPDATE SET payload = EXCLUDED.payload, status = 1 /* pending */, attempt = 0,
     max_attempts = EXCLUDED.max_attempts, run_at = EXCLUDED.run_at, error = NULL, deadline = NULL,
     updated_at = NOW()
-  WHERE notasap_jobs.status <> 2
+  WHERE notasap_jobs.status <> 2 /* running */
   RETURNING id, (xmax = 0) AS inserted)
 SELECT id, CASE WHEN inserted THEN 1 ELSE 2 END FROM up
 UNION ALL
 SELECT id, 4 FROM notasap_jobs
-WHERE kind = $1 AND idempotency_key = $5 AND status = 2 AND NOT EXISTS (SELECT 1 FROM up)`
+WHERE kind = $1 AND idempotency_key = $5 AND status = 2 /* running */ AND NOT EXISTS (SELECT 1 FROM up)`
 
 const lookupSQL = `SELECT id, status FROM notasap_jobs WHERE kind = $1 AND idempotency_key = $2`
 
@@ -202,7 +202,7 @@ func lookupRound(ctx context.Context, db DB, params []InsertParams, conflicts []
 		switch {
 		case !params[i].Replace:
 			results[i] = InsertResult{ID: id, Outcome: Duplicate}
-		case status == statusRunning:
+		case status == StatusRunning:
 			results[i] = InsertResult{ID: id, Outcome: Running}
 		default:
 			retry = append(retry, i)

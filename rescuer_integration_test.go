@@ -14,6 +14,7 @@ import (
 
 	notasap "github.com/nottolstybai/not-asap"
 	"github.com/nottolstybai/not-asap/internal/pgtest"
+	"github.com/nottolstybai/not-asap/internal/store"
 )
 
 type RescuerSuite struct {
@@ -128,7 +129,7 @@ func (s *RescuerSuite) TestRescuePending() {
 
 	row := s.waitStatus(id, notasap.StatusPending)
 	s.Require().NotNil(row.Error)
-	s.Equal("rescued: deadline exceeded", *row.Error)
+	s.Equal(store.RescuedError, *row.Error)
 	s.Equal(1, row.Attempt)
 	s.Nil(row.Deadline)
 	s.WithinDuration(time.Now().Add(time.Hour), row.RunAt, time.Minute)
@@ -143,7 +144,7 @@ func (s *RescuerSuite) TestRescueFailed() {
 
 	row := s.waitStatus(id, notasap.StatusFailed)
 	s.Require().NotNil(row.Error)
-	s.Equal("rescued: deadline exceeded", *row.Error)
+	s.Equal(store.RescuedError, *row.Error)
 	s.Equal(3, row.Attempt)
 	s.Nil(row.Deadline)
 	s.Equal(1, obs.Rescued("a"))
@@ -169,7 +170,7 @@ func (s *RescuerSuite) TestRescueUnknownKind() {
 
 	row := s.waitStatus(id, notasap.StatusPending)
 	s.Require().NotNil(row.Error)
-	s.Equal("rescued: deadline exceeded", *row.Error)
+	s.Equal(store.RescuedError, *row.Error)
 	s.WithinDuration(time.Now().Add(2*time.Hour), row.RunAt, time.Minute)
 	s.Equal(1, obs.Rescued("kind_99"))
 }
@@ -195,7 +196,7 @@ func (s *RescuerSuite) TestStaleWorkerFenced() {
 	row := s.waitStatus(id, notasap.StatusPending)
 	s.Equal(1, row.Attempt)
 	s.Require().NotNil(row.Error)
-	s.Equal("rescued: deadline exceeded", *row.Error)
+	s.Equal(store.RescuedError, *row.Error)
 
 	unblock()
 	s.Never(func() bool { return s.Job(id).Status == int16(notasap.StatusDone) }, 200*time.Millisecond, tick)

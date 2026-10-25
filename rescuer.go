@@ -1,6 +1,7 @@
 package notasap
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -23,7 +24,7 @@ func (c *Client) rescueLoop() {
 	ticker := time.NewTicker(c.rescuer.Interval)
 	defer ticker.Stop()
 	for {
-		c.rescue()
+		c.rescue(c.bgCtx)
 		select {
 		case <-ticker.C:
 		case <-c.stopCh:
@@ -33,16 +34,16 @@ func (c *Client) rescueLoop() {
 }
 
 // rescue runs rescue batches until one comes back short.
-func (c *Client) rescue() {
+func (c *Client) rescue(ctx context.Context) {
 	for {
 		var batch []rescued
-		n, err := c.st.Rescue(c.bgCtx, rescueBatch, func(j store.StuckJob) store.RescueDecision {
+		n, err := c.st.Rescue(ctx, rescueBatch, func(j store.StuckJob) store.RescueDecision {
 			r := c.rescueDecision(j)
 			batch = append(batch, r)
 			return r.d
 		})
 		if err != nil {
-			if c.bgCtx.Err() == nil {
+			if ctx.Err() == nil {
 				c.logger.Warn("notasap: rescue jobs", "error", err)
 			}
 			return
