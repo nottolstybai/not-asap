@@ -493,3 +493,90 @@ func (b *syncBuffer) String() string {
 	defer b.mu.Unlock()
 	return b.buf.String()
 }
+
+func TestScheduleWakesPoller(t *testing.T) {
+	ctx := context.Background()
+	// run starts a client polling hourly, lets its first poll find nothing,
+	// schedules a job and returns how long the job took to run.
+	run := func(t *testing.T, opts ...ScheduleOption) time.Duration {
+		st := newFakeStore()
+		done := make(chan struct{}, 1)
+		c := newPoolClient(t, st, func(context.Context, *Job[testPayload]) error {
+			done <- struct{}{}
+			return nil
+		}, KindConfig{PollInterval: time.Hour})
+		require.NoError(t, c.Start(ctx))
+		defer stopInBubble(t, c)
+		synctest.Wait()
+
+		start := time.Now()
+		st.feed(1)
+		_, err := c.Schedule(ctx, testPayload{}, opts...)
+		require.NoError(t, err)
+		<-done
+		return time.Since(start)
+	}
+	t.Run("ready job", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			require.Zero(t, run(t))
+		})
+	})
+	t.Run("delayed job", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			require.Equal(t, time.Hour, run(t, WithDelay(time.Minute)))
+		})
+	})
+}
+
+func TestWakeBeforeStartAndAfterStop(t *testing.T) {
+	ctx := context.Background()
+	schedule := func(t *testing.T, c *Client) {
+		for range 3 {
+			_, err := c.Schedule(ctx, testPayload{})
+			require.NoError(t, err)
+		}
+		_, err := c.ScheduleBatch(ctx, Item(testPayload{}), Item(testPayload{}))
+		require.NoError(t, err)
+	}
+
+	t.Run("never started", func(t *testing.T) {
+		c := newPoolClient(t, newFakeStore(), noop[testPayload], KindConfig{})
+		schedule(t, c)
+		require.Empty(t, c.pools)
+	})
+	t.Run("stopped", func(t *testing.T) {
+		c := newPoolClient(t, newFakeStore(), noop[testPayload], KindConfig{})
+		require.NoError(t, c.Start(ctx))
+		stop(t, c)
+		schedule(t, c)
+		require.Len(t, c.pools[1].notify, 1)
+	})
+}
+
+func TestClaimCoalescesUnderBacklog(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		st := newFakeStore()
+		done := make(chan struct{}, 40)
+		// Handlers finish one by one, each within 8ms of its start, so while
+		// two run another slot frees well within the coalesce window.
+		c := newPoolClient(t, st, func(_ context.Context, j *Job[testPayload]) error {
+			time.Sleep(time.Duration(j.ID%8+1) * time.Millisecond)
+			done <- struct{}{}
+			return nil
+		}, KindConfig{Workers: 8, PollInterval: time.Hour})
+		st.feed(40)
+		require.NoError(t, c.Start(context.Background()))
+		defer stopInBubble(t, c)
+		for range 40 {
+			<-done
+		}
+
+		limits := st.Limits()
+		require.NotContains(t, limits, 1)
+		var sum int
+		for _, l := range limits {
+			sum += l
+		}
+		require.Greater(t, float64(sum)/float64(len(limits)), 1.0)
+	})
+}

@@ -2,6 +2,7 @@ package notasap
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"time"
 
@@ -35,6 +36,7 @@ type fakeStore struct {
 	rescues    int
 	deletes    int
 	maxLimit   int
+	limits     []int // limit of every Claim call, in order
 	calls      []finishCall
 	writes     []writeResult // scripted results of upcoming Finish/Reschedule calls
 }
@@ -108,14 +110,25 @@ func (f *fakeStore) MaxLimit() int {
 	return f.maxLimit
 }
 
+func (f *fakeStore) Limits() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.limits)
+}
+
 func (f *fakeStore) Calls() []finishCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]finishCall(nil), f.calls...)
 }
 
-func (f *fakeStore) Insert(context.Context, store.DB, []store.InsertParams) ([]store.InsertResult, error) {
-	return nil, nil
+// Insert reports every job as inserted; it does not queue them for Claim.
+func (f *fakeStore) Insert(_ context.Context, _ store.DB, params []store.InsertParams) ([]store.InsertResult, error) {
+	res := make([]store.InsertResult, len(params))
+	for i := range res {
+		res[i] = store.InsertResult{ID: int64(i + 1), Outcome: store.Inserted}
+	}
+	return res, nil
 }
 
 func (f *fakeStore) Claim(ctx context.Context, _ int16, limit int, _ time.Duration) ([]store.ClaimedJob, error) {
@@ -127,6 +140,7 @@ func (f *fakeStore) Claim(ctx context.Context, _ int16, limit int, _ time.Durati
 	f.mu.Lock()
 	f.claims++
 	f.maxLimit = max(f.maxLimit, limit)
+	f.limits = append(f.limits, limit)
 	if f.claimFails > 0 {
 		f.claimFails--
 		err := f.claimErr

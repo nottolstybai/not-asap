@@ -57,8 +57,10 @@ type Client struct {
 	cancelBg  context.CancelFunc
 	runCtx    context.Context
 	cancelRun context.CancelCauseFunc
-	bgWG      sync.WaitGroup // pollers and maintenance loops
-	jobsWG    sync.WaitGroup // running handlers
+	// pools holds the poller of every kind; Schedule wakes them through it.
+	pools  map[Kind]*kindPool
+	bgWG   sync.WaitGroup // pollers and maintenance loops
+	jobsWG sync.WaitGroup // running handlers
 }
 
 // New creates a Client over pool. It validates all options and returns the
@@ -121,13 +123,16 @@ func (c *Client) Start(ctx context.Context) error {
 	c.state = stateStarted
 
 	names := make([]string, 0, len(c.kinds))
-	for _, e := range c.kinds {
+	c.pools = make(map[Kind]*kindPool, len(c.kinds))
+	for k, e := range c.kinds {
 		p := &kindPool{
-			c:     c,
-			e:     e,
-			slots: make(chan struct{}, e.cfg.Workers),
-			wake:  make(chan struct{}, 1),
+			c:      c,
+			e:      e,
+			slots:  make(chan struct{}, e.cfg.Workers),
+			wake:   make(chan struct{}, 1),
+			notify: make(chan struct{}, 1),
 		}
+		c.pools[k] = p
 		c.bgWG.Go(p.loop)
 		names = append(names, e.cfg.Name)
 	}

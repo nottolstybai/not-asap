@@ -30,7 +30,8 @@ func reg[T notasap.Payload](h notasap.Handler[T], cfg notasap.KindConfig) kindRe
 }
 
 // recorder is an Observer that counts events by key: "scheduled/<kind>",
-// "finished/<status>", "retried/<reason>", "stuck/<kind>", "rescued/<kind>";
+// "finished/<status>", "retried/<reason>", "stuck/<kind>", "rescued/<kind>",
+// "polled/<kind>";
 // janitor batch sizes are kept in order.
 type recorder struct {
 	notasap.NopObserver
@@ -55,8 +56,9 @@ func (r *recorder) JobFinished(_ string, st notasap.Status, _ time.Duration) {
 func (r *recorder) JobRetried(_ string, reason notasap.RetryReason, _ time.Duration) {
 	r.inc("retried/" + string(reason))
 }
-func (r *recorder) JobStuck(kind string)   { r.inc("stuck/" + kind) }
-func (r *recorder) JobRescued(kind string) { r.inc("rescued/" + kind) }
+func (r *recorder) JobStuck(kind string)                { r.inc("stuck/" + kind) }
+func (r *recorder) JobRescued(kind string)              { r.inc("rescued/" + kind) }
+func (r *recorder) Polled(kind string, _ time.Duration) { r.inc("polled/" + kind) }
 func (r *recorder) JanitorDeleted(_ notasap.Status, n int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

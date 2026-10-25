@@ -20,6 +20,10 @@ var dbCallTimeout = 10 * time.Second
 // doubles after each attempt.
 const statusWriteBackoff = 50 * time.Millisecond
 
+// claimCoalesceWindow bounds how long a poller under backlog waits for more
+// slots to free before it claims.
+const claimCoalesceWindow = 20 * time.Millisecond
+
 // isTransient reports whether err is a connection-level failure (pool acquire
 // or timeout) after which retrying a status write is safe: the lease makes the
 // write idempotent.
@@ -33,10 +37,14 @@ type kindPool struct {
 	e     *kindEntry
 	slots chan struct{} // one token per running handler; cap is Workers
 	wake  chan struct{} // signalled when a slot frees; cap 1
+	// notify is signalled when this client schedules a ready job of the
+	// kind; cap 1.
+	notify chan struct{}
 }
 
 // loop claims jobs while there are free slots until the client stops. A full
-// batch is followed by an immediate poll, otherwise it waits PollInterval.
+// batch is followed by an immediate poll, otherwise it waits PollInterval or
+// until the client schedules a ready job of the kind.
 func (p *kindPool) loop() {
 	c, cfg := p.c, p.e.cfg
 	lease := cfg.Timeout + c.rescuer.Grace
@@ -44,31 +52,12 @@ func (p *kindPool) loop() {
 	timer.Stop()
 	defer timer.Stop()
 
-	fullBatch := false
-	for first := true; ; first = false {
-		if !first && !fullBatch {
-			timer.Reset(cfg.PollInterval)
-			select {
-			case <-timer.C:
-			case <-c.stopCh:
-				return
-			}
-		}
-		free := cap(p.slots) - len(p.slots)
-		for free == 0 {
-			select {
-			case <-p.wake:
-			case <-c.stopCh:
-				return
-			}
-			free = cap(p.slots) - len(p.slots)
-		}
-		select {
-		case <-c.stopCh:
+	backlog := false
+	for {
+		free, ok := p.waitFree(backlog)
+		if !ok {
 			return
-		default:
 		}
-
 		// The claim does not use bgCtx: cancelling it mid-query could commit
 		// the claim while losing its rows. Claimed rows are always dispatched
 		// and then drained by Stop.
@@ -84,14 +73,75 @@ func (p *kindPool) loop() {
 			default:
 			}
 			c.logger.Warn("notasap: claim jobs", "kind", cfg.Name, "error", err)
-			fullBatch = false
-			continue
 		}
 		for _, row := range rows {
 			p.slots <- struct{}{}
 			c.jobsWG.Go(func() { p.execute(row) })
 		}
-		fullBatch = len(rows) == free
+		backlog = err == nil && len(rows) == free
+		if !backlog {
+			if !p.sleep(timer, cfg.PollInterval) {
+				return
+			}
+		}
+	}
+}
+
+// waitFree returns the number of free slots once there is one. If all slots
+// were busy, or backlog says the last claim was a full batch, it then waits up
+// to claimCoalesceWindow for a quarter of them to be free, so a backlog is
+// claimed in batches rather than one row at a time. It returns false once the
+// client stops.
+func (p *kindPool) waitFree(backlog bool) (int, bool) {
+	stopCh := p.c.stopCh
+	free := cap(p.slots) - len(p.slots)
+	if free == 0 || backlog {
+		for free == 0 {
+			select {
+			case <-p.wake:
+			case <-stopCh:
+				return 0, false
+			}
+			free = cap(p.slots) - len(p.slots)
+		}
+		if want := max(1, cap(p.slots)/4); free < want {
+			window := time.NewTimer(claimCoalesceWindow)
+			defer window.Stop()
+		coalesce:
+			for free < want {
+				select {
+				case <-p.wake:
+				case <-window.C:
+					break coalesce
+				case <-stopCh:
+					return 0, false
+				}
+				free = cap(p.slots) - len(p.slots)
+			}
+			// Only this loop takes slots, so free has not dropped since.
+			free = cap(p.slots) - len(p.slots)
+		}
+	}
+	select {
+	case <-stopCh:
+		return 0, false
+	default:
+	}
+	return free, true
+}
+
+// sleep waits d on timer or until notify is signalled. It returns false once
+// the client stops.
+func (p *kindPool) sleep(timer *time.Timer, d time.Duration) bool {
+	timer.Reset(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-p.notify:
+		return true
+	case <-p.c.stopCh:
+		return false
 	}
 }
 

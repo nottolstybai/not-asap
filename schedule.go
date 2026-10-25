@@ -74,7 +74,7 @@ type BatchResult struct {
 // Schedule inserts a job for p. On an idempotency key conflict it returns the
 // existing job ID with ErrDuplicate or ErrJobRunning.
 func (c *Client) Schedule(ctx context.Context, p Payload, opts ...ScheduleOption) (int64, error) {
-	return c.scheduleOne(ctx, c.db, p, opts)
+	return c.scheduleOne(ctx, c.db, p, opts, true)
 }
 
 // ScheduleTx is Schedule within tx. The job becomes visible when tx commits.
@@ -87,7 +87,7 @@ func (c *Client) ScheduleTx(ctx context.Context, tx pgx.Tx, p Payload, opts ...S
 	if tx == nil {
 		return 0, errors.New("notasap: ScheduleTx: tx is nil")
 	}
-	return c.scheduleOne(ctx, tx, p, opts)
+	return c.scheduleOne(ctx, tx, p, opts, false)
 }
 
 // ScheduleBatch inserts all items atomically. Per-item idempotency conflicts
@@ -111,17 +111,19 @@ func (c *Client) ScheduleBatchTx(ctx context.Context, tx pgx.Tx, items ...BatchI
 	return c.scheduleBatch(ctx, tx, items, false)
 }
 
-func (c *Client) scheduleOne(ctx context.Context, db store.DB, p Payload, opts []ScheduleOption) (int64, error) {
-	res, err := c.scheduleBatch(ctx, db, []BatchItem{{payload: p, opts: opts}}, false)
+func (c *Client) scheduleOne(ctx context.Context, db store.DB, p Payload, opts []ScheduleOption, ownTx bool) (int64, error) {
+	res, err := c.scheduleBatch(ctx, db, []BatchItem{{payload: p, opts: opts}}, ownTx)
 	if err != nil {
 		return 0, err
 	}
 	return res[0].ID, res[0].Err
 }
 
-// scheduleBatch validates items and inserts them. With ownTx, a batch of
-// several items with any idempotency key runs in a transaction on db, so the
-// extra conflict-resolution round trips cannot leave it partially committed.
+// scheduleBatch validates items and inserts them. ownTx means db is not the
+// caller's tx: a batch of several items with any idempotency key runs in a
+// transaction on db, so the extra conflict-resolution round trips cannot leave
+// it partially committed, and the inserts are committed on return, so the
+// pollers of jobs that are ready now are woken.
 func (c *Client) scheduleBatch(ctx context.Context, db store.DB, items []BatchItem, ownTx bool) ([]BatchResult, error) {
 	if len(items) == 0 {
 		return nil, nil
@@ -154,18 +156,41 @@ func (c *Client) scheduleBatch(ctx context.Context, db store.DB, items []BatchIt
 	}
 
 	res := make([]BatchResult, len(items))
+	var ready []Kind
 	for i, r := range inserted {
 		res[i].ID = r.ID
 		switch r.Outcome {
 		case store.Inserted, store.Replaced:
 			c.observer.JobScheduled(names[i])
+			if ownTx && params[i].Delay == 0 {
+				ready = append(ready, Kind(params[i].Kind))
+			}
 		case store.Duplicate:
 			res[i].Err = ErrDuplicate
 		case store.Running:
 			res[i].Err = ErrJobRunning
 		}
 	}
+	c.notify(ready)
 	return res, nil
+}
+
+// notify wakes the idle pollers of kinds without blocking. Before Start it
+// does nothing; after Stop nobody receives the signal.
+func (c *Client) notify(kinds []Kind) {
+	if len(kinds) == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, k := range kinds {
+		if p := c.pools[k]; p != nil {
+			select {
+			case p.notify <- struct{}{}:
+			default:
+			}
+		}
+	}
 }
 
 // insertParams validates it and returns its insert parameters and kind name.

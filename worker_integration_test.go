@@ -308,3 +308,13 @@ func (s *WorkerSuite) TestStartFailsWithoutTable() {
 	s.Require().ErrorContains(err, "apply migrations")
 	s.Require().NoError(c.Stop(context.Background()))
 }
+
+func (s *WorkerSuite) TestScheduleWakesIdlePoller() {
+	c := s.startClient([]kindReg{reg(noop[payloadA], notasap.KindConfig{Name: "a", PollInterval: time.Hour})})
+	// The first poll finds nothing, so the poller sleeps for PollInterval.
+	s.Eventually(func() bool { return c.obs.Count("polled/a") >= 1 }, waitFor, tick)
+	id := s.schedule(c, payloadA{})
+
+	s.waitStatus(id, notasap.StatusDone)
+	s.Equal(2, c.obs.Count("polled/a"))
+}
