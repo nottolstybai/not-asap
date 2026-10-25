@@ -46,15 +46,21 @@ func (s *Store) Rescue(ctx context.Context, limit int, decide func(StuckJob) Res
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, rescueSelectSQL, limit)
 		if err != nil {
-			return err
+			return fmt.Errorf("tx.Query: %w", err)
 		}
+
 		jobs, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (StuckJob, error) {
 			var j StuckJob
 			err := row.Scan(&j.ID, &j.Kind, &j.Attempt, &j.MaxAttempts)
+
 			return j, err
 		})
-		if err != nil || len(jobs) == 0 {
-			return err
+		if err != nil {
+			return fmt.Errorf("pgx.CollectRows: %w", err)
+		}
+
+		if len(jobs) == 0 {
+			return nil
 		}
 
 		b := &pgx.Batch{}
@@ -65,14 +71,18 @@ func (s *Store) Rescue(ctx context.Context, limit int, decide func(StuckJob) Res
 				b.Queue(rescueRetrySQL, j.ID, d.Delay.Seconds(), RescuedError)
 			}
 		}
+
 		if err := tx.SendBatch(ctx, b).Close(); err != nil {
-			return err
+			return fmt.Errorf("tx.SendBatch: %w", err)
 		}
+
 		n = len(jobs)
+
 		return nil
 	})
 	if err != nil {
-		return 0, fmt.Errorf("notasap: rescue: %w", err)
+		return 0, fmt.Errorf("pgx.BeginFunc: %w", err)
 	}
+
 	return n, nil
 }

@@ -54,6 +54,7 @@ func handleSendInvoice(ctx context.Context, job *notasap.Job[SendInvoice]) error
 	}
 
 	log.Info("invoice sent", "order_id", p.OrderID, "email", p.Email)
+
 	return nil
 }
 
@@ -74,14 +75,16 @@ func run() error {
 
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		return fmt.Errorf("connect: %w", err)
+		return fmt.Errorf("pgxpool.New: %w", err)
 	}
+
 	defer pool.Close()
 
 	client, err := notasap.New(pool)
 	if err != nil {
 		return err
 	}
+
 	err = notasap.Register(client, handleSendInvoice, notasap.KindConfig{
 		Name:        "send_invoice",
 		Workers:     4,
@@ -97,7 +100,12 @@ func run() error {
 		return err
 	}
 
-	id, err := client.Schedule(ctx, SendInvoice{OrderID: 42, Email: "user@example.com"},
+	id, err := client.Schedule(
+		ctx,
+		SendInvoice{
+			OrderID: 42,
+			Email:   "user@example.com",
+		},
 		notasap.WithDelay(2*time.Second),
 		notasap.WithIdempotencyKey("invoice-order-42"),
 	)
@@ -115,5 +123,6 @@ func run() error {
 
 	stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
 	return client.Stop(stopCtx)
 }

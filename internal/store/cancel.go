@@ -35,16 +35,18 @@ func (s *Store) Cancel(ctx context.Context, id int64) (CancelOutcome, error) {
 	if err == nil {
 		return CancelOK, nil
 	}
+
 	if !errors.Is(err, pgx.ErrNoRows) {
-		return 0, fmt.Errorf("notasap: cancel: %w", err)
+		return 0, fmt.Errorf("pool.QueryRow: %w", err)
 	}
+
 	var status int16
 	err = s.pool.QueryRow(ctx, statusSQL, id).Scan(&status)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return CancelNotFound, nil
 	case err != nil:
-		return 0, fmt.Errorf("notasap: cancel: %w", err)
+		return 0, fmt.Errorf("pool.QueryRow: %w", err)
 	case status == StatusRunning:
 		return CancelRunning, nil
 	default:

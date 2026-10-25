@@ -65,6 +65,7 @@ func (p *kindPool) loop() {
 		if !ok {
 			return
 		}
+
 		// The claim does not use bgCtx: cancelling it mid-query could commit
 		// the claim while losing its rows. Claimed rows are always dispatched
 		// and then drained by Stop.
@@ -79,12 +80,15 @@ func (p *kindPool) loop() {
 				return
 			default:
 			}
+
 			c.logger.Warn("notasap: claim jobs", "kind", cfg.Name, "error", err)
 		}
+
 		for _, row := range rows {
 			p.slots <- struct{}{}
 			c.jobsWG.Go(func() { p.execute(row) })
 		}
+
 		backlog = err == nil && len(rows) == free
 		if !backlog {
 			if !p.sleep(timer, cfg.PollInterval) {
@@ -109,8 +113,10 @@ func (p *kindPool) waitFree(backlog bool) (int, bool) {
 			case <-stopCh:
 				return 0, false
 			}
+
 			free = cap(p.slots) - len(p.slots)
 		}
+
 		if want := max(1, cap(p.slots)/4); free < want {
 			window := time.NewTimer(claimCoalesceWindow)
 			defer window.Stop()
@@ -123,15 +129,18 @@ func (p *kindPool) waitFree(backlog bool) (int, bool) {
 				case <-stopCh:
 					return 0, false
 				}
+
 				free = cap(p.slots) - len(p.slots)
 			}
 		}
 	}
+
 	select {
 	case <-stopCh:
 		return 0, false
 	default:
 	}
+
 	return free, true
 }
 
@@ -188,9 +197,13 @@ func (p *kindPool) run(ctx context.Context, row store.ClaimedJob, logger *slog.L
 	defer func() {
 		if v := recover(); v != nil {
 			logger.Error("notasap: handler panicked", "panic", v, "stack", string(debug.Stack()))
-			res = execResult{panicked: true, panicValue: v}
+			res = execResult{
+				panicked:   true,
+				panicValue: v,
+			}
 		}
 	}()
+
 	return p.entry.run(ctx, row)
 }
 
@@ -200,11 +213,15 @@ func (p *kindPool) record(row store.ClaimedJob, a action, took time.Duration, lo
 	ctx, cancel := context.WithTimeout(context.Background(), c.dbCallTimeout)
 	defer cancel()
 
-	ref := store.Ref{ID: row.ID, Lease: row.Lease}
+	ref := store.Ref{
+		ID:    row.ID,
+		Lease: row.Lease,
+	}
 	write := func() (bool, error) {
 		if a.status == StatusPending {
 			return c.st.Reschedule(ctx, ref, a.delay, a.errMsg, a.refund)
 		}
+
 		return c.st.Finish(ctx, ref, int16(a.status), a.errMsg)
 	}
 	// Transient failures are retried with doubling backoff, all within the
@@ -218,12 +235,15 @@ func (p *kindPool) record(row store.ClaimedJob, a action, took time.Duration, lo
 		case <-time.After(delay):
 		case <-ctx.Done():
 		}
+
 		if ctx.Err() != nil {
 			break
 		}
+
 		unknown = unknown || timedOut(err)
 		ok, err = write()
 	}
+
 	switch {
 	case err != nil:
 		logger.Warn("notasap: write job status", "status", a.status, "error", err)

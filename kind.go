@@ -40,5 +40,6 @@ func (s Status) String() string {
 	case StatusCancelled:
 		return "cancelled"
 	}
+
 	return "status(" + strconv.Itoa(int(s)) + ")"
 }

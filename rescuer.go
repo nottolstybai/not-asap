@@ -40,24 +40,29 @@ func (c *Client) rescue(ctx context.Context) {
 		n, err := c.st.Rescue(ctx, rescueBatch, func(j store.StuckJob) store.RescueDecision {
 			r := c.rescueDecision(j)
 			batch = append(batch, r)
+
 			return r.decision
 		})
 		if err != nil {
 			if ctx.Err() == nil {
 				c.logger.Warn("notasap: rescue jobs", "error", err)
 			}
+
 			return
 		}
+
 		for _, r := range batch {
 			c.observer.JobRescued(r.name)
 			status := StatusPending
 			if r.decision.Fail {
 				status = StatusFailed
 			}
+
 			c.logger.Warn("notasap: job rescued after deadline",
 				"job_id", r.job.ID, "kind", r.name, "attempt", r.job.Attempt,
 				"status", status, "delay", r.decision.Delay)
 		}
+
 		if n < rescueBatch {
 			return
 		}
@@ -71,12 +76,17 @@ func (c *Client) rescueDecision(j store.StuckJob) rescued {
 	if e, ok := c.entry(Kind(j.Kind)); ok {
 		name, backoff = e.cfg.Name, e.cfg.Backoff
 	}
-	r := rescued{job: j, name: name}
+
+	r := rescued{
+		job:  j,
+		name: name,
+	}
 	if j.Attempt >= j.MaxAttempts {
 		r.decision.Fail = true
 	} else {
 		r.decision.Delay = delayOf(backoff, j.Attempt, c.logger)
 	}
+
 	return r
 }
 

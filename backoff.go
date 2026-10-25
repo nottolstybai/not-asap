@@ -14,6 +14,7 @@ func Constant(d time.Duration) Backoff {
 	if d < 0 {
 		panic("notasap: Constant: negative duration")
 	}
+
 	return func(int) time.Duration { return d }
 }
 
@@ -24,9 +25,11 @@ func Exponential(base, max time.Duration) Backoff {
 	if base <= 0 {
 		panic("notasap: Exponential: base must be positive")
 	}
+
 	if max < base {
 		panic("notasap: Exponential: max must be >= base")
 	}
+
 	return func(attempt int) time.Duration {
 		d := base
 		for shift := 1; shift < attempt; shift++ {
@@ -34,8 +37,10 @@ func Exponential(base, max time.Duration) Backoff {
 				d = max
 				break
 			}
+
 			d *= 2
 		}
+
 		return d/2 + rand.N(d/2+1)
 	}
 }

@@ -55,6 +55,7 @@ func New(reg prometheus.Registerer, opts ...Option) (*Metrics, error) {
 	if reg == nil {
 		return nil, errors.New("notasap/prom: nil Registerer")
 	}
+
 	cfg := config{
 		jobBuckets:  prometheus.ExponentialBuckets(0.005, 2, 15),
 		pollBuckets: prometheus.ExponentialBuckets(0.0005, 2, 12),
@@ -64,40 +65,53 @@ func New(reg prometheus.Registerer, opts ...Option) (*Metrics, error) {
 			o(&cfg)
 		}
 	}
+
 	if err := checkBuckets("WithJobDurationBuckets", cfg.jobBuckets); err != nil {
 		return nil, err
 	}
+
 	if err := checkBuckets("WithPollDurationBuckets", cfg.pollBuckets); err != nil {
 		return nil, err
 	}
 
 	m := &Metrics{
 		scheduled: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "notasap_jobs_scheduled_total", Help: "Jobs scheduled.",
+			Name: "notasap_jobs_scheduled_total",
+			Help: "Jobs scheduled.",
 		}, []string{"kind"}),
 		finished: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "notasap_jobs_finished_total", Help: "Jobs that reached a terminal status.",
+			Name: "notasap_jobs_finished_total",
+			Help: "Jobs that reached a terminal status.",
 		}, []string{"kind", "status"}),
 		retried: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "notasap_jobs_retried_total", Help: "Job attempts sent back for another try.",
+			Name: "notasap_jobs_retried_total",
+			Help: "Job attempts sent back for another try.",
 		}, []string{"kind", "reason"}),
 		jobDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Name: "notasap_job_duration_seconds", Help: "Job attempt duration.", Buckets: cfg.jobBuckets,
+			Name:    "notasap_job_duration_seconds",
+			Help:    "Job attempt duration.",
+			Buckets: cfg.jobBuckets,
 		}, []string{"kind", "outcome"}),
 		running: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "notasap_jobs_running", Help: "Jobs currently executing.",
+			Name: "notasap_jobs_running",
+			Help: "Jobs currently executing.",
 		}, []string{"kind"}),
 		pollDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Name: "notasap_poll_duration_seconds", Help: "Duration of a poll for jobs.", Buckets: cfg.pollBuckets,
+			Name:    "notasap_poll_duration_seconds",
+			Help:    "Duration of a poll for jobs.",
+			Buckets: cfg.pollBuckets,
 		}, []string{"kind"}),
 		rescued: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "notasap_jobs_rescued_total", Help: "Stuck jobs returned to the queue.",
+			Name: "notasap_jobs_rescued_total",
+			Help: "Stuck jobs returned to the queue.",
 		}, []string{"kind"}),
 		stuck: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "notasap_jobs_stuck_total", Help: "Jobs found stuck.",
+			Name: "notasap_jobs_stuck_total",
+			Help: "Jobs found stuck.",
 		}, []string{"kind"}),
 		deleted: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "notasap_janitor_deleted_total", Help: "Jobs deleted by the janitor.",
+			Name: "notasap_janitor_deleted_total",
+			Help: "Jobs deleted by the janitor.",
 		}, []string{"status"}),
 	}
 
@@ -110,9 +124,11 @@ func New(reg prometheus.Registerer, opts ...Option) (*Metrics, error) {
 			for _, done := range cs[:i] {
 				reg.Unregister(done)
 			}
+
 			return nil, err
 		}
 	}
+
 	return m, nil
 }
 
@@ -121,14 +137,17 @@ func checkBuckets(opt string, b []float64) error {
 	if len(b) == 0 {
 		return fmt.Errorf("notasap/prom: %s: buckets must not be empty", opt)
 	}
+
 	for i, v := range b {
 		if math.IsNaN(v) {
 			return fmt.Errorf("notasap/prom: %s: bucket %d is NaN", opt, i)
 		}
+
 		if i > 0 && v <= b[i-1] {
 			return fmt.Errorf("notasap/prom: %s: buckets must be strictly increasing", opt)
 		}
 	}
+
 	return nil
 }
 

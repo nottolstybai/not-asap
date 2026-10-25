@@ -38,6 +38,7 @@ func WithDelay(d time.Duration) ScheduleOption {
 			o.fail(errors.New("notasap: WithDelay: delay must not be negative"))
 			return
 		}
+
 		o.delay = d
 	}
 }
@@ -50,6 +51,7 @@ func WithIdempotencyKey(key string) ScheduleOption {
 			o.fail(errors.New("notasap: WithIdempotencyKey: key is empty"))
 			return
 		}
+
 		o.key = &key
 	}
 }
@@ -69,7 +71,10 @@ type BatchItem struct {
 
 // Item builds a BatchItem.
 func Item(p Payload, opts ...ScheduleOption) BatchItem {
-	return BatchItem{payload: p, opts: opts}
+	return BatchItem{
+		payload: p,
+		opts:    opts,
+	}
 }
 
 // BatchResult is the outcome of one BatchItem. Err is nil, ErrDuplicate or
@@ -100,6 +105,7 @@ func (c *Client) ScheduleTx(ctx context.Context, tx pgx.Tx, p Payload, opts ...S
 	if tx == nil {
 		return 0, errors.New("notasap: ScheduleTx: tx is nil")
 	}
+
 	return c.scheduleOne(ctx, tx, p, opts, false)
 }
 
@@ -125,14 +131,19 @@ func (c *Client) ScheduleBatchTx(ctx context.Context, tx pgx.Tx, items ...BatchI
 	if tx == nil {
 		return nil, errors.New("notasap: ScheduleBatchTx: tx is nil")
 	}
+
 	return c.scheduleBatch(ctx, tx, items, false)
 }
 
 func (c *Client) scheduleOne(ctx context.Context, db store.DB, p Payload, opts []ScheduleOption, ownTx bool) (int64, error) {
-	res, err := c.scheduleBatch(ctx, db, []BatchItem{{payload: p, opts: opts}}, ownTx)
+	res, err := c.scheduleBatch(ctx, db, []BatchItem{{
+		payload: p,
+		opts:    opts,
+	}}, ownTx)
 	if err != nil {
 		return 0, err
 	}
+
 	return res[0].ID, res[0].Err
 }
 
@@ -145,6 +156,7 @@ func (c *Client) scheduleBatch(ctx context.Context, db store.DB, items []BatchIt
 	if len(items) == 0 {
 		return nil, nil
 	}
+
 	params := make([]store.InsertParams, len(items))
 	names := make([]string, len(items))
 	for i, it := range items {
@@ -152,6 +164,7 @@ func (c *Client) scheduleBatch(ctx context.Context, db store.DB, items []BatchIt
 		if err != nil {
 			return nil, err
 		}
+
 		params[i] = p
 		names[i] = name
 	}
@@ -160,7 +173,11 @@ func (c *Client) scheduleBatch(ctx context.Context, db store.DB, items []BatchIt
 	insert := func(db store.DB) error {
 		var err error
 		inserted, err = c.st.Insert(ctx, db, params)
-		return err
+		if err != nil {
+			return fmt.Errorf("st.Insert: %w", err)
+		}
+
+		return nil
 	}
 	var err error
 	if ownTx && len(params) > 1 && slices.ContainsFunc(params, func(p store.InsertParams) bool { return p.Key != nil }) {
@@ -168,8 +185,9 @@ func (c *Client) scheduleBatch(ctx context.Context, db store.DB, items []BatchIt
 	} else {
 		err = insert(db)
 	}
+
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("notasap: Schedule: %w", err)
 	}
 
 	res := make([]BatchResult, len(items))
@@ -188,7 +206,9 @@ func (c *Client) scheduleBatch(ctx context.Context, db store.DB, items []BatchIt
 			res[i].Err = ErrJobRunning
 		}
 	}
+
 	c.notify(ready)
+
 	return res, nil
 }
 
@@ -208,6 +228,7 @@ func (c *Client) poolsOf(kinds []Kind) []*kindPool {
 	if len(kinds) == 0 {
 		return nil
 	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	var ps []*kindPool
@@ -216,6 +237,7 @@ func (c *Client) poolsOf(kinds []Kind) []*kindPool {
 			ps = append(ps, p)
 		}
 	}
+
 	return ps
 }
 
@@ -226,27 +248,33 @@ func (c *Client) insertParams(it BatchItem) (store.InsertParams, string, error) 
 	if it.payload == nil {
 		return store.InsertParams{}, "", errors.New("notasap: Schedule: payload is nil")
 	}
+
 	kind := it.payload.Kind()
 	e, ok := c.entry(kind)
 	if !ok {
 		return store.InsertParams{}, "", fmt.Errorf("%w %d", ErrUnknownKind, kind)
 	}
+
 	var o scheduleOptions
 	for _, opt := range it.opts {
 		if opt != nil {
 			opt(&o)
 		}
 	}
+
 	if o.err != nil {
 		return store.InsertParams{}, "", o.err
 	}
+
 	if o.replace && o.key == nil {
 		return store.InsertParams{}, "", errors.New("notasap: Schedule: WithReplace requires WithIdempotencyKey")
 	}
+
 	payload, err := json.Marshal(it.payload)
 	if err != nil {
-		return store.InsertParams{}, "", fmt.Errorf("notasap: Schedule: marshal payload of kind %d: %w", kind, err)
+		return store.InsertParams{}, "", fmt.Errorf("notasap: Schedule: kind %d: json.Marshal: %w", kind, err)
 	}
+
 	return store.InsertParams{
 		Kind:        int16(kind),
 		Payload:     payload,

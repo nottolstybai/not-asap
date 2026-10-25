@@ -93,7 +93,10 @@ func newOptions() options {
 			Backoff:      defaultBackoff(),
 			PollInterval: defaultPollInterval,
 		},
-		rescuer: RescuerConfig{Interval: defaultRescuerInterval, Grace: defaultRescuerGrace},
+		rescuer: RescuerConfig{
+			Interval: defaultRescuerInterval,
+			Grace:    defaultRescuerGrace,
+		},
 		janitor: JanitorConfig{
 			Interval:  defaultJanitorInterval,
 			BatchSize: defaultJanitorBatch,
@@ -112,7 +115,9 @@ func WithLogger(l *slog.Logger) Option {
 		if l == nil {
 			return errors.New("notasap: WithLogger: logger is nil")
 		}
+
 		o.logger = l
+
 		return nil
 	}
 }
@@ -123,7 +128,9 @@ func WithObserver(obs Observer) Option {
 		if obs == nil {
 			return errors.New("notasap: WithObserver: observer is nil")
 		}
+
 		o.observer = obs
+
 		return nil
 	}
 }
@@ -144,7 +151,9 @@ func WithDefaults(cfg KindConfig) Option {
 		case cfg.PollInterval < 0:
 			return errors.New("notasap: WithDefaults: PollInterval must not be negative")
 		}
+
 		o.defaults = mergeKindConfig(o.defaults, cfg)
+
 		return nil
 	}
 }
@@ -158,12 +167,15 @@ func WithRescuer(cfg RescuerConfig) Option {
 		case cfg.Grace < 0:
 			return errors.New("notasap: WithRescuer: Grace must not be negative")
 		}
+
 		if cfg.Interval != 0 {
 			o.rescuer.Interval = cfg.Interval
 		}
+
 		if cfg.Grace != 0 {
 			o.rescuer.Grace = cfg.Grace
 		}
+
 		return nil
 	}
 }
@@ -177,22 +189,27 @@ func WithJanitor(cfg JanitorConfig) Option {
 		case cfg.BatchSize < 0:
 			return errors.New("notasap: WithJanitor: BatchSize must not be negative")
 		}
+
 		for s, d := range cfg.Retention {
 			switch s {
 			case StatusDone, StatusFailed, StatusCancelled:
 			default:
 				return fmt.Errorf("notasap: WithJanitor: Retention: unsupported status %s", s)
 			}
+
 			if d < 0 {
 				return fmt.Errorf("notasap: WithJanitor: Retention[%s] must not be negative", s)
 			}
 		}
+
 		if cfg.Interval != 0 {
 			o.janitor.Interval = cfg.Interval
 		}
+
 		if cfg.BatchSize != 0 {
 			o.janitor.BatchSize = cfg.BatchSize
 		}
+
 		ret := make(map[Status]time.Duration, len(o.janitor.Retention)+len(cfg.Retention))
 		maps.Copy(ret, o.janitor.Retention)
 		maps.Copy(ret, cfg.Retention)
@@ -200,6 +217,7 @@ func WithJanitor(cfg JanitorConfig) Option {
 		if cfg.Disabled {
 			o.janitor.Disabled = true
 		}
+
 		return nil
 	}
 }
@@ -211,7 +229,9 @@ func WithStopGrace(d time.Duration) Option {
 		if d < 0 {
 			return errors.New("notasap: WithStopGrace: duration must not be negative")
 		}
+
 		o.stopGrace = d
+
 		return nil
 	}
 }
@@ -221,18 +241,23 @@ func mergeKindConfig(defaults, cfg KindConfig) KindConfig {
 	if cfg.Workers == 0 {
 		cfg.Workers = defaults.Workers
 	}
+
 	if cfg.MaxAttempts == 0 {
 		cfg.MaxAttempts = defaults.MaxAttempts
 	}
+
 	if cfg.Timeout == 0 {
 		cfg.Timeout = defaults.Timeout
 	}
+
 	if cfg.Backoff == nil {
 		cfg.Backoff = defaults.Backoff
 	}
+
 	if cfg.PollInterval == 0 {
 		cfg.PollInterval = defaults.PollInterval
 	}
+
 	return cfg
 }
 
@@ -252,5 +277,6 @@ func validateKindConfig(cfg KindConfig) error {
 	case cfg.Backoff == nil:
 		return fmt.Errorf("notasap: KindConfig %q: Backoff is nil", cfg.Name)
 	}
+
 	return nil
 }

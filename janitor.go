@@ -33,6 +33,7 @@ func (c *Client) clean(ctx context.Context) {
 		if retention <= 0 {
 			continue
 		}
+
 		var total int64
 		for ctx.Err() == nil {
 			n, err := c.st.DeleteFinished(ctx, int16(status), retention, c.janitor.BatchSize)
@@ -40,16 +41,20 @@ func (c *Client) clean(ctx context.Context) {
 				if ctx.Err() == nil {
 					c.logger.Warn("notasap: delete finished jobs", "status", status, "error", err)
 				}
+
 				break
 			}
+
 			if n > 0 {
 				c.observer.JanitorDeleted(status, n)
 				total += n
 			}
+
 			if n < int64(c.janitor.BatchSize) {
 				break
 			}
 		}
+
 		if total > 0 {
 			c.logger.Debug("notasap: janitor deleted finished jobs", "status", status, "count", total)
 		}

@@ -13,8 +13,9 @@ import (
 func (c *Client) Cancel(ctx context.Context, id int64) error {
 	out, err := c.st.Cancel(ctx, id)
 	if err != nil {
-		return err
+		return fmt.Errorf("notasap: Cancel: st.Cancel: %w", err)
 	}
+
 	switch out {
 	case store.CancelOK:
 		return nil
@@ -25,5 +26,6 @@ func (c *Client) Cancel(ctx context.Context, id int64) error {
 	case store.CancelNotFound:
 		return ErrNotFound
 	}
+
 	return fmt.Errorf("notasap: Cancel: unexpected outcome %d", out)
 }

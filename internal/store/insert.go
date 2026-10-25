@@ -101,6 +101,7 @@ func (s *Store) Insert(ctx context.Context, db DB, params []InsertParams) ([]Ins
 	for i := range params {
 		todo[i] = i
 	}
+
 	// Taking keys in one (kind, key) order prevents deadlocks between
 	// concurrent batches with overlapping keys. Later rounds keep the order
 	// as they are built by iterating todo.
@@ -109,6 +110,7 @@ func (s *Store) Insert(ctx context.Context, db DB, params []InsertParams) ([]Ins
 		if c := cmp.Compare(pa.Kind, pb.Kind); c != 0 {
 			return c
 		}
+
 		switch {
 		case pa.Key == nil && pb.Key == nil:
 			return 0
@@ -117,25 +119,30 @@ func (s *Store) Insert(ctx context.Context, db DB, params []InsertParams) ([]Ins
 		case pb.Key == nil:
 			return 1
 		}
+
 		return strings.Compare(*pa.Key, *pb.Key)
 	})
 	for range maxInsertRounds {
 		conflicts, err := insertRound(ctx, db, params, todo, results)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("insertRound: %w", err)
 		}
+
 		if len(conflicts) == 0 {
 			return results, nil
 		}
+
 		todo, err = lookupRound(ctx, db, params, conflicts, results)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("lookupRound: %w", err)
 		}
+
 		if len(todo) == 0 {
 			return results, nil
 		}
 	}
-	return nil, fmt.Errorf("notasap: insert: idempotency key conflict unresolved after %d rounds", maxInsertRounds)
+
+	return nil, fmt.Errorf("idempotency key conflict unresolved after %d rounds", maxInsertRounds)
 }
 
 // insertRound inserts params[todo] and returns the indexes whose statement
@@ -149,8 +156,10 @@ func insertRound(ctx context.Context, db DB, params []InsertParams, todo []int, 
 		if p.Replace {
 			sql = insertReplaceSQL
 		}
+
 		b.Queue(sql, p.Kind, p.Payload, p.MaxAttempts, p.Delay.Seconds(), p.Key)
 	}
+
 	br := db.SendBatch(ctx, b)
 	var conflicts []int
 	for _, i := range todo {
@@ -162,20 +171,28 @@ func insertRound(ctx context.Context, db DB, params []InsertParams, todo []int, 
 		if errors.Is(err, pgx.ErrNoRows) {
 			if params[i].Key == nil {
 				_ = br.Close()
-				return nil, errors.New("notasap: insert: no row returned for a job without idempotency key")
+				return nil, errors.New("no row returned for a job without idempotency key")
 			}
+
 			conflicts = append(conflicts, i)
 			continue
 		}
+
 		if err != nil {
 			_ = br.Close()
-			return nil, fmt.Errorf("notasap: insert: %w", err)
+			return nil, fmt.Errorf("br.QueryRow: %w", err)
 		}
-		results[i] = InsertResult{ID: id, Outcome: InsertOutcome(outcome)}
+
+		results[i] = InsertResult{
+			ID:      id,
+			Outcome: InsertOutcome(outcome),
+		}
 	}
+
 	if err := br.Close(); err != nil {
-		return nil, fmt.Errorf("notasap: insert: %w", err)
+		return nil, fmt.Errorf("br.Close: %w", err)
 	}
+
 	return conflicts, nil
 }
 
@@ -187,6 +204,7 @@ func lookupRound(ctx context.Context, db DB, params []InsertParams, conflicts []
 	for _, i := range conflicts {
 		b.Queue(lookupSQL, params[i].Kind, params[i].Key)
 	}
+
 	br := db.SendBatch(ctx, b)
 	var retry []int
 	for _, i := range conflicts {
@@ -199,21 +217,31 @@ func lookupRound(ctx context.Context, db DB, params []InsertParams, conflicts []
 			retry = append(retry, i)
 			continue
 		}
+
 		if err != nil {
 			_ = br.Close()
-			return nil, fmt.Errorf("notasap: insert: lookup: %w", err)
+			return nil, fmt.Errorf("br.QueryRow: %w", err)
 		}
+
 		switch {
 		case !params[i].Replace:
-			results[i] = InsertResult{ID: id, Outcome: Duplicate}
+			results[i] = InsertResult{
+				ID:      id,
+				Outcome: Duplicate,
+			}
 		case status == StatusRunning:
-			results[i] = InsertResult{ID: id, Outcome: Running}
+			results[i] = InsertResult{
+				ID:      id,
+				Outcome: Running,
+			}
 		default:
 			retry = append(retry, i)
 		}
 	}
+
 	if err := br.Close(); err != nil {
-		return nil, fmt.Errorf("notasap: insert: lookup: %w", err)
+		return nil, fmt.Errorf("br.Close: %w", err)
 	}
+
 	return retry, nil
 }

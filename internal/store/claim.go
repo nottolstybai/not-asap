@@ -51,16 +51,19 @@ type Ref struct {
 func (s *Store) Claim(ctx context.Context, kind int16, limit int, lease time.Duration) ([]ClaimedJob, error) {
 	rows, err := s.pool.Query(ctx, claimSQL, kind, limit, lease.Seconds())
 	if err != nil {
-		return nil, fmt.Errorf("notasap: claim: %w", err)
+		return nil, fmt.Errorf("pool.Query: %w", err)
 	}
+
 	jobs, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (ClaimedJob, error) {
 		var j ClaimedJob
 		err := row.Scan(&j.ID, &j.Kind, &j.Payload, &j.Attempt, &j.MaxAttempts, &j.Lease, &j.CreatedAt)
+
 		return j, err
 	})
 	if err != nil {
-		return nil, fmt.Errorf("notasap: claim: %w", err)
+		return nil, fmt.Errorf("pgx.CollectRows: %w", err)
 	}
+
 	return jobs, nil
 }
 
@@ -70,8 +73,9 @@ func (s *Store) Claim(ctx context.Context, kind int16, limit int, lease time.Dur
 func (s *Store) Finish(ctx context.Context, ref Ref, status int16, errMsg string) (bool, error) {
 	tag, err := s.pool.Exec(ctx, finishSQL, ref.ID, ref.Lease, status, nullable(errMsg))
 	if err != nil {
-		return false, fmt.Errorf("notasap: finish: %w", err)
+		return false, fmt.Errorf("pool.Exec: %w", err)
 	}
+
 	return tag.RowsAffected() == 1, nil
 }
 
@@ -81,7 +85,8 @@ func (s *Store) Finish(ctx context.Context, ref Ref, status int16, errMsg string
 func (s *Store) Reschedule(ctx context.Context, ref Ref, delay time.Duration, errMsg string, refund bool) (bool, error) {
 	tag, err := s.pool.Exec(ctx, rescheduleSQL, ref.ID, ref.Lease, delay.Seconds(), nullable(errMsg), refund)
 	if err != nil {
-		return false, fmt.Errorf("notasap: reschedule: %w", err)
+		return false, fmt.Errorf("pool.Exec: %w", err)
 	}
+
 	return tag.RowsAffected() == 1, nil
 }

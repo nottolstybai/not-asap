@@ -54,9 +54,11 @@ func (s *Store) CheckSchema(ctx context.Context) error {
 	if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
 		return ErrNoTable
 	}
+
 	if err != nil {
-		return fmt.Errorf("notasap: check schema: %w", err)
+		return fmt.Errorf("pool.Exec: %w", err)
 	}
+
 	return nil
 }
 
@@ -65,5 +67,6 @@ func nullable(s string) *string {
 	if s == "" {
 		return nil
 	}
+
 	return &s
 }

@@ -3,6 +3,7 @@ package notasap
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
 	"time"
@@ -73,11 +74,14 @@ func New(pool *pgxpool.Pool, opts ...Option) (*Client, error) {
 	if pool == nil {
 		return nil, errors.New("notasap: New: pool is nil")
 	}
+
 	c, err := newClient(store.New(pool), pool, opts...)
 	if err != nil {
 		return nil, err
 	}
+
 	c.maxConns = pool.Config().MaxConns
+
 	return c, nil
 }
 
@@ -87,10 +91,12 @@ func newClient(st jobStore, db store.DB, opts ...Option) (*Client, error) {
 		if opt == nil {
 			continue
 		}
+
 		if err := opt(&o); err != nil {
 			return nil, err
 		}
 	}
+
 	return &Client{
 		options:       o,
 		st:            st,
@@ -118,8 +124,13 @@ func (c *Client) Start(ctx context.Context) error {
 	case stateStopped:
 		return ErrStopped
 	}
+
 	if err := c.st.CheckSchema(ctx); err != nil {
-		return err
+		if errors.Is(err, store.ErrNoTable) {
+			return err
+		}
+
+		return fmt.Errorf("notasap: Start: st.CheckSchema: %w", err)
 	}
 
 	c.stopCh = make(chan struct{})
@@ -141,6 +152,7 @@ func (c *Client) Start(ctx context.Context) error {
 		c.bgWG.Go(p.loop)
 		names = append(names, e.cfg.Name)
 	}
+
 	c.startMaintenance()
 
 	slices.Sort(names)
@@ -148,7 +160,9 @@ func (c *Client) Start(ctx context.Context) error {
 		c.logger.Warn("notasap: connection pool is smaller than kinds + 2; status writes may starve, give notasap its own pool with MaxConns >= kinds + 2",
 			"max_conns", c.maxConns, "kinds", len(names))
 	}
+
 	c.logger.Info("notasap: started", "kinds", names)
+
 	return nil
 }
 
@@ -176,6 +190,7 @@ func (c *Client) Stop(ctx context.Context) error {
 	if prev == stateNew {
 		close(c.stopped)
 	}
+
 	c.mu.Unlock()
 	switch prev {
 	case stateNew:
@@ -188,6 +203,7 @@ func (c *Client) Stop(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
+
 	defer close(c.stopped)
 
 	close(c.stopCh)
@@ -204,6 +220,7 @@ func (c *Client) Stop(ctx context.Context) error {
 	case <-drained:
 	case <-ctx.Done():
 	}
+
 	c.cancelRun(errShutdown)
 	var err error
 	select {
@@ -218,6 +235,8 @@ func (c *Client) Stop(ctx context.Context) error {
 			c.logger.Warn("notasap: handlers still running after stop grace")
 		}
 	}
+
 	c.logger.Info("notasap: stopped")
+
 	return err
 }

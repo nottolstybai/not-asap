@@ -43,19 +43,36 @@ type action struct {
 func decide(r execResult, attempt, maxAttempts int, backoff Backoff, logger *slog.Logger) action {
 	switch {
 	case r.decodeErr != nil:
-		return action{status: StatusFailed, errMsg: truncateError("decode payload: " + r.decodeErr.Error())}
+		return action{
+			status: StatusFailed,
+			errMsg: truncateError("decode payload: " + r.decodeErr.Error()),
+		}
 	case !r.panicked && r.err == nil:
 		return action{status: StatusDone}
 	case !r.panicked && errors.Is(r.err, ErrCancel):
-		return action{status: StatusCancelled, errMsg: truncateError(r.err.Error())}
+		return action{
+			status: StatusCancelled,
+			errMsg: truncateError(r.err.Error()),
+		}
 	}
 
 	errMsg := truncateError(failureText(r))
 	switch {
 	case errors.Is(r.cause, errShutdown):
-		return action{status: StatusPending, refund: true, errMsg: errMsg, reason: RetryShutdown}
+		return action{
+			status: StatusPending,
+			refund: true,
+			errMsg: errMsg,
+			reason: RetryShutdown,
+		}
 	case !r.panicked && errors.Is(r.err, ErrKeepAttempt):
-		return action{status: StatusPending, delay: delayOf(backoff, attempt, logger), refund: true, errMsg: errMsg, reason: RetryKeepAttempt}
+		return action{
+			status: StatusPending,
+			delay:  delayOf(backoff, attempt, logger),
+			refund: true,
+			errMsg: errMsg,
+			reason: RetryKeepAttempt,
+		}
 	}
 
 	reason := RetryError
@@ -65,16 +82,28 @@ func decide(r execResult, attempt, maxAttempts int, backoff Backoff, logger *slo
 	case errors.Is(r.cause, errTimeout):
 		reason = RetryTimeout
 	}
+
 	if attempt >= maxAttempts {
-		return action{status: StatusFailed, errMsg: errMsg, reason: reason}
+		return action{
+			status: StatusFailed,
+			errMsg: errMsg,
+			reason: reason,
+		}
 	}
-	return action{status: StatusPending, delay: delayOf(backoff, attempt, logger), errMsg: errMsg, reason: reason}
+
+	return action{
+		status: StatusPending,
+		delay:  delayOf(backoff, attempt, logger),
+		errMsg: errMsg,
+		reason: reason,
+	}
 }
 
 func failureText(r execResult) string {
 	if r.panicked {
 		return fmt.Sprintf("panic: %v", r.panicValue)
 	}
+
 	return r.err.Error()
 }
 
@@ -87,6 +116,7 @@ func delayOf(b Backoff, attempt int, logger *slog.Logger) (d time.Duration) {
 			d = 0
 		}
 	}()
+
 	return max(b(attempt), 0)
 }
 
@@ -95,9 +125,11 @@ func truncateError(s string) string {
 	if len(s) <= maxErrorLen {
 		return s
 	}
+
 	n := maxErrorLen
 	for n > 0 && !utf8.RuneStart(s[n]) {
 		n--
 	}
+
 	return s[:n]
 }
