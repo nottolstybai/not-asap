@@ -12,20 +12,13 @@
 <p align="center">
   <a href="https://pkg.go.dev/github.com/nottolstybai/not-asap"><img alt="Go Reference" src="https://pkg.go.dev/badge/github.com/nottolstybai/not-asap.svg"></a>
   <a href="https://github.com/nottolstybai/not-asap/actions/workflows/test.yml"><img alt="test" src="https://github.com/nottolstybai/not-asap/actions/workflows/test.yml/badge.svg?branch=main"></a>
-  <a href="https://github.com/nottolstybai/not-asap/actions/workflows/test.yml"><img alt="coverage" src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/nottolstybai/not-asap/badges/coverage.json"></a>
-  <img alt="Go 1.26+" src="https://img.shields.io/badge/go-1.26%2B-00ADD8?logo=go&logoColor=white">
-  <img alt="PostgreSQL 14+" src="https://img.shields.io/badge/postgres-14%2B-4169E1?logo=postgresql&logoColor=white">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green"></a>
-</p>
-
-<p align="center">
-  <b>English</b> · <a href="README.ru.md">Русский</a>
 </p>
 
 ---
 
 **notasap** runs background jobs inside your Go service, using one Postgres table as the queue.
-There is no broker to deploy. Because a job is a row, you can schedule it **in the same transaction**
+There is no broker to deploy. A job is a row, so you can schedule it **in the same transaction**
 as your business data: the job exists only if the transaction commits.
 
 ```go
@@ -35,50 +28,18 @@ client.ScheduleTx(ctx, tx, SendInvoice{OrderID: orderID})    // your job
 tx.Commit(ctx)                                               // both or neither
 ```
 
-## Contents
-
-- [Features](#features)
-- [Quick start](#quick-start)
-- [How it works](#how-it-works)
-- [Writing handlers](#writing-handlers)
-- [Scheduling jobs](#scheduling-jobs)
-- [Configuration](#configuration)
-- [Running and stopping](#running-and-stopping)
-- [Reliability](#reliability)
-- [Operating in production](#operating-in-production)
-- [Observability](#observability)
-- [Migrations](#migrations)
-- [Development](#development)
-- [License](#license)
-
-## Features
-
-- **Transactional scheduling.** `ScheduleTx` writes the job in your `pgx.Tx`.
-- **Typed handlers.** Payloads are plain Go structs; handlers receive them already decoded.
-- **Delays, retries, timeouts.** Start a job later, retry it with constant or exponential backoff, and cap each run with a timeout.
-- **Idempotency keys.** Schedule the same logical job twice and get the first one back, or replace it on purpose.
-- **Per-kind worker pools.** Every job kind has its own workers, so a slow kind never starves the others.
-- **Crash recovery.** Jobs of a crashed process are picked up again; late results of a stale worker are rejected.
-- **Graceful shutdown.** `Stop` drains running jobs; interrupted jobs go back to the queue without losing an attempt.
-- **Housekeeping.** A janitor deletes old finished jobs on a per-status schedule.
-- **Observability.** `log/slog` logging and an optional Prometheus collector.
+It also provides typed handlers, delays, retries with backoff, timeouts, idempotency keys,
+a separate worker pool per job kind, crash recovery, graceful shutdown, `slog` logging and Prometheus metrics.
 
 ## Quick start
 
-### 1. Install
+Requires Go 1.26+, PostgreSQL 14+ and [pgx v5](https://github.com/jackc/pgx).
 
 ```sh
 go get github.com/nottolstybai/not-asap
 ```
 
-Requires Go 1.26+, PostgreSQL 14+ and [pgx v5](https://github.com/jackc/pgx).
-
-### 2. Create the table
-
-Apply the migration from [`migrations/`](migrations) with your migration tool
-(see [Migrations](#migrations)).
-
-### 3. Define a job and run the client
+Create the table with the migration from [`migrations/`](migrations) (see [Migrations](#migrations)), then:
 
 ```go
 package main
@@ -146,16 +107,15 @@ A runnable version is in [`examples/basic`](examples/basic).
 
 ## How it works
 
-Every job is a row in `notasap_jobs`. Each registered kind has a poller that claims
-ready rows with `FOR UPDATE SKIP LOCKED` and hands them to that kind's workers.
-Replicas of your service share the table and never claim the same row twice.
+Every job is a row in `notasap_jobs`. Each registered kind has a poller that claims ready rows with
+`FOR UPDATE SKIP LOCKED` and hands them to that kind's workers. Replicas share the table and never
+claim the same row twice.
 
 An idle poller checks for ready jobs every `PollInterval`. `Schedule` and `ScheduleBatch` also wake
-this replica's poller at once when they insert a job without a delay. `ScheduleTx` and `ScheduleBatchTx`
-do not, because the job is invisible until your commit; such jobs, and jobs scheduled by other replicas,
-start within `PollInterval`. Under steady `Schedule` traffic each ready job wakes the poller, so a claim
-may fetch a single row: more round trips to the database for lower latency. Under a backlog a poller
-waits up to 20 ms for a quarter of its workers to free up, so it claims in batches rather than one row at a time.
+this replica's poller at once when the job has no delay. `ScheduleTx` and `ScheduleBatchTx` do not,
+because the job is invisible until your commit; such jobs, and jobs scheduled by other replicas, start
+within `PollInterval`. Under a backlog a poller waits up to 20 ms for a quarter of its workers to free up,
+so it claims in batches.
 
 ```mermaid
 stateDiagram-v2
@@ -175,19 +135,17 @@ stateDiagram-v2
 > Delivery is **at least once**. A job can run more than once (for example after a crash),
 > so handlers must be idempotent.
 
-## Writing handlers
-
-A handler is a function that receives the decoded payload and job metadata:
+## Handlers
 
 ```go
 func handle(ctx context.Context, job *notasap.Job[SendInvoice]) error
 ```
 
-`job` carries `ID`, `Kind`, `Payload`, `Attempt` (starts at 1), `MaxAttempts` and `CreatedAt`.
+`job` has `ID`, `Kind`, `Payload`, `Attempt` (starts at 1), `MaxAttempts` and `CreatedAt`.
 `ctx` is cancelled when the kind's `Timeout` expires or the client stops, so pass it to every call
 that can block. `notasap.Logger(ctx)` returns a logger with `job_id`, `kind` and `attempt` attached.
 
-What the handler returns decides what happens next:
+The return value decides what happens next:
 
 | Handler result | Job status | Attempt spent? |
 |---|---|---|
@@ -198,23 +156,21 @@ What the handler returns decides what happens next:
 | payload cannot be decoded | `failed` immediately | yes |
 | interrupted by `Stop` | `pending`, runs again right away | **no** |
 
-Sentinels are matched with `errors.Is`, so wrap them to keep a useful message:
+Sentinels are matched with `errors.Is`, so you can wrap them with a message:
 
 ```go
 if !order.Paid {
-	// The order is not paid yet. Check again later without spending an attempt.
 	return fmt.Errorf("order %d not paid: %w", order.ID, notasap.ErrKeepAttempt)
 }
 ```
 
 > [!WARNING]
-> `ErrKeepAttempt` has no limit: a job that always returns it lives forever.
-> Stop retrying yourself, for example once `job.CreatedAt` is too old.
-> Such retries are visible in the metric `notasap_jobs_retried_total{reason="keep_attempt"}`.
+> `ErrKeepAttempt` has no limit: a job that always returns it lives forever. Stop it yourself,
+> for example once `job.CreatedAt` is too old. Watch `notasap_jobs_retried_total{reason="keep_attempt"}`.
 
-Error texts are stored in the `error` column, trimmed to 4 KB on a UTF-8 boundary.
+Error text is stored in the `error` column, trimmed to 4 KB.
 
-## Scheduling jobs
+## Scheduling
 
 ```go
 id, err := client.Schedule(ctx, payload, opts...)                    // standalone
@@ -229,8 +185,8 @@ res, err := client.ScheduleBatchTx(ctx, tx, items...)
 | `notasap.WithIdempotencyKey(key)` | at most one job per `(kind, key)` while the row exists |
 | `notasap.WithReplace()` | with a key: overwrite the existing job instead of returning a duplicate |
 
-Scheduling a kind that is not registered returns `ErrUnknownKind` and writes nothing.
-A batch returns one `BatchResult{ID, Err}` per item; per-item `Err` is only `ErrDuplicate` or `ErrJobRunning`.
+Scheduling an unregistered kind returns `ErrUnknownKind` and writes nothing. A batch returns one
+`BatchResult{ID, Err}` per item; the per-item `Err` is only `ErrDuplicate` or `ErrJobRunning`.
 
 ### Idempotency keys
 
@@ -238,37 +194,36 @@ When a job with the same kind and key already exists:
 
 | Existing job | Without `WithReplace` | With `WithReplace` |
 |---|---|---|
-| `pending`, `done`, `failed`, `cancelled` | `ErrDuplicate` and the existing ID | the row is overwritten: new payload, `pending`, attempts reset, same ID |
+| `pending`, `done`, `failed`, `cancelled` | `ErrDuplicate` and the existing ID | overwritten: new payload, `pending`, attempts reset, same ID |
 | `running` | `ErrDuplicate` and the existing ID | `ErrJobRunning` and the existing ID |
 
-The key is free again once the janitor deletes the old row. Failed jobs are kept forever by default,
+The key is free again once the janitor deletes the row. Failed jobs are kept forever by default,
 so their keys stay taken until you replace them.
 
 ```go
 id, err := client.Schedule(ctx, SendInvoice{OrderID: 42},
 	notasap.WithIdempotencyKey("invoice:42"))
 if errors.Is(err, notasap.ErrDuplicate) {
-	// already scheduled; id points to the existing job
+	// already scheduled; id is the existing job
 }
 ```
 
 <details>
 <summary>Locking details</summary>
 
-- A batch of 2+ items with idempotency keys passed to `ScheduleBatch` runs in its own transaction, so it is all or nothing.
-- A keyed `ScheduleTx` that inserts or replaces a job holds the key until your transaction ends:
-  a concurrent schedule of the same key waits for it. Finding a duplicate locks nothing.
-- `WithReplace` normally does not wait on or lock a row that is already `running`: it returns `ErrJobRunning`
-  with the existing ID. If a worker claims the row at the same moment, `ScheduleTx` still returns
-  `ErrJobRunning` but keeps the row locked until your transaction ends, and the worker waits for it to save
-  the job's result, with the results of other jobs in the same batch. Keep such transactions short and small; see
-  [The table belongs to the library](#the-table-belongs-to-the-library).
+- A `ScheduleBatch` of 2+ keyed items runs in its own transaction: all or nothing.
+- A keyed `ScheduleTx` that inserts or replaces a job holds the key until your transaction ends;
+  a concurrent schedule of the same key waits. Finding a duplicate locks nothing.
+- `WithReplace` does not wait on a `running` row: it returns `ErrJobRunning`. If a worker claims the row
+  at that very moment, `ScheduleTx` still returns `ErrJobRunning` but keeps the row locked until your
+  transaction ends, and the worker (with the other results of its batch) waits for it. Keep such transactions
+  short; see [The table belongs to the library](#the-table-belongs-to-the-library).
 - Several keyed schedules in one transaction can deadlock with another transaction; see
   [Keyed jobs in one transaction](#keyed-jobs-in-one-transaction).
 
 </details>
 
-### Cancelling a pending job
+### Cancelling
 
 ```go
 err := client.Cancel(ctx, id) // nil, ErrJobRunning, ErrJobFinished or ErrNotFound
@@ -291,7 +246,7 @@ client, err := notasap.New(pool,
 )
 ```
 
-Per-kind settings in `KindConfig`. Zero fields fall back to `WithDefaults`, then to the built-in defaults:
+`KindConfig` (zero fields fall back to `WithDefaults`, then to the built-in values):
 
 | Field | Default | Meaning |
 |---|---|---|
@@ -310,14 +265,14 @@ Background loops:
 | `RescuerConfig.Grace` | `30s` | extra time after `Timeout` before a running job counts as stuck |
 | `JanitorConfig.Interval` | `10m` | how often finished jobs are deleted |
 | `JanitorConfig.BatchSize` | `1000` | rows per delete statement |
-| `JanitorConfig.Retention` | done `24h`, cancelled `24h`, failed `0` | how long to keep each status; `0` = keep forever |
-| `JanitorConfig.Disabled` | `false` | turn the janitor off (cannot be turned back on by a later `WithJanitor`) |
-| `WithStopGrace` | `5s` | how long `Stop` waits for handlers to save their result after cancelling them |
+| `JanitorConfig.Retention` | done `24h`, cancelled `24h`, failed `0` | how long to keep each status; `0` = forever |
+| `JanitorConfig.Disabled` | `false` | turn the janitor off (a later `WithJanitor` cannot turn it back on) |
+| `WithStopGrace` | `5s` | how long `Stop` waits for cancelled handlers to save their result |
 
 `Retention` is merged per status: `Retention{StatusDone: time.Hour}` keeps the other defaults.
-Invalid values are reported by `New` and `Register`, never as a panic at run time.
+Invalid values are returned as errors by `New` and `Register`, never as a panic at run time.
 
-## Running and stopping
+## Start and stop
 
 ```go
 err := client.Start(ctx) // checks the table exists, then starts workers and background loops
@@ -325,43 +280,36 @@ err := client.Stop(ctx)  // graceful shutdown
 ```
 
 - `Register` every kind before `Start`. `Schedule` and `Cancel` work in any state.
-- `Start` holds the client lock while it checks the schema, so give it a `ctx` with a deadline.
-- A client starts once. A second `Start` returns `ErrAlreadyStarted`; `Start` after `Stop` returns `ErrStopped`.
+- `Start` holds the client lock while it checks the schema, so pass a `ctx` with a deadline.
+- A client starts once: a second `Start` returns `ErrAlreadyStarted`, `Start` after `Stop` returns `ErrStopped`.
 
-`Stop` works in steps:
+`Stop`:
 
-1. Stops claiming new jobs and stops the background loops.
-   A claim already in flight finishes first (up to 10 s), and its jobs are run.
-2. Waits for running handlers until `ctx` is done, then for the writes of their results.
-   When `Stop` returns `nil`, a write of every result has been attempted; a write that failed is
-   logged (`write job status`) and the rescuer recovers its job.
-3. If `ctx` expires, cancels the handlers, waits `StopGrace` for them to return and their results
-   to be saved, and returns `ctx.Err()`. Interrupted jobs go back to `pending` without losing an attempt.
+1. Stops claiming jobs and stops the background loops. A claim already in flight finishes first (up to 10 s)
+   and its jobs run.
+2. Waits for running handlers until `ctx` is done, then for the writes of their results. If `Stop` returns
+   `nil`, every result write has been attempted; a failed write is logged (`write job status`) and the
+   rescuer recovers the job.
+3. If `ctx` expires, cancels the handlers, waits `StopGrace` for them to return and save, and returns
+   `ctx.Err()`. Interrupted jobs go back to `pending` without losing an attempt.
 
-A second concurrent `Stop` waits for the first one, so `defer pool.Close()` is safe.
-If `Stop` returns `ctx.Err()`, writes may go on after it returns: results still queued (up to 4000,
-that is several batches, each retried for up to 10 s) and the results of handlers that were still running,
-which they write themselves. Keep the pool open until
-then, or those writes fail and the rescuer recovers the jobs.
+A second concurrent `Stop` waits for the first, so `defer pool.Close()` is safe. After `Stop` returns
+`ctx.Err()`, writes may still be in progress (queued results, up to 4000, each batch retried for up to 10 s,
+and results of handlers that are still running). Keep the pool open until then, or those writes fail
+and the rescuer recovers the jobs.
 
 ## Reliability
 
-**Crashed processes.** When a worker claims a job it sets `deadline = now + Timeout + Grace`.
-If the process dies, the rescuer (running in every replica) finds `running` jobs past their deadline and
-returns them to `pending`, or marks them `failed` if no attempts are left. A crash spends an attempt,
-so a job that keeps crashing the process cannot loop forever.
-
-> [!IMPORTANT]
-> A crashed job is retried only after `Timeout + Grace`. For long jobs use a long `Timeout`.
-
-**Stale workers.** Every claim increments a `lease` counter. A worker saves its result only if the
-lease still matches, so a worker that was too slow cannot overwrite the result of a newer run.
-
-**Handlers that ignore `ctx`.** Go cannot stop a goroutine from outside. After `Timeout + Grace` the job
-is reported as stuck (log and metric) and its worker slot stays busy until the handler returns.
-Meanwhile the rescuer may give the job to another worker, in this process or another replica.
-
-**Unregistered kinds.** Jobs of a kind that no replica registers stay `pending`.
+- **Crashed processes.** A worker claims a job with `deadline = now + Timeout + Grace`. The rescuer (in every
+  replica) returns `running` jobs past their deadline to `pending`, or marks them `failed` if no attempts
+  are left. A crash spends an attempt, so a job that keeps crashing the process cannot loop forever.
+  Such a job is retried only after `Timeout + Grace`, so use a long `Timeout` for long jobs.
+- **Stale workers.** Every claim increments a `lease` counter. A worker saves its result only if the lease
+  still matches, so a slow worker cannot overwrite the result of a newer run.
+- **Handlers that ignore `ctx`.** Go cannot stop a goroutine from outside. After `Timeout + Grace` the job is
+  reported as stuck (log and metric) and its worker slot stays busy until the handler returns. Meanwhile the
+  rescuer may give the job to another worker, in this process or another replica.
+- **Unregistered kinds.** Jobs of a kind that no replica registers stay `pending`.
 
 ## Operating in production
 
@@ -369,104 +317,94 @@ The queue is an ordinary table updated in place, so it is only as fast as that t
 
 ### Long transactions
 
-Every claim and every status change leaves a dead row version and a dead index entry behind.
-Postgres can remove them, and index scans can skip them cheaply, only once they are older than the
-oldest snapshot still open in the cluster (the xmin horizon). While one transaction stays open,
-every claim of every replica steps over all dead entries made since it began, and claims get slower
-minute by minute for all kinds.
+Every claim and status change leaves a dead row version and index entry. Postgres can remove them only
+once they are older than the oldest open snapshot in the cluster (the xmin horizon). While one old
+transaction stays open, every claim of every replica steps over all dead entries made since it began,
+and claims get slower for all kinds.
 
-The horizon is held by long business transactions (including the ones you `ScheduleTx` into),
-sessions left idle in transaction, `pg_dump` and long analytics queries on the primary,
-a lagging replication slot, or a standby with `hot_standby_feedback`.
+The horizon is held by long business transactions (including ones you `ScheduleTx` into), sessions idle in
+transaction, `pg_dump`, long analytics queries on the primary, a lagging replication slot, or a standby
+with `hot_standby_feedback`.
 
 - Keep `ScheduleTx` transactions short; do not call slow external services inside them.
-- Set `idle_in_transaction_session_timeout` (and `statement_timeout`) for application roles.
-- Alert on the age of the oldest transaction (`backend_xmin` in `pg_stat_activity`) and of `xmin` in `pg_replication_slots`.
+- Set `idle_in_transaction_session_timeout` and `statement_timeout` for application roles.
+- Alert on the age of the oldest transaction (`backend_xmin` in `pg_stat_activity`) and of `xmin` in
+  `pg_replication_slots`.
 
-### Dead tuples and autovacuum
+### Autovacuum
 
-A job writes at least three row versions: insert, claim and finish. Each retry adds two more,
-and the janitor's delete leaves one more dead row. Every update changes an indexed column,
-so none of them is a HOT update, and each one also adds index entries. A queue table therefore
-produces dead tuples at several times the job rate, and default autovacuum thresholds, which grow with
-the table size, let them pile up between runs. Tune autovacuum for this table to match your load,
-and check that it keeps up (dead tuples and last autovacuum in `pg_stat_user_tables`).
+A job writes at least three row versions (insert, claim, finish); each retry adds two, and the janitor's
+delete one more. Every update changes an indexed column, so none is a HOT update. Dead tuples therefore
+appear several times faster than jobs, and default autovacuum thresholds let them pile up. Tune
+autovacuum for this table and check that it keeps up (dead tuples and last autovacuum in
+`pg_stat_user_tables`).
 
 ### Retention and table size
 
-Finished jobs stay in the table until the janitor deletes them, so done retention decides the table size:
-rows ≈ job rate × retention. At 300 jobs/s the default `24h` keeps about 26M done rows; a few hours is
-usually enough. Failed jobs are kept forever by default (`failed 0`), together with their idempotency keys;
-give them a retention too if failures are frequent.
+Finished jobs stay until the janitor deletes them: rows ≈ job rate × retention. At 300 jobs/s the default
+`24h` keeps about 26M done rows; a few hours is usually enough. Failed jobs are kept forever by default,
+together with their idempotency keys; set a retention for them too if failures are frequent.
 
 The janitor runs in every replica, but only one deletes at a time: each batch takes a transaction-level
-advisory try-lock keyed by the table, and a replica that does not get it skips that status until its
-next tick and moves on to the next one.
-The lock ends with the `DELETE` statement, so this works through PgBouncer in transaction mode.
+advisory try-lock, and a replica that does not get it skips that status until the next tick. The lock ends
+with the `DELETE`, so it works through PgBouncer in transaction mode.
 
 ### Connection pool
 
-In each replica the pollers, the rescuer and the janitor use up to kinds + 2 connections at once.
-Job results are saved in batches by one writer: a result is written at once if no write is in flight,
-otherwise it joins the next write (up to 1000 jobs in one statement). If 4000 results are already
-waiting, a finished handler keeps its worker slot until there is room, so claiming slows down with the
-database. The writer holds one more connection, so plan for kinds + 3 (pollers, rescuer, janitor and
-result writer), each held for milliseconds. Your handlers' queries come on top of that. Once `Stop` has
-closed the writer, each late handler writes its result itself, on a connection of its own.
-A status write that fails, or gets no connection within 10 s, retries included, is lost for every job in the batch
-(`write job statuses` in the log at Warn, each job at Debug), and those jobs run again after
-`Timeout + Grace`.
+Each replica needs **kinds + 3** connections, each held for milliseconds: pollers (one per kind), rescuer,
+janitor and the result writer. Your handlers' queries come on top, plus one per handler that may outlive `Stop`.
 
-- Give notasap its own `pgxpool` with `MaxConns` of at least kinds + 3, or size the shared pool for kinds + 3 plus your handlers
-  (plus one per handler that may outlive `Stop`).
-- `Start` logs a warning when `MaxConns` is below kinds + 3.
+- Give notasap its own `pgxpool` with `MaxConns` of at least kinds + 3, or size the shared pool accordingly.
+  `Start` logs a warning if `MaxConns` is lower.
+- Results are saved in batches by one writer (up to 1000 jobs per statement). If 4000 results are already
+  waiting, a finished handler keeps its worker slot until there is room, so claiming slows down with the database.
+- A status write that fails or gets no connection within 10 s (retries included) is lost for every job of
+  the batch (`write job statuses` at Warn, each job at Debug); those jobs run again after `Timeout + Grace`.
 - In a handler that holds a transaction, use `ScheduleTx`: `Schedule` and `Cancel` take a second connection,
-  and many such handlers at once can exhaust the pool. Worse, if that transaction already locks the key or row
-  (for example, it scheduled the same key), the handler waits on its own transaction in `Schedule` or `Cancel`,
-  and Postgres cannot detect it. There is no `CancelTx`, so do not cancel a row your own transaction has locked.
+  and many such handlers can exhaust the pool. If your transaction already locks the key or row
+  (for example, it scheduled the same key), `Schedule` or `Cancel` waits on it forever and Postgres cannot
+  detect this. There is no `CancelTx`: do not cancel a row your own transaction has locked.
 
 ### The table belongs to the library
 
-notasap assumes that only it changes `notasap_jobs`. Allowed:
+notasap assumes only it changes `notasap_jobs`.
+
+Allowed:
 
 - Plain `SELECT` (dashboards, debugging): it takes no row locks.
-- Foreign keys referencing `notasap_jobs`: they take `FOR KEY SHARE`, which does not conflict with the
-  library's updates.
+- Foreign keys referencing `notasap_jobs`: they take `FOR KEY SHARE`, which does not conflict with the library.
 
 Not allowed:
 
-- Changing or locking job rows outside the library (`UPDATE`, `DELETE`, `SELECT ... FOR UPDATE` / `FOR SHARE`),
-  or long transactions touching the table. A locked `running` row makes result writes wait, and all results of
-  that client wait behind its batch; jobs may also be run again by the rescuer.
-- DDL other than migrations. Create indexes `CONCURRENTLY`, and set `lock_timeout` in migrations so that they
+- Changing or locking job rows outside the library (`UPDATE`, `DELETE`, `SELECT ... FOR UPDATE` / `FOR SHARE`)
+  or long transactions touching the table. A locked `running` row makes result writes wait, and all results
+  of that client's batch wait behind it; the rescuer may also run jobs again.
+- DDL other than migrations. Create indexes `CONCURRENTLY` and set `lock_timeout` in migrations, so they
   do not queue all queue traffic behind them.
 
-Ideally do not call `ScheduleTx` with `WithReplace` inside a large or long transaction: in the rare race where a
-worker claims the job at the same moment, the row stays locked until that transaction ends and result writes
-wait for it (see [Idempotency keys](#idempotency-keys)).
+Avoid `ScheduleTx` with `WithReplace` inside a large or long transaction (see
+[Idempotency keys](#idempotency-keys)).
 
 ### Keyed jobs in one transaction
 
-Two transactions that take the same idempotency keys in opposite order deadlock. Within one
-`ScheduleBatch` or `ScheduleBatchTx` call notasap inserts items in (kind, key) order, keys compared
-byte-wise, so such calls do not deadlock each other. It cannot order keys across calls: if one
-transaction makes several keyed `ScheduleTx` or `ScheduleBatchTx` calls, make them in the same
-(kind, key) order everywhere in the application. Postgres breaks a deadlock after `deadlock_timeout`
-by aborting one transaction with SQLSTATE `40P01`; retry the whole transaction on it.
+Two transactions that take the same idempotency keys in opposite order deadlock. Inside one `ScheduleBatch`
+or `ScheduleBatchTx` call notasap inserts items in (kind, key) order (keys compared byte-wise), so such
+calls do not deadlock each other. It cannot order keys across calls: if one transaction makes several keyed
+`ScheduleTx` or `ScheduleBatchTx` calls, use the same (kind, key) order everywhere in your application.
+Postgres breaks a deadlock after `deadlock_timeout` by aborting one transaction with SQLSTATE `40P01`;
+retry the whole transaction.
 
 ### Payloads
 
-Keep payloads small: ids, not documents. The payload is read on every claim, and one larger than
-about 2 KB may be compressed or moved out of line (TOAST), which costs extra work each time.
+Keep payloads small: ids, not documents. The payload is read on every claim, and one larger than about 2 KB
+may be compressed or moved out of line (TOAST), which costs extra work each time.
 
 ## Observability
 
-### Logs
+**Logs.** Pass a `*slog.Logger` with `WithLogger`. Start, stop and retries are logged at Info, finished jobs
+at Debug, failures and panics at Error (with stack trace).
 
-Pass a `*slog.Logger` with `WithLogger`. Start and stop are logged at Info, finished jobs at Debug,
-retries at Info, failures and panics at Error (with stack trace).
-
-### Prometheus
+**Prometheus.**
 
 ```go
 import "github.com/nottolstybai/not-asap/prom"
@@ -489,62 +427,22 @@ client, err := notasap.New(pool, notasap.WithObserver(metrics))
 | `notasap_jobs_stuck_total` | `kind` |
 | `notasap_janitor_deleted_total` | `status` |
 
-`scheduled_total` is counted when the insert succeeds, so with `ScheduleTx` it also counts jobs
-of transactions that are later rolled back.
-
-To use another metrics system, implement the `notasap.Observer` interface
-(embed `notasap.NopObserver` to override only what you need).
+For another metrics system, implement `notasap.Observer` (embed `notasap.NopObserver` to override only what you need).
 
 ## Migrations
 
-The schema ships in two formats, embedded in the [`migrations`](migrations) package:
+The schema is embedded in the [`migrations`](migrations) package in two formats:
 
 | Tool | Files | Embedded FS |
 |---|---|---|
 | [goose](https://github.com/pressly/goose) | `migrations/goose/` | `migrations.Goose` |
 | [golang-migrate](https://github.com/golang-migrate/migrate) | `migrations/golang-migrate/` | `migrations.GolangMigrate` |
 
-Either copy the file into your own migrations directory, or run the embedded files with a
-**separate version table**, so their numbers never clash with yours:
+Copy the file into your migrations directory, or run the embedded files with a separate version table
+so their numbers do not clash with yours.
 
-<details>
-<summary>goose</summary>
-
-```go
-db := stdlib.OpenDBFromPool(pool) // github.com/jackc/pgx/v5/stdlib
-goose.SetBaseFS(migrations.Goose)
-goose.SetTableName("notasap_goose_version")
-if err := goose.SetDialect("postgres"); err != nil { /* ... */ }
-if err := goose.Up(db, "goose"); err != nil { /* ... */ }
-```
-
-</details>
-
-<details>
-<summary>golang-migrate</summary>
-
-```go
-src, _ := iofs.New(migrations.GolangMigrate, "golang-migrate")
-m, _ := migrate.NewWithSourceInstance("iofs", src,
-	"pgx5://localhost:5432/app?x-migrations-table=notasap_schema_migrations")
-if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) { /* ... */ }
-```
-
-</details>
-
-The table name is always `notasap_jobs`. To keep it in a separate schema, set `search_path` on the pool.
-
-## Development
-
-```sh
-make test-unit   # fast tests, no database
-make test        # all tests; starts Postgres with testcontainers (needs Docker)
-make cover       # coverage report
-make vet
-```
-
-Set `NOTASAP_TEST_DSN` to run the integration tests against your own database instead of a container.
+The table is always named `notasap_jobs`. To keep it in a separate schema, set `search_path` on the pool.
 
 ## License
 
-[MIT](LICENSE). Use it in any project, commercial or not.
+[MIT](LICENSE)
